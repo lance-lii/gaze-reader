@@ -16,7 +16,8 @@
     "build:artifact": "node scripts/build-artifact.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p extension/tsconfig.json",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run test && npm run build && npm run build:ext && npm run build:artifact"
+    "check": "npm run typecheck && npm run test && npm run build && npm run build:ext && npm run build:artifact",
+    "bench": "vitest run --config vitest.bench.config.ts"
   },
   "license": "MIT",
   "dependencies": {
