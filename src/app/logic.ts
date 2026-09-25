@@ -497,6 +497,30 @@ export function shouldIgnoreShortcut(e: KeyLike, target: KeyTargetLike | null | 
   return false;
 }
 
+// ─────────────────────────────── Error handling ─────────────────────────────
+
+/** A human-readable message from anything thrown or rejected. */
+export function errorMessage(err: unknown, fallback = 'Something unexpected happened.'): string {
+  if (err instanceof Error && err.message.trim()) return err.message.trim();
+  if (typeof err === 'string' && err.trim()) return err.trim();
+  if (err && typeof err === 'object' && 'message' in err) {
+    const m = (err as { message: unknown }).message;
+    if (typeof m === 'string' && m.trim()) return m.trim();
+  }
+  return fallback;
+}
+
+/**
+ * Global errors not worth bothering the reader about: the browser's benign
+ * ResizeObserver loop warning, opaque cross-origin "Script error.", and
+ * anything thrown by a browser extension's injected script.
+ */
+export function isBenignGlobalError(message: string, filename = ''): boolean {
+  if (/ResizeObserver loop/i.test(message)) return true;
+  if (message === 'Script error.' || message === 'Script error') return true;
+  return /^(chrome|moz|safari(-web)?)-extension:/i.test(filename);
+}
+
 // ─────────────────────────────── Camera errors ──────────────────────────────
 
 const TRACKER_CODES: readonly TrackerErrorCode[] = [
@@ -606,43 +630,13 @@ export function previewCorner(buddyCorner: Corner): 'bottom-left' | 'bottom-righ
   return buddyCorner === 'bottom-left' ? 'bottom-right' : 'bottom-left';
 }
 
-// ──────────────────────────────── Text input ────────────────────────────────
+// ──────────────────────────────── URL input ────────────────────────────────
 
-/** Guesses whether pasted text is Markdown (headings, lists, emphasis, fences) or plain prose. */
-export function guessTextFormat(text: string): 'md' | 'txt' {
-  let score = 0;
-  const lines = text.split(/\r?\n/, 600);
-  for (const line of lines) {
-    if (/^#{1,6}\s+\S/.test(line)) score += 2;
-    else if (/^```/.test(line)) score += 2;
-    else if (/^\s{0,3}(?:[-*+]|\d{1,3}[.)])\s+\S/.test(line)) score += 1;
-    else if (/^>\s?\S/.test(line)) score += 1;
-    if (/\*\*[^*\n]+\*\*|__[^_\n]+__|\[[^\]\n]+\]\([^)\s]+\)/.test(line)) score += 1;
-    if (score >= 3) return 'md';
-  }
-  return 'txt';
-}
-
-/** A title for pasted text: its first line if that looks like one, else a fallback. */
-export function deriveTitle(text: string, fallback = 'Pasted text'): string {
-  const first = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .find((l) => l.length > 0);
-  if (!first) return fallback;
-  const cleaned = first
-    .replace(/^#{1,6}\s+/, '')
-    .replace(/[*_`]+/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (cleaned.length < 2) return fallback;
-  if (cleaned.length <= 80) return cleaned;
-  const cut = cleaned.slice(0, 60);
-  const space = cut.lastIndexOf(' ');
-  return `${(space > 30 ? cut.slice(0, space) : cut).trimEnd()}…`;
-}
-
-/** Accepts "example.com/book.txt" or full http(s) URLs; rejects everything else. */
+/**
+ * Accepts "example.com/book.txt" or full http(s) URLs; rejects everything
+ * else. Used for instant inline feedback in the "Open from URL" form (the
+ * loader validates again before fetching).
+ */
 export function normalizeUrl(input: string): string | null {
   const raw = input.trim();
   if (!raw) return null;

@@ -354,16 +354,33 @@ function isExtensionPage(): boolean {
   return /^(chrome|moz|safari-web)-extension:$/.test(protocol);
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
+/** Settles with `p`, or rejects on timeout or abort — whichever comes first — leaving no timer behind. */
+function settleWithin<T>(p: Promise<T>, ms: number, onTimeout: () => Error, signal: AbortSignal): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(onTimeout()), ms);
+    const done = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = (): void => {
+      done();
+      reject(new DOMException('Camera start was cancelled.', 'AbortError'));
+    };
+    const timer = setTimeout(() => {
+      done();
+      reject(onTimeout());
+    }, ms);
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort);
     p.then(
       (value) => {
-        clearTimeout(timer);
+        done();
         resolve(value);
       },
       (err: unknown) => {
-        clearTimeout(timer);
+        done();
         reject(err);
       },
     );
@@ -421,6 +438,8 @@ export class CameraFeatureSource implements FeatureSource {
   /** Bumped by every stop(); an in-flight start() that sees a newer value backs out. */
   private generation = 0;
   private starting: Promise<void> | null = null;
+  /** Cancels the in-flight attempt's wait for the model. */
+  private startAbort: AbortController | null = null;
   private pendingCamera: CameraHandle | null = null;
   private session: Session | null = null;
 
@@ -505,6 +524,8 @@ export class CameraFeatureSource implements FeatureSource {
   stop(): void {
     this.generation++;
     this.starting = null;
+    this.startAbort?.abort();
+    this.startAbort = null;
     this.pendingCamera?.stop();
     this.pendingCamera = null;
     const s = this.session;
@@ -527,7 +548,8 @@ export class CameraFeatureSource implements FeatureSource {
 
   private async doStart(gen: number): Promise<void> {
     this.error = null;
-    const unsupported = cameraSupportError();
+    // With the real camera, fail fast here rather than downloading the model for nothing.
+    const unsupported = this.deps.openCamera === openCamera ? cameraSupportError() : null;
     if (unsupported) throw this.fail(unsupported);
 
     // The model download is the slow part; overlap it with the permission prompt.
@@ -547,17 +569,22 @@ export class CameraFeatureSource implements FeatureSource {
     }
     this.pendingCamera = camera;
 
+    // Only the model wait is cancellable: an open permission prompt can't be withdrawn.
+    const abort = new AbortController();
+    this.startAbort = abort;
     let landmarker: LandmarkerHandle;
     try {
-      landmarker = await withTimeout(
+      landmarker = await settleWithin(
         model,
         MODEL_LOAD_TIMEOUT_MS,
         () => new TrackerError('model-load-failed', 'Loading the face-tracking model timed out. Check your connection and try again.'),
+        abort.signal,
       );
     } catch (err) {
       camera.stop();
       if (gen !== this.generation) return;
       this.pendingCamera = null;
+      this.startAbort = null;
       throw this.fail(err instanceof TrackerError ? err : new TrackerError('model-load-failed', undefined, { cause: err }));
     }
     if (gen !== this.generation) {
@@ -565,6 +592,7 @@ export class CameraFeatureSource implements FeatureSource {
       return;
     }
     this.pendingCamera = null;
+    this.startAbort = null;
     this.beginSession(camera, landmarker);
   }
 

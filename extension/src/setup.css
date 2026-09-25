@@ -1,0 +1,127 @@
+body {
+  min-height: 100vh;
+  display: grid;
+  place-items: start center;
+}
+
+.setup {
+  width: min(620px, 100% - 32px);
+  padding: 56px 0 64px;
+}
+
+.hero {
+  display: block;
+  width: 160px;
+  height: 96px;
+  margin: 0 0 20px -32px;
+  filter: drop-shadow(0 6px 14px rgba(194, 65, 12, 0.22));
+}
+
+.hero .pupil {
+  animation: read 3.2s ease-in-out infinite;
+}
+
+@keyframes read {
+  0%,
+  12% {
+    transform: translateX(-5px);
+  }
+  70% {
+    transform: translateX(3px);
+  }
+  82%,
+  100% {
+    transform: translateX(-5px);
+  }
+}
+
+h1 {
+  margin: 0 0 12px;
+  font: 700 clamp(24px, 4vw, 30px) / 1.2 var(--font-reading);
+  letter-spacing: -0.005em;
+  text-wrap: balance;
+}
+
+.lede {
+  margin: 0 0 20px;
+  font-size: 16px;
+  line-height: 1.6;
+  color: color-mix(in srgb, var(--fg) 85%, var(--muted));
+}
+
+.promises {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 24px;
+  padding: 0;
+  list-style: none;
+}
+
+.promises li {
+  position: relative;
+  padding: 12px 14px 12px 42px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  line-height: 1.5;
+}
+
+.promises li::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  top: 15px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent-soft)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 8.2l2.2 2.2 4.8-4.8' fill='none' stroke='%23c2410c' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / 14px no-repeat;
+}
+
+.panel {
+  padding: 18px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+.panel[data-state="granted"] {
+  border-color: color-mix(in srgb, var(--ok) 50%, var(--border));
+}
+
+.panel[data-state="denied"],
+.panel[data-state="error"] {
+  border-color: color-mix(in srgb, var(--err) 45%, var(--border));
+}
+
+.panel-text {
+  margin: 0 0 14px;
+  font-size: 15px;
+}
+
+.panel-text:last-child {
+  margin: 0;
+}
+
+.panel-text strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 16px;
+}
+
+.panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.panel-actions:not(:has(button:not([hidden]))) {
+  display: none;
+}
+
+.btn {
+  min-height: 40px;
+  padding: 0 18px;
+}

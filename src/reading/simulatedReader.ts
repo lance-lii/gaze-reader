@@ -334,29 +334,39 @@ function position(seg: Segment, t: number, layout: LineLayout): { x: number; y: 
 
 // ─────────────────────────────────── Sensor ───────────────────────────────────
 
+export type DriftOnset = 'gradual' | 'immediate';
+
 interface SensorOptions {
   noisePx: number;
   driftPx: number;
+  driftOnset: DriftOnset;
+  wanderPx: number;
   blinksPerMin: number;
   source: GazeSourceKind;
 }
 
 /** After this much invalid time the smoothing filter restarts (like the webcam source). */
 const FILTER_RESET_MS = 300;
+/** Correlation time of the low-frequency "wander" noise (head micro-motion, landmark jitter). */
+const WANDER_TAU_MS = 500;
 
 /**
  * Turns true gaze points into GazeSamples the way a webcam tracker would:
- * isotropic Gaussian noise, a slow vertical drift that grows from 0 to about
- * ±driftPx (a head settling after calibration) and wobbles, optional blinks
- * (invalid samples) and One Euro smoothing.
+ * white Gaussian noise, optional correlated low-frequency noise ("wander"),
+ * a slow vertical drift of about ±driftPx (growing from 0 as a head settles
+ * after calibration, or present from the start as a calibration bias) that
+ * wobbles, optional blinks (invalid samples) and One Euro smoothing.
  */
 class GazeSensor {
   private readonly filter = new OneEuroFilter2D();
   private t0: number | null = null;
+  private lastT: number | null = null;
   private readonly driftSign: number;
   private readonly driftTauMs: number;
   private readonly wobbleMs: number;
   private readonly wobblePhase: number;
+  private wanderX = 0;
+  private wanderY = 0;
   private nextBlinkAt = Infinity;
   private blinkUntil = -Infinity;
   private invalidSince: number | null = null;
@@ -370,14 +380,29 @@ class GazeSensor {
     this.driftTauMs = 4000 + 6000 * rng();
     this.wobbleMs = 15000 + 15000 * rng();
     this.wobblePhase = 2 * Math.PI * rng();
+    if (opts.wanderPx > 0) {
+      this.wanderX = opts.wanderPx * gaussian(rng);
+      this.wanderY = opts.wanderPx * gaussian(rng);
+    }
   }
 
   driftAt(t: number): number {
     if (this.t0 === null || !(this.opts.driftPx > 0)) return 0;
     const dt = Math.max(0, t - this.t0);
-    const grow = 1 - Math.exp(-dt / this.driftTauMs);
+    const grow = this.opts.driftOnset === 'immediate' ? 1 : 1 - Math.exp(-dt / this.driftTauMs);
     const wobble = 0.85 + 0.15 * Math.sin((2 * Math.PI * dt) / this.wobbleMs + this.wobblePhase);
     return this.opts.driftPx * this.driftSign * grow * wobble;
+  }
+
+  private stepWander(t: number): void {
+    const w = this.opts.wanderPx;
+    const prev = this.lastT;
+    this.lastT = t;
+    if (!(w > 0) || prev === null) return;
+    const a = Math.exp(-Math.max(0, t - prev) / WANDER_TAU_MS);
+    const s = w * Math.sqrt(1 - a * a);
+    this.wanderX = a * this.wanderX + s * gaussian(this.rng);
+    this.wanderY = a * this.wanderY + s * gaussian(this.rng);
   }
 
   resetFilter(): void {
@@ -389,6 +414,7 @@ class GazeSensor {
       this.t0 = t;
       this.scheduleBlink(t);
     }
+    this.stepWander(t);
     if (t >= this.nextBlinkAt) {
       this.blinkUntil = t + 100 + 150 * this.rng();
       this.scheduleBlink(this.blinkUntil);
@@ -409,8 +435,8 @@ class GazeSensor {
       };
     }
     this.invalidSince = null;
-    const rawX = truth.x + this.opts.noisePx * gaussian(this.rng);
-    const rawY = truth.y + this.driftAt(t) + this.opts.noisePx * gaussian(this.rng);
+    const rawX = truth.x + this.wanderX + this.opts.noisePx * gaussian(this.rng);
+    const rawY = truth.y + this.wanderY + this.driftAt(t) + this.opts.noisePx * gaussian(this.rng);
     const s = this.filter.filter(rawX, rawY, t);
     this.last = { x: s.x, y: s.y, rawX, rawY };
     return { t, x: s.x, y: s.y, rawX, rawY, valid: true, confidence: 0.85 + 0.1 * this.rng(), source: this.opts.source };
@@ -429,8 +455,12 @@ export interface SimulateReadingOptions {
   wpm?: number;
   /** σ of the Gaussian noise added to every sample (both axes), px. Default 0. */
   noisePx?: number;
-  /** Magnitude the slow vertical drift grows to, px. Default 0. */
+  /** Magnitude of the slow vertical drift, px. Default 0. */
   driftPx?: number;
+  /** 'gradual' (default): drift grows from 0 over ~5–10 s; 'immediate': a calibration bias from the start. */
+  driftOnset?: DriftOnset;
+  /** σ of correlated low-frequency noise (τ ≈ 500 ms) on both axes, px. Default 0. */
+  wanderPx?: number;
   /** Sample rate. Default 30. */
   hz?: number;
   seed?: number;
@@ -477,6 +507,8 @@ export function simulateReading(layout: LineLayout, opts: SimulateReadingOptions
   const sensor = new GazeSensor(mulberry32(seed ^ 0x9e3779b9), {
     noisePx: Math.max(0, opts.noisePx ?? 0),
     driftPx: opts.driftPx ?? 0,
+    driftOnset: opts.driftOnset ?? 'gradual',
+    wanderPx: Math.max(0, opts.wanderPx ?? 0),
     blinksPerMin: Math.max(0, opts.blinksPerMin ?? 0),
     source: 'simulated',
   });
@@ -505,6 +537,8 @@ export interface SimulatedReaderOptions {
   noisePx?: number;
   /** Slow vertical drift magnitude, px. Default 10. */
   driftPx?: number;
+  /** σ of correlated low-frequency noise, px. Default 0. */
+  wanderPx?: number;
   /** Samples per second. Default 30. */
   hz?: number;
   seed?: number;
@@ -543,6 +577,8 @@ export class SimulatedReaderSource implements GazeSource {
     this.sensor = new GazeSensor(mulberry32(seed ^ 0x9e3779b9), {
       noisePx: Math.max(0, opts.noisePx ?? 14),
       driftPx: opts.driftPx ?? 10,
+      driftOnset: 'gradual',
+      wanderPx: Math.max(0, opts.wanderPx ?? 0),
       blinksPerMin: Math.max(0, opts.blinksPerMin ?? 0),
       source: 'simulated',
     });

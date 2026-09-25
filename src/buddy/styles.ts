@@ -104,7 +104,11 @@ ${cornerRules}
 :root[data-theme="dark"] .${B}-svg {
   filter: drop-shadow(0 0 1px rgba(255, 255, 255, 0.35)) drop-shadow(0 4px 10px rgba(0, 0, 0, 0.5));
 }
-.${B}-svg * { transform-box: fill-box; }
+/* Only parts transformed by CSS get fill-box: it would also re-origin the
+   rotate()/scale() transform attributes used elsewhere in the drawing. */
+.${B}-char, .${B}-body, .${B}-head, .${B}-glasses, .${B}-cowlick, .${B}-brow, .${B}-lid-up,
+.${B}-lid-low, .${B}-mouth--talk, .${B}-flip, .${B}-z, .${B}-star { transform-box: fill-box; }
+.${B}-char { transform-origin: 50% 100%; }
 
 /* Moods are class toggles on the root; parts are never re-rendered. */
 .${B}-mouth { opacity: 0; transition: opacity 140ms ease; }

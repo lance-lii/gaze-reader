@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="description"
+      content="Gaze Reader turns the page when your eyes reach the bottom. Webcam eye tracking that runs entirely in your browser, with Dewey, a tiny nerd reading buddy."
+    />
+    <meta name="theme-color" content="#f7f3ea" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Gaze Reader</title>
+    <script>
+      // Apply the saved theme before first paint so there's no flash of the wrong colors.
+      (function () {
+        try {
+          var raw = localStorage.getItem('gazeReader.settings.v1');
+          var s = raw ? JSON.parse(raw) : null;
+          var t = s && typeof s.theme === 'string' ? s.theme : 'auto';
+          if (t !== 'light' && t !== 'sepia' && t !== 'dark') {
+            t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          }
+          document.documentElement.setAttribute('data-theme', t);
+          document.documentElement.style.colorScheme = t === 'dark' ? 'dark' : 'light';
+        } catch (e) {
+          /* storage blocked: stay on the default theme */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <noscript>
+      <p style="font: 18px/1.6 system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; padding: 0 1rem">
+        Gaze Reader needs JavaScript to follow your eyes and turn the pages. Everything runs locally in your browser.
+      </p>
+    </noscript>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

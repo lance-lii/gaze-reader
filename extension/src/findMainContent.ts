@@ -61,7 +61,7 @@ export function findMainContent(doc: Document, opts: FindMainContentOptions = {}
     for (let a = b.parentElement; a && !containsBlock.has(a); a = a.parentElement) containsBlock.add(a);
   }
 
-  const zones = new ZoneClassifier();
+  const zones = new ZoneClassifier(doc.defaultView);
   const content = new Map<Element, number>();
   const noise = new Map<Element, number>();
   const credit = (map: Map<Element, number>, from: Element, amount: number) => {
@@ -169,7 +169,13 @@ class ZoneClassifier {
   private readonly zone = new Map<Element, boolean>();
   private readonly skipped = new Map<Element, boolean>();
 
-  /** Inside markup that is never reading text (scripts, our own UI, hidden subtrees…). */
+  constructor(private readonly view: Window | null) {}
+
+  /**
+   * Inside markup that is never reading text: scripts, our own UI, hidden
+   * subtrees. `display: none` matters: many sites render a second, hidden copy
+   * of the article for another breakpoint. Each element's style is read once.
+   */
   isSkipped(el: Element): boolean {
     const path: Element[] = [];
     let result = false;
@@ -180,7 +186,12 @@ class ZoneClassifier {
         break;
       }
       path.push(a);
-      if (SKIP_TAGS.has(a.localName) || a.hasAttribute(IGNORE_ATTR) || a.hasAttribute('hidden')) {
+      if (
+        SKIP_TAGS.has(a.localName) ||
+        a.hasAttribute(IGNORE_ATTR) ||
+        a.hasAttribute('hidden') ||
+        (this.view !== null && isDisplayNone(a, this.view))
+      ) {
         result = true;
         break;
       }
@@ -237,6 +248,14 @@ function isHiddenByStyle(el: Element, view: Window): boolean {
   try {
     const cs = view.getComputedStyle(el);
     return cs.display === 'none' || cs.visibility === 'hidden';
+  } catch {
+    return false;
+  }
+}
+
+function isDisplayNone(el: Element, view: Window): boolean {
+  try {
+    return view.getComputedStyle(el).display === 'none';
   } catch {
     return false;
   }

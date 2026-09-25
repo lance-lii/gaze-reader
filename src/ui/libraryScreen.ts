@@ -118,7 +118,7 @@ export class LibraryScreen implements Mountable {
       <div class="gr-lib-top">
         <section class="gr-hero" aria-labelledby="${uid}-hero">
           <p class="gr-hero__kicker">${icon('eye')}<span>Hands-free reading</span></p>
-          <h1 class="gr-hero__title" id="${uid}-hero">Your eyes turn the page.</h1>
+          <h1 class="gr-hero__title" id="${uid}-hero">Your eyes <span class="gr-hero__ink">turn the page.</span></h1>
           <p class="gr-hero__lead">Gaze Reader follows your eyes with your webcam and turns the page when you reach the bottom. Dewey, the little fellow in the corner, reads along.</p>
           <p class="gr-privacy-note">${icon('shield')}<span>Everything runs on this device. Video never leaves your browser.</span></p>
         </section>
@@ -389,7 +389,8 @@ export class LibraryScreen implements Mountable {
       btn.addEventListener(
         'click',
         () => {
-          const open = form.hidden;
+          // `hidden` may also be 'until-found'; anything but `false` means collapsed.
+          const open = form.hidden !== false;
           this.setFormOpen(other[0], other[1], false);
           this.setFormOpen(btn, form, open);
           if (open) focus.focus();

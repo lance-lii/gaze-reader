@@ -67,6 +67,7 @@ export class CameraPreview implements Mountable {
   }
 
   attach(source: PreviewSource | null): void {
+    if (source === this.source) return;
     this.source = source;
     this.lastVideoTime = -1;
     this.lastLandmarks = null;

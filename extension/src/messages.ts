@@ -67,7 +67,9 @@ export type HubToOffscreen = { type: 'camera-start' } | { type: 'camera-stop' };
 export type RuntimeRequest =
   | { type: 'set-tab-enabled'; tabId: number; enabled: boolean }
   | { type: 'camera-permission-granted' }
-  | { type: 'open-setup'; returnTabId?: number };
+  | { type: 'open-setup'; returnTabId?: number }
+  /** Content script → service worker: Gaze Reader turned on/off in this tab (drives the toolbar badge). */
+  | { type: 'page-status'; enabled: boolean };
 
 export type RuntimeResponse = { ok: true; state?: PageState | null } | { ok: false; error: string };
 
@@ -233,6 +235,8 @@ export function isRuntimeRequest(x: unknown): x is RuntimeRequest {
       return true;
     case 'open-setup':
       return x.returnTabId === undefined || isTabId(x.returnTabId);
+    case 'page-status':
+      return isBool(x.enabled);
     default:
       return false;
   }

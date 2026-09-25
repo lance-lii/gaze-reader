@@ -1,0 +1,1610 @@
+/**
+ * The app shell's brain: wires the gaze sources, the reading pipeline, the
+ * reader, Dewey and the chrome together, and owns every lifecycle.
+ *
+ *   source ─► gaze ─► FixationDetector ─► LineTracker ─► PageEndDetector ─► ScrollController
+ *
+ * Methods are grouped by concern: lifecycle · screens · books · session &
+ * progress · pipeline · page turning · layout · sources · calibration ·
+ * tracking state · commands & settings · DOM events.
+ */
+import { createEventBus } from '../core/events';
+import { createSettingsStore, type SettingsStore } from '../core/settings';
+import type {
+  AppSettings,
+  Book,
+  CommandName,
+  EventBus,
+  GazeModel,
+  GazeSample,
+  GazeSource,
+  GazeSourceKind,
+  LayoutChangeReason,
+  LineLayout,
+  PageEndDecision,
+  ReadingPosition,
+  Unsubscribe,
+} from '../types';
+import { Buddy } from '../buddy/buddy';
+import { clearCalibration, loadCalibration, saveCalibration } from '../gaze/calibrationModel';
+import { CameraFeatureSource, preloadFaceLandmarker } from '../gaze/faceTracker';
+import { FEATURE_NAMES } from '../gaze/features';
+import { MouseGazeSource } from '../gaze/mouseGazeSource';
+import { WebcamGazeSource } from '../gaze/webcamGazeSource';
+import { listSampleBooks, loadBookFromFile, loadBookFromText, loadBookFromUrl, loadSampleBook, type SampleBookInfo } from '../reader/bookLoader';
+import { deleteBook, getBook, getProgress, listBooks, saveBook, saveProgress } from '../reader/library';
+import { ReaderView } from '../reader/readerView';
+import { ScrollController } from '../reader/scrollController';
+import { LineTracker } from '../reading/lineTracker';
+import { PageEndDetector } from '../reading/pageEndDetector';
+import { SimulatedReaderSource } from '../reading/simulatedReader';
+import { FixationDetector } from '../signal/fixations';
+import { CalibrationOverlay } from '../ui/calibrationOverlay';
+import { CameraPreview } from '../ui/cameraPreview';
+import { DebugOverlay } from '../ui/debugOverlay';
+import { GazeDot } from '../ui/gazeDot';
+import { HelpDialog } from '../ui/helpDialog';
+import { LibraryScreen } from '../ui/libraryScreen';
+import { Onboarding, hasCompletedOnboarding } from '../ui/onboarding';
+import { SettingsPanel } from '../ui/settingsPanel';
+import { Toaster, type ToastAction } from '../ui/toast';
+import { Topbar } from '../ui/topbar';
+import {
+  BreakTimer,
+  ProgressMeter,
+  ReadingClock,
+  SHORTCUTS,
+  TYPICAL_WPM,
+  TrackingStateMachine,
+  calibrationFitsViewport,
+  cameraErrorInfo,
+  computeWpm,
+  errorMessage,
+  firstFullyVisibleIndex,
+  formatMinutes,
+  formatPercent,
+  lastFullyVisibleIndex,
+  minutesLeft,
+  previewCorner,
+  resolveTheme,
+  resumeLineIndex,
+  sameStatus,
+  shortcutFor,
+  shouldIgnoreShortcut,
+  trackerErrorCode,
+  type SourcePhase,
+  type TrackingStatus,
+} from './logic';
+
+type Screen = 'library' | 'reader';
+
+/** Why the webcam must not (re)start on its own until the reader asks for it again. */
+type WebcamHold = { reason: 'failed'; detail: string } | { reason: 'uncalibrated' };
+
+interface ReadingSession {
+  readonly book: Book;
+  readonly clock: ReadingClock;
+  readonly meter: ProgressMeter;
+  readonly breaks: BreakTimer;
+  lastProgressEmitAt: number;
+  finished: boolean;
+  undos: number;
+}
+
+const HEARTBEAT_MS = 250;
+const PROGRESS_EVERY_MS = 5000;
+const HIDDEN_STOP_MS = 60_000;
+const SCROLL_SETTLE_MS = 120;
+const SAVE_POSITION_MS = 1000;
+const ESTIMATE_EMIT_MS = 100;
+/** Reading counts as active while gaze was valid this recently… */
+const ACTIVE_GAZE_WINDOW_MS = 5000;
+/** …or the reader touched the keyboard / wheel / pointer this recently (camera off). */
+const ACTIVE_INPUT_WINDOW_MS = 60_000;
+const POOR_HINT_AFTER_MS = 8000;
+const PRELOAD_DELAY_MS = 2500;
+
+const TYPOGRAPHY_KEYS: readonly (keyof AppSettings)[] = ['fontSizePx', 'lineHeight', 'fontFamily', 'columnWidthCh'];
+const OVERLAY_KEYS: readonly (keyof AppSettings)[] = ['showGazeDot', 'showDebugOverlay', 'showCameraPreview', 'buddyCorner', 'buddyEnabled'];
+/** When several re-measures coalesce, the strongest reason wins. */
+const MEASURE_PRIORITY: Readonly<Record<LayoutChangeReason, number>> = {
+  scroll: 0,
+  content: 1,
+  resize: 2,
+  'page-turn': 3,
+  initial: 4,
+};
+
+/** Named timeouts, so every pending timer can be found and cleared. */
+class Timers {
+  private readonly ids = new Map<string, ReturnType<typeof setTimeout>>();
+
+  set(name: string, fn: () => void, ms: number): void {
+    this.clear(name);
+    this.ids.set(
+      name,
+      setTimeout(() => {
+        this.ids.delete(name);
+        fn();
+      }, ms),
+    );
+  }
+
+  clear(name: string): void {
+    const id = this.ids.get(name);
+    if (id !== undefined) clearTimeout(id);
+    this.ids.delete(name);
+  }
+
+  clearAll(): void {
+    for (const id of this.ids.values()) clearTimeout(id);
+    this.ids.clear();
+  }
+}
+
+function hasFiles(e: DragEvent): boolean {
+  return e.dataTransfer?.types.includes('Files') ?? false;
+}
+
+export class AppController {
+  readonly bus: EventBus;
+  private readonly store: SettingsStore;
+  private readonly root: HTMLElement;
+  private readonly ac = new AbortController();
+  private readonly timers = new Timers();
+  private readonly unsubs: Unsubscribe[] = [];
+  private started = false;
+  private destroyed = false;
+
+  // Views
+  private readonly screens: HTMLElement;
+  private readonly readerScreen: HTMLElement;
+  private readonly library: LibraryScreen;
+  private readonly topbar: Topbar;
+  private readonly reader: ReaderView;
+  private readonly settingsPanel: SettingsPanel;
+  private readonly help: HelpDialog;
+  private readonly onboarding: Onboarding;
+  private readonly toasts: Toaster;
+  private readonly preview: CameraPreview;
+  private readonly buddy: Buddy;
+  private readonly gazeDot: GazeDot;
+  private readonly debug: DebugOverlay;
+  private screen: Screen = 'library';
+  private readonly darkQuery: MediaQueryList | null;
+
+  // Books & reading pipeline
+  private readonly fixations = new FixationDetector();
+  private readonly lineTracker = new LineTracker();
+  private readonly pageEnd: PageEndDetector;
+  private scroll: ScrollController | null = null;
+  private layout: LineLayout | null = null;
+  private session: ReadingSession | null = null;
+  private openSeq = 0;
+  private samples: readonly SampleBookInfo[] | null = null;
+  private hasRecent = false;
+  private turning = false;
+  private scrollSettling = false;
+  private pipelineWasBlocked = false;
+  private lastEstimateEmitAt = Number.NEGATIVE_INFINITY;
+  private pendingMeasure: LayoutChangeReason | null = null;
+  private contentObserver: ResizeObserver | null = null;
+
+  // Gaze sources
+  private sourceKind: GazeSourceKind | null = null;
+  private source: GazeSource | null = null;
+  private offSample: Unsubscribe | null = null;
+  /** Bumped by every source change; async bring-ups that see a newer value back out. */
+  private sourceGen = 0;
+  private camera: CameraFeatureSource | null = null;
+  private offCameraError: Unsubscribe | null = null;
+  /** undefined = not loaded from storage yet. */
+  private model: GazeModel | null | undefined = undefined;
+  private savedCalibration = false;
+  private calibration: CalibrationOverlay | null = null;
+  private forceCalibration = false;
+  private webcamHold: WebcamHold | null = null;
+  private hiddenLong = false;
+  private readonly introduced = new Set<GazeSourceKind>();
+
+  // Tracking state
+  private readonly tracking = new TrackingStateMachine();
+  private phase: SourcePhase = 'off';
+  private phaseDetail: string | undefined;
+  private status: TrackingStatus | null = null;
+  private pillKey = '';
+  private poorHintShown = false;
+  private lastValidGazeAt = Number.NEGATIVE_INFINITY;
+  private lastInputAt = Number.NEGATIVE_INFINITY;
+
+  // Loops & misc
+  private heartbeatId: ReturnType<typeof setInterval> | null = null;
+  private heartbeatCount = 0;
+  private progressRaf = 0;
+  private dragDepth = 0;
+  private greeted = false;
+  private lastError = { key: '', at: 0 };
+
+  constructor(root: HTMLElement) {
+    this.root = root;
+    this.bus = createEventBus();
+    this.store = createSettingsStore(this.bus);
+    const getSettings = (): AppSettings => this.store.get();
+    const settings = getSettings();
+    this.darkQuery = typeof matchMedia === 'function' ? matchMedia('(prefers-color-scheme: dark)') : null;
+
+    root.replaceChildren();
+    root.classList.add('gr-app');
+
+    // Screens (made inert while a dialog is open).
+    this.screens = document.createElement('div');
+    this.screens.className = 'gr-screens';
+    this.library = new LibraryScreen({
+      onOpenFile: (file) => void this.openFromFile(file),
+      onOpenText: (text, title) => void this.openFromText(text, title),
+      onOpenUrl: (url) => void this.openFromUrl(url),
+      onOpenSample: (id) => void this.openSample(id),
+      onOpenBook: (id) => void this.openSaved(id),
+      onDeleteBook: (id, title) => void this.removeBook(id, title),
+      onRetrySamples: () => void this.loadSamples(),
+      onCommand: (name) => this.bus.emit('command', { name }),
+    });
+    this.library.mount(this.screens);
+
+    this.readerScreen = document.createElement('div');
+    this.readerScreen.className = 'gr-reader-screen';
+    this.readerScreen.hidden = true;
+    this.topbar = new Topbar({ bus: this.bus, getSettings, onSelectSource: (kind) => this.selectSource(kind) });
+    this.topbar.mount(this.readerScreen);
+    const stage = document.createElement('div');
+    stage.className = 'gr-reader-stage';
+    this.readerScreen.appendChild(stage);
+    this.screens.appendChild(this.readerScreen);
+    root.appendChild(this.screens);
+
+    this.reader = new ReaderView({ mount: stage, bus: this.bus });
+    this.reader.applySettings(settings);
+    this.pageEnd = new PageEndDetector({ sensitivity: settings.sensitivity, glanceDownToTurn: settings.glanceDownToTurn });
+
+    // Floating layers, bottom to top.
+    this.preview = new CameraPreview({ onHide: () => this.hidePreview() });
+    this.debug = new DebugOverlay({ bus: this.bus, getSettings });
+    this.gazeDot = new GazeDot({ bus: this.bus, getSettings });
+    this.buddy = new Buddy({ bus: this.bus, getSettings });
+    this.toasts = new Toaster();
+    this.onboarding = new Onboarding({ bus: this.bus });
+    this.settingsPanel = new SettingsPanel({
+      bus: this.bus,
+      getSettings,
+      hasSavedCalibration: () => {
+        this.currentModel();
+        return this.savedCalibration;
+      },
+      onForgetCalibration: () => this.forgetCalibration(),
+      onRecalibrate: () => this.recalibrate(),
+      onShowHelp: () => this.runCommand('show-help'),
+      onReplayIntro: () => {
+        this.closePanels();
+        void this.runOnboarding();
+      },
+      onClose: () => this.syncModalState(),
+    });
+    this.help = new HelpDialog({ onClose: () => this.syncModalState() });
+    for (const layer of [this.preview, this.debug, this.gazeDot, this.buddy, this.toasts, this.onboarding, this.settingsPanel, this.help]) {
+      layer.mount(root);
+    }
+
+    this.bindBus();
+    this.bindDom();
+    this.applyTheme();
+    this.updateOverlays();
+    this.refreshTracking(performance.now());
+  }
+
+  // ─────────────────────────────── Lifecycle ───────────────────────────────
+
+  /** Shows the library, loads samples and recent books, and runs the first-run intro. */
+  async start(): Promise<void> {
+    if (this.started || this.destroyed) return;
+    this.started = true;
+    this.showScreen('library');
+    const samplesReady = this.loadSamples();
+    void this.refreshRecent();
+    if (!hasCompletedOnboarding()) {
+      await this.runOnboarding(samplesReady);
+    } else {
+      this.greetLibrary();
+      this.schedulePreload();
+    }
+  }
+
+  /** Surfaces an error to the reader (used by the global error handlers in main.ts). */
+  reportError(code: string, message: string): void {
+    if (!this.destroyed) this.bus.emit('error', { code, message });
+  }
+
+  destroy(): void {
+    if (this.destroyed) return;
+    this.savePositionNow();
+    this.destroyed = true;
+    this.sourceGen++;
+    this.teardownSource();
+    this.camera = null;
+    this.stopHeartbeat();
+    this.timers.clearAll();
+    if (this.progressRaf) cancelAnimationFrame(this.progressRaf);
+    this.progressRaf = 0;
+    this.unobserveContent();
+    this.ac.abort();
+    for (const off of this.unsubs.splice(0)) off();
+    this.scroll?.destroy();
+    this.scroll = null;
+    this.session = null;
+    try {
+      this.reader.close();
+    } catch {
+      /* tearing down anyway */
+    }
+    for (const c of [this.help, this.settingsPanel, this.onboarding, this.toasts, this.buddy, this.gazeDot, this.debug, this.preview, this.topbar, this.library]) {
+      c.destroy();
+    }
+    this.bus.clear();
+    this.root.replaceChildren();
+    this.root.classList.remove('gr-app');
+    const html = document.documentElement;
+    delete html.dataset.screen;
+    delete html.dataset.buddyCorner;
+    delete html.dataset.buddy;
+  }
+
+  // ──────────────────────────────── Screens ────────────────────────────────
+
+  private showScreen(screen: Screen): void {
+    this.screen = screen;
+    const reading = screen === 'reader';
+    if (reading) this.library.hide();
+    else this.library.show();
+    this.readerScreen.hidden = !reading;
+    this.root.dataset.screen = screen;
+    // The reader is a fixed, full-viewport scroller; the page itself must not scroll under it.
+    document.documentElement.dataset.screen = screen;
+    this.topbar.setAutoHide(reading);
+    this.updateOverlays();
+  }
+
+  private modalOpen(): boolean {
+    return this.settingsPanel.isOpen || this.help.isOpen || this.onboarding.isOpen;
+  }
+
+  private syncModalState(): void {
+    this.screens.inert = this.modalOpen() || this.calibration !== null;
+  }
+
+  /** Closes the settings drawer and help; returns whether anything was open. */
+  private closePanels(): boolean {
+    const wasOpen = this.settingsPanel.isOpen || this.help.isOpen;
+    this.help.close();
+    this.settingsPanel.close();
+    this.syncModalState();
+    return wasOpen;
+  }
+
+  private applyTheme(): void {
+    const s = this.store.get();
+    const theme = resolveTheme(s.theme, this.darkQuery?.matches ?? false);
+    const html = document.documentElement;
+    html.dataset.theme = theme;
+    html.dataset.readingFont = s.fontFamily;
+    html.style.colorScheme = theme === 'dark' ? 'dark' : 'light';
+    const bg = getComputedStyle(html).getPropertyValue('--gr-bg').trim();
+    if (bg) {
+      let meta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+      if (!meta) {
+        meta = document.createElement('meta');
+        meta.name = 'theme-color';
+        document.head.appendChild(meta);
+      }
+      meta.content = bg;
+    }
+  }
+
+  private greetLibrary(): void {
+    if (this.greeted) return;
+    this.greeted = true;
+    this.timers.set(
+      'greet',
+      () => {
+        if (this.session) return;
+        this.bus.emit('buddy-say', {
+          text: this.hasRecent ? 'Welcome back! Your books are right where you left them.' : "Hi, I'm Dewey! Pick a book and I'll read along.",
+          priority: 'normal',
+          mood: 'happy',
+        });
+      },
+      700,
+    );
+  }
+
+  private async runOnboarding(samplesReady: Promise<void> = Promise.resolve()): Promise<void> {
+    const pending = this.onboarding.run();
+    this.syncModalState();
+    const choice = await pending;
+    this.syncModalState();
+    if (this.destroyed) return;
+    if (!choice) {
+      this.greetLibrary();
+      return;
+    }
+    if (choice === 'webcam') void preloadFaceLandmarker();
+    this.selectSource(choice);
+    if (this.session) return;
+    // Get them reading straight away, with the guide to how reading eyes work.
+    await samplesReady;
+    const first = this.samples?.[0];
+    if (first && !this.session && !this.destroyed) await this.openSample(first.id);
+    else this.greetLibrary();
+  }
+
+  // ───────────────────────────────── Books ─────────────────────────────────
+
+  private async loadSamples(): Promise<void> {
+    this.library.setSamples({ status: 'loading' });
+    try {
+      const samples = await listSampleBooks();
+      if (this.destroyed) return;
+      this.samples = samples;
+      this.library.setSamples({ status: 'ready', samples });
+    } catch (err) {
+      console.warn('[app] could not load the sample books', err);
+      if (!this.destroyed) this.library.setSamples({ status: 'error', message: 'The sample books could not be loaded.' });
+    }
+  }
+
+  private async refreshRecent(): Promise<void> {
+    try {
+      const entries = await listBooks();
+      if (this.destroyed) return;
+      this.hasRecent = entries.length > 0;
+      this.library.setRecent(entries);
+    } catch (err) {
+      console.warn('[app] could not list saved books', err);
+    }
+  }
+
+  private openFromFile(file: File): Promise<boolean> {
+    return this.openWith(`Opening “${file.name}”…`, () => loadBookFromFile(file));
+  }
+
+  private openFromText(text: string, title: string | null): Promise<boolean> {
+    // The loader detects the format (text, Markdown or HTML) and a title when none is given.
+    return this.openWith('Preparing your text…', async () =>
+      loadBookFromText(text, { ...(title ? { title } : {}), source: 'paste' }),
+    );
+  }
+
+  private openFromUrl(url: string): Promise<boolean> {
+    let host = url;
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      /* keep the raw text */
+    }
+    return this.openWith(`Fetching from ${host}…`, () => loadBookFromUrl(url));
+  }
+
+  private openSample(id: string): Promise<boolean> {
+    return this.openWith('Opening the sample…', () => loadSampleBook(id));
+  }
+
+  private openSaved(id: string): Promise<boolean> {
+    return this.openWith('Opening…', async () => {
+      const book = await getBook(id);
+      if (!book) throw new Error('That book is no longer saved on this device.');
+      return book;
+    });
+  }
+
+  /** Loads a book with a busy indicator; only the most recent request wins. */
+  private async openWith(label: string, load: () => Promise<Book>): Promise<boolean> {
+    const seq = ++this.openSeq;
+    this.library.setBusy(label);
+    const busyToast = this.screen === 'reader' ? this.toasts.show({ id: 'opening', message: label, durationMs: 0 }) : null;
+    try {
+      const book = await load();
+      if (seq !== this.openSeq || this.destroyed) return false;
+      await this.openBook(book, seq);
+      this.library.resetForms();
+      return true;
+    } catch (err) {
+      if (seq !== this.openSeq || this.destroyed) return false;
+      console.warn('[app] could not open the book', err);
+      this.toasts.show({ id: 'open-failed', tone: 'error', title: 'Couldn’t open that book', message: errorMessage(err) });
+      return false;
+    } finally {
+      if (busyToast) this.toasts.dismiss(busyToast);
+      if (seq === this.openSeq && !this.destroyed) this.library.setBusy(null);
+    }
+  }
+
+  private async openBook(book: Book, seq: number): Promise<void> {
+    // Saving and restoring progress are conveniences: failures must not block reading.
+    try {
+      await saveBook(book);
+    } catch (err) {
+      console.warn('[app] could not save the book to the library', err);
+    }
+    let position: ReadingPosition | null = null;
+    try {
+      position = await getProgress(book.id);
+    } catch {
+      position = null;
+    }
+    if (seq !== this.openSeq || this.destroyed) return;
+
+    this.endSession();
+    this.closePanels();
+    // Show the reader before rendering: position restore needs a laid-out scroller.
+    this.showScreen('reader');
+    try {
+      this.reader.open(book, position);
+    } catch (err) {
+      try {
+        this.reader.close();
+      } catch {
+        /* already broken */
+      }
+      this.showScreen('library');
+      throw err;
+    }
+    this.startSession(book, position);
+  }
+
+  private closeBook(): void {
+    const session = this.session;
+    const pages = this.scroll?.pagesTurned ?? 0;
+    this.endSession();
+    this.topbar.setBook(null);
+    document.title = 'Gaze Reader';
+    this.showScreen('library');
+    this.syncSource();
+    void this.refreshRecent();
+    this.library.focusPrimary();
+    if (session && pages > 0) {
+      this.bus.emit('buddy-say', {
+        text: pages === 1 ? 'One page further than before. Nice!' : `${pages} pages this time. Lovely reading!`,
+        priority: 'normal',
+        mood: 'happy',
+      });
+    }
+  }
+
+  private async removeBook(id: string, title: string): Promise<void> {
+    let book: Book | null = null;
+    let progress: ReadingPosition | null = null;
+    try {
+      [book, progress] = await Promise.all([getBook(id), getProgress(id)]);
+      await deleteBook(id);
+    } catch (err) {
+      console.warn('[app] could not remove the book', err);
+      this.toasts.show({ tone: 'error', message: `Couldn’t remove “${title}”.` });
+      return;
+    }
+    await this.refreshRecent();
+    if (!(document.activeElement instanceof HTMLElement) || document.activeElement === document.body) this.library.focusPrimary();
+    const saved = book;
+    this.toasts.show({
+      id: `removed:${id}`,
+      message: `Removed “${title}” from this device.`,
+      actions: saved ? [{ label: 'Undo', primary: true, run: () => void this.restoreBook(saved, progress) }] : [],
+    });
+  }
+
+  private async restoreBook(book: Book, progress: ReadingPosition | null): Promise<void> {
+    try {
+      await saveBook(book);
+      if (progress) await saveProgress(progress);
+    } catch (err) {
+      console.warn('[app] could not restore the book', err);
+      this.toasts.show({ tone: 'error', message: `Couldn’t restore “${book.title}”.` });
+    }
+    await this.refreshRecent();
+  }
+
+  // ──────────────────────────── Session & progress ────────────────────────────
+
+  private startSession(book: Book, position: ReadingPosition | null): void {
+    this.scroll = new ScrollController({ scroller: this.reader.scroller, bus: this.bus, getSettings: () => this.store.get() });
+    this.session = {
+      book,
+      clock: new ReadingClock(),
+      meter: new ProgressMeter(book.wordCount),
+      breaks: new BreakTimer(),
+      lastProgressEmitAt: performance.now(),
+      finished: false,
+      undos: 0,
+    };
+    this.layout = null;
+    this.resetPipeline(true);
+    this.topbar.setBook(book);
+    document.title = `${book.title} · Gaze Reader`;
+    this.focusReader();
+    this.bus.emit('book-opened', {
+      id: book.id,
+      title: book.title,
+      author: book.author,
+      wordCount: book.wordCount,
+      resumed: (position?.fraction ?? 0) > 0.001,
+    });
+    this.observeContent();
+    this.scheduleMeasure('initial', 50);
+    this.updateProgressUi();
+    this.startHeartbeat();
+    // The simulated reader remembers where it was in the previous book; start it afresh.
+    if (this.sourceKind === 'simulated') {
+      this.sourceGen++;
+      this.teardownSource();
+    }
+    this.syncSource();
+  }
+
+  /** Saves and forgets the current book without changing screens. */
+  private endSession(): void {
+    if (!this.session) return;
+    this.savePositionNow();
+    this.emitProgress(performance.now());
+    this.session = null;
+    this.stopHeartbeat();
+    for (const name of ['save-position', 'scroll-settle', 'measure', 'poor-hint', 'resize-hint']) this.timers.clear(name);
+    this.pendingMeasure = null;
+    this.unobserveContent();
+    this.scroll?.destroy();
+    this.scroll = null;
+    this.turning = false;
+    this.scrollSettling = false;
+    this.reader.close();
+    this.layout = null;
+    this.resetPipeline(true);
+  }
+
+  private focusReader(): void {
+    const scroller = this.reader.scroller;
+    if (!scroller.hasAttribute('tabindex')) scroller.tabIndex = -1;
+    scroller.focus({ preventScroll: true });
+  }
+
+  private startHeartbeat(): void {
+    if (this.heartbeatId === null) this.heartbeatId = setInterval(this.heartbeat, HEARTBEAT_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatId !== null) clearInterval(this.heartbeatId);
+    this.heartbeatId = null;
+  }
+
+  private readonly heartbeat = (): void => {
+    const now = performance.now();
+    this.refreshTracking(now);
+    const session = this.session;
+    if (!session) return;
+    const s = this.store.get();
+    const active = this.isActivelyReading(now);
+    const dt = session.clock.tick(now, active);
+    session.meter.update(this.reader.progress());
+    if (session.breaks.tick(dt, active, s.breakIntervalMin, s.breakReminders)) this.breakDue(session);
+    if (now - session.lastProgressEmitAt >= PROGRESS_EVERY_MS) this.emitProgress(now);
+    if (++this.heartbeatCount % 4 === 0) this.updateProgressUi();
+  };
+
+  private isActivelyReading(now: number): boolean {
+    if (document.hidden || this.screen !== 'reader' || this.modalOpen() || this.calibration) return false;
+    return now - this.lastValidGazeAt < ACTIVE_GAZE_WINDOW_MS || now - this.lastInputAt < ACTIVE_INPUT_WINDOW_MS;
+  }
+
+  private emitProgress(now: number): void {
+    const session = this.session;
+    if (!session) return;
+    session.lastProgressEmitAt = now;
+    const fraction = Math.min(1, Math.max(0, this.reader.progress() || 0));
+    const minutes = session.clock.minutes;
+    this.bus.emit('book-progress', {
+      fraction,
+      wordsRead: Math.round(fraction * session.book.wordCount),
+      wpm: computeWpm(session.meter.wordsAdvanced, minutes),
+      pagesTurned: this.scroll?.pagesTurned ?? 0,
+      minutesReading: Math.round(minutes * 10) / 10,
+    });
+  }
+
+  private scheduleProgressUi(): void {
+    if (this.progressRaf) return;
+    this.progressRaf = requestAnimationFrame(() => {
+      this.progressRaf = 0;
+      this.updateProgressUi();
+    });
+  }
+
+  private updateProgressUi(): void {
+    const session = this.session;
+    if (!session) return;
+    const fraction = this.reader.progress();
+    const wpm = computeWpm(session.meter.wordsAdvanced, session.clock.minutes) ?? TYPICAL_WPM;
+    const left = formatMinutes(minutesLeft(fraction, session.book.wordCount, wpm));
+    this.topbar.setProgress(fraction, formatPercent(fraction), fraction >= 0.995 || !left ? '' : `${left} left`);
+  }
+
+  private breakDue(session: ReadingSession): void {
+    this.bus.emit('break-due', { minutesReading: Math.round(session.clock.minutes) });
+    // Dewey delivers the reminder; without him, a toast does.
+    if (!this.store.get().buddyEnabled) {
+      this.toasts.show({
+        id: 'break',
+        title: 'Time for an eye break',
+        message: 'Look at something about 6 metres (20 feet) away for 20 seconds.',
+        durationMs: 15_000,
+      });
+    }
+  }
+
+  private finishBook(): void {
+    const session = this.session;
+    if (!session || session.finished) return;
+    session.finished = true;
+    this.bus.emit('book-finished', {
+      title: session.book.title,
+      minutesReading: Math.round(session.clock.minutes),
+      pagesTurned: this.scroll?.pagesTurned ?? 0,
+    });
+    this.savePositionNow();
+    this.emitProgress(performance.now());
+    this.toasts.show({
+      id: 'finished',
+      tone: 'success',
+      title: 'The end!',
+      message: `You finished “${session.book.title}”.`,
+      actions: [{ label: 'Back to the library', primary: true, run: () => this.closeBook() }],
+      durationMs: 12_000,
+    });
+  }
+
+  private scheduleSavePosition(): void {
+    this.timers.set('save-position', () => this.savePositionNow(), SAVE_POSITION_MS);
+  }
+
+  private savePositionNow(): void {
+    if (!this.session) return;
+    let pos: ReadingPosition | null = null;
+    try {
+      pos = this.reader.getPosition();
+    } catch {
+      pos = null;
+    }
+    if (!pos) return;
+    saveProgress(pos).catch((err: unknown) => console.warn('[app] could not save reading progress', err));
+  }
+
+  // ──────────────────────────────── Pipeline ────────────────────────────────
+
+  private readonly onSample = (s: GazeSample): void => {
+    if (!this.session || s.source !== this.sourceKind) return;
+    this.bus.emit('gaze', s);
+    this.tracking.push(s);
+    if (s.valid) this.lastValidGazeAt = s.t;
+
+    if (this.pipelineBlocked()) {
+      this.pipelineWasBlocked = true;
+      return;
+    }
+    if (this.pipelineWasBlocked) {
+      // Don't let a fixation straddle a pause (dialog, scroll, calibration).
+      this.pipelineWasBlocked = false;
+      this.fixations.reset();
+    }
+
+    const { completed } = this.fixations.push(s);
+    if (completed) {
+      this.bus.emit('fixation', completed);
+      this.bus.emit('line-estimate', this.lineTracker.onFixation(completed));
+      this.lastEstimateEmitAt = s.t;
+    }
+    const live = this.lineTracker.onSample(s);
+    if (live && s.t - this.lastEstimateEmitAt >= ESTIMATE_EMIT_MS) {
+      this.bus.emit('line-estimate', live);
+      this.lastEstimateEmitAt = s.t;
+    }
+    const decision = this.pageEnd.update({ t: s.t, gaze: s, estimate: this.lineTracker.estimate, layout: this.layout });
+    if (decision.trigger) this.onPageEnd(decision);
+  };
+
+  /** The reading model only sees samples while the text is still and the reader is looking at it. */
+  private pipelineBlocked(): boolean {
+    return (
+      this.layout === null ||
+      this.phase !== 'running' ||
+      this.screen !== 'reader' ||
+      document.hidden ||
+      this.turning ||
+      this.scrollSettling ||
+      (this.scroll?.animating ?? false) ||
+      this.calibration !== null ||
+      this.modalOpen()
+    );
+  }
+
+  private resetPipeline(full: boolean): void {
+    this.fixations.reset();
+    this.pageEnd.reset();
+    if (full) this.lineTracker.reset();
+    this.pipelineWasBlocked = false;
+    this.lastEstimateEmitAt = Number.NEGATIVE_INFINITY;
+  }
+
+  // ────────────────────────────── Page turning ──────────────────────────────
+
+  private onPageEnd(decision: PageEndDecision): void {
+    const scroll = this.scroll;
+    if (!scroll || !this.store.get().autoScroll || this.turning || scroll.animating) return;
+    if (scroll.atEnd()) {
+      this.finishBook();
+      this.pageEnd.notifyScrolled(performance.now());
+      return;
+    }
+    void this.turnPage({ auto: true, reason: decision.reason, decision });
+  }
+
+  private async pageForward(): Promise<void> {
+    const scroll = this.scroll;
+    if (!scroll || !this.session) return;
+    if (scroll.atEnd()) {
+      this.finishBook();
+      return;
+    }
+    await this.turnPage({ auto: false, reason: 'manual' });
+  }
+
+  private async turnPage(opts: { auto: boolean; reason: string; decision?: PageEndDecision }): Promise<void> {
+    const scroll = this.scroll;
+    if (!scroll || this.turning || scroll.animating) return;
+    const layout = this.layout ?? this.measure('scroll');
+    const lines = layout?.lines ?? [];
+    const target =
+      opts.decision && opts.decision.targetLineIndex >= 0 && opts.decision.targetLineIndex < lines.length
+        ? opts.decision.targetLineIndex
+        : lastFullyVisibleIndex(lines);
+    const oldDocTop = lines[target]?.docTop ?? null;
+    if (opts.decision) this.bus.emit('page-end', opts.decision);
+    this.turning = true;
+    try {
+      await scroll.turnPage(layout, target, { auto: opts.auto, reason: opts.reason });
+    } catch (err) {
+      console.warn('[app] page turn failed', err);
+    } finally {
+      this.turning = false;
+    }
+    if (this.scroll === scroll && this.session) this.afterJump('turn', oldDocTop);
+  }
+
+  private async pageBack(): Promise<void> {
+    const scroll = this.scroll;
+    if (!scroll || this.turning || scroll.animating) return;
+    this.turning = true;
+    try {
+      await scroll.pageBack(this.layout);
+    } catch (err) {
+      console.warn('[app] page back failed', err);
+    } finally {
+      this.turning = false;
+    }
+    if (this.scroll === scroll && this.session) this.afterJump('back');
+  }
+
+  private async undoTurn(): Promise<void> {
+    const scroll = this.scroll;
+    const session = this.session;
+    if (!scroll || !session || this.turning) return;
+    this.turning = true;
+    let undone = false;
+    try {
+      undone = await scroll.undo();
+    } catch (err) {
+      console.warn('[app] undo failed', err);
+    } finally {
+      this.turning = false;
+    }
+    if (this.scroll !== scroll || this.session !== session) return;
+    if (!undone) {
+      this.toasts.show({ id: 'undo', message: 'There’s no page turn to undo.' });
+      return;
+    }
+    this.afterJump('undo');
+    session.undos++;
+    if (session.undos === 2 && this.store.get().sensitivity !== 'relaxed') {
+      this.toasts.show({
+        id: 'undo',
+        title: 'Pages turning too early?',
+        message: 'Relaxed sensitivity waits until you have clearly finished the page.',
+        actions: [{ label: 'Use Relaxed', primary: true, run: () => this.store.update({ sensitivity: 'relaxed' }) }],
+      });
+    }
+  }
+
+  /** After any programmatic jump: re-measure, re-seat the line tracker, start the cooldown. */
+  private afterJump(kind: 'turn' | 'back' | 'undo', oldDocTop: number | null = null): void {
+    this.timers.clear('scroll-settle');
+    this.scrollSettling = false;
+    const layout = this.measure(kind === 'undo' ? 'scroll' : 'page-turn');
+    if (layout && kind !== 'undo') {
+      const resume = kind === 'turn' ? resumeLineIndex(layout.lines, oldDocTop, layout.linePitch) : firstFullyVisibleIndex(layout.lines);
+      if (resume >= 0) this.lineTracker.afterPageTurn(resume);
+    }
+    this.pageEnd.notifyScrolled(performance.now());
+    this.fixations.reset();
+    this.updateProgressUi();
+    this.scheduleSavePosition();
+  }
+
+  // ───────────────────────────────── Layout ─────────────────────────────────
+
+  private measure(reason: LayoutChangeReason): LineLayout | null {
+    if (!this.session || this.screen !== 'reader') return null;
+    let layout: LineLayout;
+    try {
+      layout = this.reader.measureLayout();
+    } catch (err) {
+      console.warn('[app] measuring the text failed', err);
+      return this.layout;
+    }
+    this.layout = layout;
+    this.lineTracker.setLayout(layout, reason);
+    this.bus.emit('layout', layout);
+    return layout;
+  }
+
+  /** Debounced re-measure; coalesced requests keep the strongest reason. */
+  private scheduleMeasure(reason: LayoutChangeReason, delayMs = 150): void {
+    if (!this.session) return;
+    const pending = this.pendingMeasure;
+    if (pending === null || MEASURE_PRIORITY[reason] > MEASURE_PRIORITY[pending]) this.pendingMeasure = reason;
+    this.timers.set(
+      'measure',
+      () => {
+        const r = this.pendingMeasure ?? reason;
+        this.pendingMeasure = null;
+        // A turn in flight re-measures when it lands.
+        if (this.turning || this.scroll?.animating) return;
+        this.measure(r);
+      },
+      delayMs,
+    );
+  }
+
+  private observeContent(): void {
+    this.unobserveContent();
+    if (typeof ResizeObserver === 'undefined') return;
+    // Catches late font loads and typography changes that reflow the text.
+    this.contentObserver = new ResizeObserver(() => this.scheduleMeasure('content'));
+    this.contentObserver.observe(this.reader.content);
+  }
+
+  private unobserveContent(): void {
+    this.contentObserver?.disconnect();
+    this.contentObserver = null;
+  }
+
+  private readonly onReaderScroll = (): void => {
+    this.scheduleProgressUi();
+    if (!this.session || this.turning || this.scroll?.animating) return;
+    // The trailing scroll event of a jump we have already measured.
+    if (!this.scrollSettling && this.layout && Math.abs(this.reader.scroller.scrollTop - this.layout.scrollTop) < 1) return;
+    this.scrollSettling = true;
+    this.pageEnd.notifyScrolled(performance.now());
+    this.timers.set(
+      'scroll-settle',
+      () => {
+        this.scrollSettling = false;
+        if (!this.session) return;
+        this.measure('scroll');
+        this.fixations.reset();
+        this.scheduleSavePosition();
+      },
+      SCROLL_SETTLE_MS,
+    );
+  };
+
+  // ──────────────────────────────── Sources ────────────────────────────────
+
+  private viewportSize(): { width: number; height: number } {
+    return { width: window.innerWidth, height: window.innerHeight };
+  }
+
+  /** The source that should be running right now, or null. */
+  private desiredSource(): GazeSourceKind | null {
+    if (this.destroyed || !this.session || this.hiddenLong) return null;
+    const kind = this.store.get().gazeSource;
+    if (kind === 'webcam' && this.webcamHold) return null;
+    return kind;
+  }
+
+  /** Brings the running source in line with desiredSource(). Idempotent; safe to call at any time. */
+  private syncSource(): void {
+    const want = this.desiredSource();
+    if (want !== null && want === this.sourceKind) return;
+    const gen = ++this.sourceGen;
+    this.teardownSource();
+    if (want === null) {
+      this.setIdlePhase();
+      return;
+    }
+    this.sourceKind = want;
+    void this.bringUp(want, gen);
+  }
+
+  /** The user picked a source (top bar, toast action, onboarding). Re-picking the current one retries it. */
+  private selectSource(kind: GazeSourceKind): void {
+    if (kind === 'webcam') this.webcamHold = null;
+    const s = this.store.get();
+    const patch: Partial<AppSettings> = {};
+    // The demo exists to show automatic page turns.
+    if (kind === 'simulated' && !s.autoScroll) patch.autoScroll = true;
+    if (s.gazeSource !== kind) patch.gazeSource = kind;
+    if (Object.keys(patch).length > 0) this.store.update(patch);
+    if (patch.gazeSource === undefined) this.syncSource();
+    if (kind === 'webcam' && !this.session) void preloadFaceLandmarker();
+  }
+
+  private async bringUp(kind: GazeSourceKind, gen: number): Promise<void> {
+    const stale = (): boolean => gen !== this.sourceGen || this.destroyed;
+    try {
+      let source: GazeSource;
+      if (kind === 'webcam') {
+        const camera = await this.prepareWebcam(gen);
+        if (stale()) return;
+        if (!camera) {
+          this.teardownSource();
+          this.setIdlePhase();
+          return;
+        }
+        source = new WebcamGazeSource({ features: camera, getModel: () => this.model ?? null });
+      } else {
+        this.setPhase('starting');
+        source =
+          kind === 'mouse'
+            ? new MouseGazeSource({ noisePx: () => this.store.get().mouseNoisePx })
+            : new SimulatedReaderSource({
+                getLayout: () => this.layout,
+                wpm: () => this.store.get().simulatedWpm,
+                seed: (Date.now() ^ Math.floor(Math.random() * 0x7fffffff)) >>> 0,
+              });
+      }
+      const off = source.onSample(this.onSample);
+      try {
+        await source.start();
+      } catch (err) {
+        off();
+        throw err;
+      }
+      if (stale()) {
+        off();
+        source.stop();
+        return;
+      }
+      this.source = source;
+      this.offSample = off;
+      this.setPhase('running');
+      this.introduceSource(kind);
+    } catch (err) {
+      if (stale()) return;
+      console.error(`[app] could not start the ${kind} source`, err);
+      this.teardownSource();
+      if (kind === 'webcam') {
+        this.cameraFailed(err);
+        this.setIdlePhase();
+      } else {
+        this.setPhase('error', errorMessage(err));
+        this.toasts.show({ id: 'source', tone: 'error', title: 'Couldn’t start', message: errorMessage(err) });
+      }
+    }
+  }
+
+  /** Stops whatever is running (or starting), including the camera and any calibration. */
+  private teardownSource(): void {
+    this.offSample?.();
+    this.offSample = null;
+    this.source?.stop();
+    this.source = null;
+    this.sourceKind = null;
+    // Resolves the pending run() with null; the bring-up sees a stale generation and backs out.
+    this.calibration?.cancel();
+    this.offCameraError?.();
+    this.offCameraError = null;
+    this.camera?.stop();
+    this.fixations.reset();
+    this.pipelineWasBlocked = false;
+    this.updateOverlays();
+  }
+
+  /**
+   * Starts the camera and makes sure there is a usable calibration. Returns
+   * the running camera, or null (after telling the reader why) when the
+   * webcam can't be used.
+   */
+  private async prepareWebcam(gen: number): Promise<CameraFeatureSource | null> {
+    const stale = (): boolean => gen !== this.sourceGen || this.destroyed;
+    this.setPhase('starting');
+    this.camera ??= new CameraFeatureSource();
+    const camera = this.camera;
+    try {
+      await camera.start();
+    } catch (err) {
+      if (!stale()) this.cameraFailed(err);
+      return null;
+    }
+    if (stale()) return null;
+    if (!camera.running) {
+      this.cameraFailed(camera.lastError ?? new Error('The camera did not start.'));
+      return null;
+    }
+    this.offCameraError?.();
+    this.offCameraError = camera.onError((err) => this.onCameraRuntimeError(err));
+    this.updateOverlays();
+
+    const model = this.currentModel();
+    if (!model || this.forceCalibration) {
+      return (await this.calibrate('standard', gen)) ? camera : null;
+    }
+    if (!calibrationFitsViewport(model.viewport, this.viewportSize())) {
+      this.bus.emit('buddy-say', { text: 'Your window changed size, so let’s do a quick 5-dot refresh.', priority: 'high', mood: 'thinking' });
+      return (await this.calibrate('quick', gen)) ? camera : null;
+    }
+    return camera;
+  }
+
+  private cameraFailed(err: unknown): void {
+    const code = trackerErrorCode(err);
+    const info = cameraErrorInfo(code);
+    console.warn(`[app] camera unavailable (${code})`, err);
+    this.webcamHold = { reason: 'failed', detail: info.title };
+    const actions: ToastAction[] = [];
+    if (info.retryable) actions.push({ label: 'Try again', primary: true, run: () => this.selectSource('webcam') });
+    actions.push({ label: 'Use my mouse', primary: !info.retryable, run: () => this.selectSource('mouse') });
+    actions.push({ label: 'Watch a demo', run: () => this.selectSource('simulated') });
+    this.toasts.show({ id: 'camera', tone: 'error', title: info.title, message: info.message, actions, durationMs: 20_000 });
+    this.bus.emit('buddy-say', { text: info.buddyLine, priority: 'high', mood: 'worried' });
+  }
+
+  /** The camera stopped on its own after starting (unplugged, taken by another app). */
+  private onCameraRuntimeError(err: unknown): void {
+    if (this.sourceKind !== 'webcam') return;
+    this.cameraFailed(err);
+    this.syncSource();
+  }
+
+  private introduceSource(kind: GazeSourceKind): void {
+    if (this.introduced.has(kind)) return;
+    this.introduced.add(kind);
+    if (kind === 'mouse') {
+      this.bus.emit('buddy-say', { text: 'Point at the line you’re reading. I’ll turn the page at the bottom.', priority: 'high', mood: 'happy' });
+    } else if (kind === 'simulated') {
+      this.bus.emit('buddy-say', { text: 'Watch me read! When I reach the last line, the page turns itself.', priority: 'high', mood: 'excited' });
+    }
+  }
+
+  private hidePreview(): void {
+    this.store.update({ showCameraPreview: false });
+    this.toasts.show({ id: 'preview', message: 'Camera preview hidden. You can bring it back in Settings.' });
+  }
+
+  private updateOverlays(): void {
+    const s = this.store.get();
+    const reading = this.screen === 'reader';
+    const camera = this.camera;
+    const webcamLive = this.sourceKind === 'webcam' && camera !== null && camera.running && this.phase !== 'calibrating';
+    // Lets layouts keep clear of Dewey (e.g. onboarding on a phone).
+    const html = document.documentElement;
+    html.dataset.buddyCorner = s.buddyCorner;
+    html.dataset.buddy = s.buddyEnabled ? 'on' : 'off';
+    this.preview.setCorner(previewCorner(s.buddyCorner));
+    this.preview.attach(webcamLive ? camera : null);
+    this.preview.setVisible(reading && webcamLive && s.showCameraPreview);
+    // In the demo the dot is the point: it shows the simulated reader's eyes.
+    this.gazeDot.setVisible(reading && (s.showGazeDot || this.sourceKind === 'simulated'));
+    this.debug.setVisible(reading && s.showDebugOverlay);
+  }
+
+  // ─────────────────────────────── Calibration ───────────────────────────────
+
+  private currentModel(): GazeModel | null {
+    if (this.model === undefined) {
+      this.model = loadCalibration({ featureLength: FEATURE_NAMES.length, featureNames: FEATURE_NAMES });
+      this.savedCalibration = this.model !== null;
+    }
+    return this.model;
+  }
+
+  /**
+   * Runs the calibration overlay on the running camera. Resolves true when
+   * there is a usable model afterwards (new, or the previous one when a
+   * refresh was cancelled).
+   */
+  private async calibrate(mode: 'quick' | 'standard', gen: number): Promise<boolean> {
+    const stale = (): boolean => gen !== this.sourceGen || this.destroyed;
+    const camera = this.camera;
+    if (!camera?.running || this.calibration) return false;
+    const base = this.currentModel();
+    this.closePanels();
+    this.setPhase('calibrating');
+    const overlay = new CalibrationOverlay({
+      features: camera,
+      bus: this.bus,
+      video: camera.video,
+      mode: mode === 'quick' && base ? 'quick' : 'standard',
+      baseModel: base,
+      // Accuracy is reported as "≈ N lines" at the reader's actual text size.
+      linePitchPx: () => this.layout?.linePitch ?? null,
+      featureNames: FEATURE_NAMES,
+    });
+    this.calibration = overlay;
+    this.syncModalState();
+    overlay.mount(this.root);
+    let result: { model: GazeModel } | null = null;
+    try {
+      result = await overlay.run();
+    } finally {
+      overlay.destroy();
+      if (this.calibration === overlay) this.calibration = null;
+      this.forceCalibration = false;
+      this.syncModalState();
+    }
+    if (stale()) return false;
+    if (result) {
+      this.model = result.model;
+      saveCalibration(result.model);
+      this.savedCalibration = true;
+      this.webcamHold = null;
+      return true;
+    }
+    if (base) return true;
+    this.webcamHold = { reason: 'uncalibrated' };
+    this.toasts.show({
+      id: 'camera',
+      tone: 'warn',
+      title: 'Not calibrated yet',
+      message: 'A one-minute calibration lets Dewey follow your eyes. You can also read with your mouse, or watch the demo.',
+      actions: [
+        { label: 'Calibrate', primary: true, run: () => this.recalibrate() },
+        { label: 'Use my mouse', run: () => this.selectSource('mouse') },
+        { label: 'Watch a demo', run: () => this.selectSource('simulated') },
+      ],
+      durationMs: 20_000,
+    });
+    return false;
+  }
+
+  private recalibrate(): void {
+    this.forceCalibration = true;
+    this.webcamHold = null;
+    if (!this.session) {
+      this.toasts.show({ id: 'calibrate-later', message: 'Open a book and calibration will start right away.' });
+    }
+    if (this.store.get().gazeSource !== 'webcam') {
+      this.store.update({ gazeSource: 'webcam' }); // → settings-changed → syncSource → calibrates
+    } else if (this.sourceKind === 'webcam' && this.phase === 'running' && this.source) {
+      void this.recalibrateInPlace('standard');
+    } else if (this.phase !== 'calibrating') {
+      this.syncSource();
+    }
+  }
+
+  /** Recalibrates without restarting the camera; gaze processing pauses meanwhile. */
+  private async recalibrateInPlace(mode: 'quick' | 'standard'): Promise<void> {
+    const gen = this.sourceGen;
+    const source = this.source;
+    if (!source || this.calibration) return;
+    this.offSample?.();
+    this.offSample = null;
+    source.stop();
+    let ok = false;
+    try {
+      ok = await this.calibrate(mode, gen);
+    } catch (err) {
+      console.error('[app] calibration failed', err);
+    }
+    if (gen !== this.sourceGen || this.destroyed) return;
+    if (!ok) {
+      this.teardownSource();
+      this.setIdlePhase();
+      return;
+    }
+    this.offSample = source.onSample(this.onSample);
+    await source.start();
+    if (gen !== this.sourceGen || this.destroyed) return;
+    // A new model means a new drift estimate: start the reading model fresh.
+    this.resetPipeline(true);
+    if (this.layout) this.lineTracker.setLayout(this.layout, 'initial');
+    this.setPhase('running');
+  }
+
+  private forgetCalibration(): void {
+    clearCalibration();
+    this.model = null;
+    this.savedCalibration = false;
+    if (this.sourceKind === 'webcam') {
+      this.webcamHold = { reason: 'uncalibrated' };
+      this.syncSource();
+    }
+  }
+
+  private schedulePreload(): void {
+    if (this.store.get().gazeSource !== 'webcam') return;
+    // Warm the face model while the reader browses, so opening a book is quick.
+    this.timers.set('preload', () => void preloadFaceLandmarker(), PRELOAD_DELAY_MS);
+  }
+
+  private maybeSuggestRefresh(): void {
+    const model = this.model;
+    if (!model || this.sourceKind !== 'webcam' || this.phase !== 'running') return;
+    if (calibrationFitsViewport(model.viewport, this.viewportSize())) return;
+    this.toasts.show({
+      id: 'refresh-calibration',
+      title: 'Window size changed',
+      message: 'A quick 5-dot refresh keeps page turns accurate.',
+      actions: [{ label: 'Refresh now', primary: true, run: () => void this.recalibrateInPlace('quick') }],
+    });
+  }
+
+  // ───────────────────────────── Tracking state ─────────────────────────────
+
+  private setPhase(phase: SourcePhase, detail?: string): void {
+    this.phase = phase;
+    this.phaseDetail = detail;
+    const now = performance.now();
+    if (phase === 'running') this.tracking.reset(now);
+    this.refreshTracking(now);
+    this.updateOverlays();
+  }
+
+  private setIdlePhase(): void {
+    const hold = this.store.get().gazeSource === 'webcam' ? this.webcamHold : null;
+    if (hold?.reason === 'failed') this.setPhase('error', hold.detail);
+    else if (hold?.reason === 'uncalibrated') this.setPhase('off', 'Not calibrated');
+    else this.setPhase('off');
+  }
+
+  private refreshTracking(now: number): void {
+    const status = this.tracking.evaluate(now, {
+      phase: this.phase,
+      kind: this.sourceKind,
+      autoScroll: this.store.get().autoScroll,
+      detail: this.phaseDetail,
+    });
+    const cameraOn = this.camera?.running ?? false;
+    const kind = this.sourceKind;
+    const key = `${status.state}|${status.detail ?? ''}|${kind ?? ''}|${cameraOn}`;
+    if (key !== this.pillKey) {
+      this.pillKey = key;
+      this.topbar.setStatus({ ...status, kind, cameraOn });
+    }
+    if (sameStatus(this.status, status)) return;
+    this.status = status;
+    this.bus.emit('tracking-state', status);
+    if (status.state === 'poor' && !this.poorHintShown) this.timers.set('poor-hint', () => this.showPoorHint(), POOR_HINT_AFTER_MS);
+    else if (status.state !== 'poor') this.timers.clear('poor-hint');
+  }
+
+  private showPoorHint(): void {
+    if (this.status?.state !== 'poor' || this.poorHintShown) return;
+    this.poorHintShown = true;
+    this.toasts.show({
+      id: 'poor',
+      tone: 'warn',
+      title: 'Tracking is a little unsure',
+      message: 'More light on your face, and sitting about an arm’s length away, usually help.',
+      actions: [{ label: 'Recalibrate', run: () => this.recalibrate() }],
+    });
+  }
+
+  // ─────────────────────────── Commands & settings ───────────────────────────
+
+  private bindBus(): void {
+    this.unsubs.push(
+      this.bus.on('command', ({ name }) => this.runCommand(name)),
+      this.bus.on('settings-changed', ({ settings, changed }) => this.onSettingsChanged(settings, changed)),
+      this.bus.on('error', ({ code, message }) => this.showError(code, message)),
+    );
+  }
+
+  private runCommand(name: CommandName): void {
+    if (this.destroyed) return;
+    const s = this.store.get();
+    switch (name) {
+      case 'toggle-autoscroll':
+        this.setAutoScroll(!s.autoScroll);
+        break;
+      case 'pause':
+        this.setAutoScroll(false);
+        break;
+      case 'resume':
+        this.setAutoScroll(true);
+        break;
+      case 'recalibrate':
+        this.recalibrate();
+        break;
+      case 'open-settings':
+        this.help.close();
+        this.settingsPanel.open();
+        this.syncModalState();
+        break;
+      case 'close-settings':
+        this.settingsPanel.close();
+        this.syncModalState();
+        break;
+      case 'page-forward':
+        void this.pageForward();
+        break;
+      case 'page-back':
+        void this.pageBack();
+        break;
+      case 'undo-turn':
+        void this.undoTurn();
+        break;
+      case 'toggle-debug':
+        this.store.update({ showDebugOverlay: !s.showDebugOverlay });
+        break;
+      case 'toggle-gaze-dot':
+        this.store.update({ showGazeDot: !s.showGazeDot });
+        break;
+      case 'open-library':
+        this.closeBook();
+        break;
+      case 'show-help':
+        this.settingsPanel.close();
+        this.help.toggle();
+        this.syncModalState();
+        break;
+    }
+  }
+
+  private setAutoScroll(on: boolean): void {
+    if (this.store.get().autoScroll === on) return;
+    this.store.update({ autoScroll: on });
+    // Let the reader see the pill change.
+    if (this.screen === 'reader') this.topbar.reveal();
+  }
+
+  private onSettingsChanged(s: AppSettings, changed: readonly (keyof AppSettings)[]): void {
+    const any = (keys: readonly (keyof AppSettings)[]): boolean => keys.some((k) => changed.includes(k));
+    if (any(['theme', 'fontFamily'])) this.applyTheme();
+    if (any(TYPOGRAPHY_KEYS)) {
+      this.reader.applySettings(s);
+      this.scheduleMeasure('content', 60);
+    }
+    if (any(['sensitivity', 'glanceDownToTurn'])) {
+      this.pageEnd.configure({ sensitivity: s.sensitivity, glanceDownToTurn: s.glanceDownToTurn });
+    }
+    if (changed.includes('autoScroll')) {
+      // Resuming shouldn't fire on a dwell that built up while paused.
+      if (s.autoScroll) this.pageEnd.reset();
+      this.refreshTracking(performance.now());
+    }
+    if (changed.includes('gazeSource')) this.syncSource();
+    if (any(OVERLAY_KEYS)) this.updateOverlays();
+  }
+
+  private showError(code: string, message: string): void {
+    const key = `${code}:${message}`;
+    const now = Date.now();
+    if (key === this.lastError.key && now - this.lastError.at < 10_000) return;
+    this.lastError = { key, at: now };
+    this.toasts.show({
+      id: `error:${code}`,
+      tone: 'error',
+      title: 'Something went wrong',
+      message: message || 'An unexpected error occurred. Your books and progress are safe.',
+    });
+  }
+
+  // ─────────────────────────────── DOM events ───────────────────────────────
+
+  private bindDom(): void {
+    const signal = this.ac.signal;
+    window.addEventListener('keydown', this.onKeyDown, { signal });
+    window.addEventListener('resize', this.onWindowResize, { signal, passive: true });
+    document.addEventListener('visibilitychange', this.onVisibility, { signal });
+    window.addEventListener('pagehide', () => this.savePositionNow(), { signal });
+    for (const type of ['pointerdown', 'wheel', 'touchstart'] as const) {
+      window.addEventListener(type, this.noteInput, { signal, passive: true });
+    }
+    window.addEventListener('dragenter', this.onDragEnter, { signal });
+    window.addEventListener('dragover', this.onDragOver, { signal });
+    window.addEventListener('dragleave', this.onDragLeave, { signal });
+    window.addEventListener('drop', this.onDrop, { signal });
+    this.darkQuery?.addEventListener(
+      'change',
+      () => {
+        if (this.store.get().theme === 'auto') this.applyTheme();
+      },
+      { signal },
+    );
+    this.unsubs.push(this.reader.onScroll(this.onReaderScroll));
+  }
+
+  private readonly noteInput = (): void => {
+    this.lastInputAt = performance.now();
+  };
+
+  private readonly onKeyDown = (e: KeyboardEvent): void => {
+    this.noteInput();
+    if (e.defaultPrevented || this.destroyed) return;
+    const action = shortcutFor(e);
+    if (!action) return;
+    const origin = e.composedPath()[0];
+    if (shouldIgnoreShortcut(e, origin instanceof Element ? origin : null)) return;
+    if (action === 'escape') {
+      if (this.closePanels()) e.preventDefault();
+      return;
+    }
+    // Calibration and dialogs own the keyboard while they are open.
+    if (this.calibration || this.modalOpen()) return;
+    const def = SHORTCUTS.find((d) => d.action === action);
+    if (def?.readerOnly && !this.session) return;
+    e.preventDefault();
+    this.bus.emit('command', { name: action });
+  };
+
+  private readonly onWindowResize = (): void => {
+    this.scheduleMeasure('resize');
+    this.timers.set('resize-hint', () => this.maybeSuggestRefresh(), 800);
+  };
+
+  private readonly onVisibility = (): void => {
+    if (document.hidden) {
+      this.savePositionNow();
+      // Don't keep the camera on for a tab nobody is looking at.
+      this.timers.set(
+        'hidden-stop',
+        () => {
+          this.hiddenLong = true;
+          this.syncSource();
+        },
+        HIDDEN_STOP_MS,
+      );
+      return;
+    }
+    this.timers.clear('hidden-stop');
+    this.dragDepth = 0;
+    if (this.hiddenLong) {
+      this.hiddenLong = false;
+      this.syncSource();
+    }
+  };
+
+  private readonly onDragEnter = (e: DragEvent): void => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    this.dragDepth++;
+    this.library.setDragActive(true);
+  };
+
+  private readonly onDragOver = (e: DragEvent): void => {
+    if (!hasFiles(e)) return;
+    // Without this the browser would navigate away to the dropped file.
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = this.calibration ? 'none' : 'copy';
+  };
+
+  private readonly onDragLeave = (e: DragEvent): void => {
+    if (!hasFiles(e)) return;
+    this.dragDepth = Math.max(0, this.dragDepth - 1);
+    if (this.dragDepth === 0) this.library.setDragActive(false);
+  };
+
+  private readonly onDrop = (e: DragEvent): void => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    this.dragDepth = 0;
+    this.library.setDragActive(false);
+    const file = e.dataTransfer?.files[0];
+    if (!file || this.calibration || this.onboarding.isOpen) return;
+    this.closePanels();
+    void this.openFromFile(file);
+  };
+}

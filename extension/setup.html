@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Camera setup · Gaze Reader</title>
+  </head>
+  <body>
+    <main class="setup">
+      <svg class="hero" viewBox="0 0 160 96" aria-hidden="true">
+        <defs>
+          <linearGradient id="hero-bg" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="#ffbe5c" />
+            <stop offset="1" stop-color="#ef7d2d" />
+          </linearGradient>
+        </defs>
+        <rect x="32" y="0" width="96" height="96" rx="24" fill="url(#hero-bg)" />
+        <g fill="#fff6e6" stroke="#2b1d14" stroke-width="6">
+          <circle cx="62" cy="52" r="16" />
+          <circle cx="98" cy="52" r="16" />
+        </g>
+        <path d="M74 48q6-6 12 0M46 50l-7-5M114 50l7-5" fill="none" stroke="#2b1d14" stroke-width="6" stroke-linecap="round" />
+        <circle class="pupil" cx="66" cy="57" r="4.5" fill="#2b1d14" />
+        <circle class="pupil" cx="102" cy="57" r="4.5" fill="#2b1d14" />
+        <path d="M53 44a10 10 0 0 1 7-5M89 44a10 10 0 0 1 7-5" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" />
+      </svg>
+
+      <h1>Let Gaze Reader see where you’re reading</h1>
+      <p class="lede">
+        Gaze Reader watches your eyes through the webcam and turns the page when you reach the bottom, so you never have
+        to reach for the scroll wheel. Chrome needs your OK before it can use the camera.
+      </p>
+
+      <ul class="promises">
+        <li>
+          <strong>Stays on this device.</strong> Video is processed right here and is never recorded, uploaded or
+          stored. The only thing downloaded is the face-tracking model.
+        </li>
+        <li>
+          <strong>Only while you use it.</strong> The camera runs only while Gaze Reader is on in a tab you are looking
+          at, and the page shows a camera icon while it does.
+        </li>
+        <li>
+          <strong>Easy to switch off.</strong> Click <b>×</b> on the page, press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>G</kbd>,
+          or read with the mouse instead.
+        </li>
+      </ul>
+
+      <section class="panel" id="panel" data-state="checking" aria-live="polite">
+        <p class="panel-text" id="panel-text">Checking camera permission…</p>
+        <div class="panel-actions">
+          <button class="btn btn--primary" id="allow" type="button" hidden>Allow camera</button>
+          <button class="btn btn--primary" id="back" type="button" hidden>Back to my page</button>
+          <button class="btn" id="settings" type="button" hidden>Open Chrome camera settings</button>
+          <button class="btn" id="retry" type="button" hidden>Check again</button>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="./src/setup.ts"></script>
+  </body>
+</html>

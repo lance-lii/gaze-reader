@@ -115,6 +115,8 @@ describe('one-shot message guards', () => {
     expect(isRuntimeRequest({ type: 'open-setup' })).toBe(true);
     expect(isRuntimeRequest({ type: 'open-setup', returnTabId: 7 })).toBe(true);
     expect(isRuntimeRequest({ type: 'open-setup', returnTabId: 'seven' })).toBe(false);
+    expect(isRuntimeRequest({ type: 'page-status', enabled: true })).toBe(true);
+    expect(isRuntimeRequest({ type: 'page-status', enabled: 1 })).toBe(false);
     expect(isRuntimeRequest({ type: 'rm -rf' })).toBe(false);
   });
 

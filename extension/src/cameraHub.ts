@@ -66,6 +66,8 @@ export class CameraHub {
   private setupOpened = false;
   /** An offscreen document may exist (we created one, or one may survive a SW restart). */
   private docMayExist = true;
+  /** We asked Chrome to close the document; its disconnect is not a crash. */
+  private expectingClose = false;
   private ensuring: Promise<void> | null = null;
   /** Times the offscreen document was lost while in use, within the restart window. */
   private crashes: number[] = [];
@@ -129,7 +131,9 @@ export class CameraHub {
       this.camera = 'idle';
       this.fps = undefined;
       this.startRequested = false;
-      if (this.subscriberCount > 0 && !this.blocked) this.onOffscreenLost();
+      const deliberate = this.expectingClose;
+      this.expectingClose = false;
+      if (this.subscriberCount > 0 && !this.blocked && !deliberate) this.onOffscreenLost();
       this.reconcile(true);
     });
   }
@@ -264,6 +268,7 @@ export class CameraHub {
 
   private closeOffscreen(): void {
     this.docMayExist = false;
+    this.expectingClose = this.offscreen !== null;
     this.camera = 'idle';
     this.deps.closeOffscreen().catch((err: unknown) => this.log('closeOffscreen failed', err));
   }

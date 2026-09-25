@@ -90,9 +90,9 @@ He hopped down onto the arm of the chair, peered at the due-date slip and did a 
 
 “Then we have a deadline.” He straightened his bow tie, which made it more crooked. “What page are you on?”
 
-“One eighty-seven. Out of three hundred and four.”
+“One eighty-seven. Out of three hundred and five.”
 
-“One hundred and seventeen pages,” Dewey breathed, with the joy of someone who has just been handed a lovely puzzle. “Between now and eight o’clock. That’s about one page every four minutes. We could practically *stroll*.” He clasped his hands. “Iris, would you like to finish a book tonight?”
+“One hundred and eighteen pages,” Dewey breathed, with the joy of someone who has just been handed a lovely puzzle. “Between now and eight o’clock. That’s about one page every four minutes. We could practically *stroll*.” He clasped his hands. “Iris, would you like to finish a book tonight?”
 
 Iris looked at the book, and at the dark windows, and at the very small person in the argyle vest.
 
@@ -178,7 +178,7 @@ Dewey waited. He was very good at waiting. It turned out to be the thing Iris mo
 
 Dewey pushed up his glasses, thought for a moment, and pushed them up again, which is what he did when a thought was important.
 
-“Here is a thing I know about books,” he said. “The ending is already written. It’s sitting there on page three hundred and four, being whatever it is, whether you read it or not. You can’t make it go wrong by reading it. The only thing you get to choose is whether you’re there when it happens.”
+“Here is a thing I know about books,” he said. “The ending is already written. It’s sitting there on page three hundred and five, being whatever it is, whether you read it or not. You can’t make it go wrong by reading it. The only thing you get to choose is whether you’re there when it happens.”
 
 Iris said nothing.
 
@@ -238,7 +238,7 @@ The clock struck three, and later four. Odile kept the light for three more wint
 
 On page 303, Odile and Barnacle stood at the rail of the ferry with the island behind them.
 
-And on page 304, near the top, there was one last paragraph.
+And on page 305, near the top, there was one last paragraph.
 
 > Behind them, across the gray water, a light came on in the tower. Someone new had climbed the hundred and twelve steps. Odile did not look back; she did not need to. She knew exactly how it looked from out here: a light, left burning, for whoever came next.
 
@@ -306,9 +306,9 @@ The boy hesitated. “Does the dog—”
 
 ---
 
-Iris walked home through a bright, cold morning. On the way, she bought a stamp and mailed the card to Clem. She watered the fern, which had not expected her back so soon and seemed to perk up out of sheer surprise. Then she went to bed in the middle of the day and slept for nine hours without counting anything at all.
+Iris walked home through a bright, cold morning. On the way, she bought an envelope and a stamp and mailed the card to Clem. She watered the fern, which had not expected her back so soon and seemed to perk up out of sheer surprise. Then she went to bed in the middle of the day and slept for nine hours without counting anything at all.
 
-Clem called that evening. The first thing she said was, “What do you mean, *the dog lives*?”
+The card reached Clem on Monday. She called that evening, and the first thing she said was, “What do you mean, *the dog lives*?”
 
 They talked for two hours.
 
