@@ -565,6 +565,11 @@ html[data-screen='reader'] body {
 .gr-field__error:empty {
   display: none;
 }
+.gr-drop__error {
+  max-width: 52ch;
+  margin-top: 10px;
+  text-align: center;
+}
 .gr-inline-form__actions {
   display: flex;
   flex-wrap: wrap;
@@ -805,6 +810,29 @@ html[data-screen='reader'] body {
 .gr-reader-stage > * {
   flex: 1 1 auto;
   min-height: 0;
+}
+/*
+ * Below ~900px (with the 62ch / 22px defaults) the column's side margin is narrower
+ * than Dewey, and his body would hide the ends of the last lines, exactly where the
+ * page-end detector needs the reader to look. Stop the page above him (his box plus
+ * the edge from buddy/styles.ts). Line geometry reads the scroller's client box, so
+ * page-end zones and turns follow the smaller stage automatically.
+ */
+@media (max-width: 899px) {
+  :root[data-buddy='on'][data-buddy-corner^='bottom'] .gr-reader-stage {
+    bottom: calc(150px + max(16px, env(safe-area-inset-bottom, 0px)));
+  }
+  :root[data-buddy='on'][data-buddy-corner^='top'] .gr-reader-stage {
+    top: calc(var(--gr-topbar-h) + 8px + 150px);
+  }
+}
+@media (max-width: 560px), (max-width: 899px) and (max-height: 520px) {
+  :root[data-buddy='on'][data-buddy-corner^='bottom'] .gr-reader-stage {
+    bottom: calc(110px + max(10px, env(safe-area-inset-bottom, 0px)));
+  }
+  :root[data-buddy='on'][data-buddy-corner^='top'] .gr-reader-stage {
+    top: calc(var(--gr-topbar-h) + 8px + 110px);
+  }
 }
 /*
  * The reading surface holds focus most of the time (so Space / Page Down work),
@@ -1415,7 +1443,8 @@ html[data-screen='reader'] body {
   }
   :root[data-buddy='on'][data-buddy-corner^='top'] .gr-onboarding {
     align-items: flex-end;
-    padding-top: 170px;
+    /* Dewey now sits below the top bar (see the top-corner rule), so clear his lower edge. */
+    padding-top: calc(var(--gr-topbar-h) + 8px + 162px);
   }
   .gr-onboarding .gr-modal__surface {
     max-height: 100%;
@@ -1659,6 +1688,20 @@ html[data-screen='reader'] body {
 }
 .gr-app[data-screen='library'] .gr-toasts {
   top: 14px;
+}
+/* In the reader, keep toasts off the centre of the column (and fully in the margin on wide screens). */
+@media (min-width: 720px) {
+  .gr-app[data-screen='reader'] .gr-toasts {
+    right: max(12px, env(safe-area-inset-right));
+    left: auto;
+    transform: none;
+  }
+}
+
+/* Top corners: sit below the reader's top bar and the library header, not over their buttons. */
+.gr-app > .gr-buddy--top-left,
+.gr-app > .gr-buddy--top-right {
+  top: max(calc(var(--gr-topbar-h) + 8px), env(safe-area-inset-top, 0px));
 }
 .gr-toast {
   --tone: var(--gr-accent);

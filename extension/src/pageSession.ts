@@ -41,16 +41,30 @@ import {
   KEYS,
   isSerializedGazeModel,
   loadCalibrationJSON,
+  loadExtSettings,
   loadSettings,
   makeOrigin,
+  parseExtSettings,
   saveCalibrationJSON,
   syncSettings,
   watchKey,
+  type ExtSettings,
   type ExtStorage,
 } from './extStorage';
 import { findMainContent } from './findMainContent';
 import type { PageCommand, PageState } from './messages';
 import { findScroller, isWindow, readingViewport, scrollMetrics, type Scroller } from './pageGeometry';
+import {
+  PageModeMonitor,
+  buildPseudoLayout,
+  findPageModeScroller,
+  largestVisualRect,
+  modeLineCount,
+  pressPageKeys,
+  resolvePageTurn,
+  type PageTurnVia,
+  type ReadingMode,
+} from './pageMode';
 import { PagePill } from './pagePill';
 import type { PortLike } from './ports';
 import { RemoteFeatureSource, RemoteTrackerError, type RemoteSourceStatus } from './remoteFeatureSource';
@@ -73,6 +87,17 @@ const PROGRESS_EVERY_MS = 5_000;
  * lids lower to read the last lines, so every page end dips it for a moment.
  */
 const POOR_AFTER_MS = 2_500;
+
+/**
+ * Dewey explains page mode once per page load, however often the reader turns
+ * Gaze Reader off and on (the content script, and this module, live as long as the page).
+ */
+let pageModeExplained = false;
+
+/** Tests: forget that Dewey already explained page mode on this "page load". */
+export function resetPageModeNotice(): void {
+  pageModeExplained = false;
+}
 
 export interface PageSessionDeps {
   storage: ExtStorage;
@@ -113,11 +138,12 @@ const CAMERA_ERROR_TEXT: Record<string, string> = {
 
 export class PageSession {
   static async start(deps: PageSessionDeps): Promise<PageSession> {
-    const [settings, calibration] = await Promise.all([
+    const [settings, calibration, ext] = await Promise.all([
       loadSettings(deps.storage.area),
       loadCalibrationJSON(deps.storage.area),
+      loadExtSettings(deps.storage.area),
     ]);
-    const session = new PageSession(deps, settings, calibration ? zoomAwareFromJSON(calibration, MODEL_COMPAT) : null);
+    const session = new PageSession(deps, settings, ext, calibration ? zoomAwareFromJSON(calibration, MODEL_COMPAT) : null);
     try {
       session.boot();
     } catch (err) {
@@ -148,6 +174,12 @@ export class PageSession {
   private mainObservers: Disposer | null = null;
   private href = location.href;
   private layout: LineLayout | null = null;
+  private ext: ExtSettings;
+  /** Text mode follows measured lines; page mode (no measurable text) watches the bottom edge. */
+  private readonly modeMonitor = new PageModeMonitor();
+  private readingMode: ReadingMode = 'text';
+  /** Page turns the current scroll controller did not count: key presses, and turns by earlier scrollers. */
+  private otherTurns = 0;
 
   private model: ZoomAwareGazeModel | null;
   private remote: RemoteFeatureSource | null = null;
@@ -186,8 +218,9 @@ export class PageSession {
   private disposed = false;
   private buddyView: { from: AppSettings; view: AppSettings } | null = null;
 
-  private constructor(deps: PageSessionDeps, settings: AppSettings, model: ZoomAwareGazeModel | null) {
+  private constructor(deps: PageSessionDeps, settings: AppSettings, ext: ExtSettings, model: ZoomAwareGazeModel | null) {
     this.deps = deps;
+    this.ext = ext;
     this.model = model;
     // Never the page's localStorage: this store lives in memory and syncs with chrome.storage.local.
     this.store = createSettingsStore(this.bus, { persist: false, initial: settings });
@@ -226,7 +259,14 @@ export class PageSession {
     d.add(this.bus.on('settings-changed', ({ settings: s, changed }) => this.onSettingsChanged(s, changed)));
     d.add(this.bus.on('command', ({ name }) => this.command(name)));
 
-    const onResize = debounce(d, () => this.remeasure('resize'), 150);
+    let lastWidth = window.innerWidth;
+    const onResize = debounce(d, () => {
+      // A width (or zoom) change reflows the text, so stored undo offsets would land on
+      // unrelated text. Height-only resizes keep the history.
+      if (Math.abs(window.innerWidth - lastWidth) > 0.5) this.scroll?.clearHistory();
+      lastWidth = window.innerWidth;
+      this.remeasure('resize');
+    }, 150);
     d.listen(window, 'resize', onResize, { passive: true });
     d.listen(document, 'visibilitychange', () => this.onVisibilityChange());
     d.listen(window, 'keydown', (e) => this.onKeyDown(e), { capture: true });
@@ -237,6 +277,7 @@ export class PageSession {
 
     d.add(watchKey(this.deps.storage, KEYS.calibration, (value) => this.onStoredCalibration(value)));
     d.add(watchKey(this.deps.storage, KEYS.cameraGrantedAt, () => this.onPermissionGranted()));
+    d.add(watchKey(this.deps.storage, KEYS.extSettings, (value) => (this.ext = parseExtSettings(value))));
     d.interval(() => this.tick(), 1_000);
 
     d.add(() => {
@@ -287,6 +328,7 @@ export class PageSession {
       paused: this.paused,
       fps: this.sourceKind === 'webcam' && this.cameraRunning ? (this.remote?.fps ?? null) : null,
       detail: this.shownDetail,
+      pageMode: this.readingMode === 'page',
     };
   }
 
@@ -306,10 +348,13 @@ export class PageSession {
         void this.turnPage(this.layout ? lastFullyVisibleLine(this.layout) : -1, false, 'keyboard');
         return;
       case 'page-back':
-        void this.pageBack();
+        if (this.turnVia() === 'keys') this.pressKeys('back');
+        else void this.pageBack();
         return;
       case 'undo-turn':
-        void this.undoTurn();
+        // A key-press turn can't be taken back exactly; the closest thing is the reader's previous page.
+        if (this.turnVia() === 'keys') this.pressKeys('back');
+        else void this.undoTurn();
         return;
       case 'toggle-debug':
         this.bus.emit('settings-patch', { showDebugOverlay: !this.getSettings().showDebugOverlay });
@@ -377,10 +422,24 @@ export class PageSession {
     this.main = findMainContent(document);
     this.href = location.href;
     this.observeMain();
+    this.bindScroller(this.pickScroller());
+  }
 
-    const scroller = findScroller(this.main);
+  /**
+   * The element page turns scroll. In text mode, the one around the main
+   * text. In page mode there may be no main text at all (the page is a
+   * canvas), so the box around the picture of the page is a candidate too.
+   */
+  private pickScroller(): Scroller {
+    if (this.readingMode === 'text') return findScroller(this.main);
+    const viewport = readingViewport(window);
+    return viewport ? findPageModeScroller(document, this.main, viewport) : findScroller(this.main);
+  }
+
+  private bindScroller(scroller: Scroller): void {
     if (scroller === this.scroller && this.scroll) return;
     this.scrollerDisposer?.dispose();
+    this.otherTurns += this.scroll?.pagesTurned ?? 0;
     this.scroll?.destroy();
     this.scroller = scroller;
     this.scroll = new ScrollController({ scroller, bus: this.bus, getSettings: this.getSettings });
@@ -449,10 +508,49 @@ export class PageSession {
       console.warn('[gaze-reader] measuring lines failed', err);
       return this.layout;
     }
+    const mode = this.modeMonitor.observe(modeLineCount(layout, this.readingMode), performance.now());
+    if (mode !== this.readingMode) {
+      reason = 'content'; // different lines altogether: nothing the tracker learned carries over
+      this.onReadingModeChanged(mode);
+    }
+    if (mode === 'page') {
+      // No text to measure (a canvas or image reader): pseudo-lines over the picture of the page,
+      // in the scroller page mode picked (which may differ from the one just measured).
+      const pageScroller = this.scroller ?? scroller;
+      const same = pageScroller === scroller;
+      const pageViewport = same ? viewport : (readingViewport(pageScroller) ?? viewport);
+      const m = same ? metrics : scrollMetrics(pageScroller);
+      layout = buildPseudoLayout({
+        viewport: pageViewport,
+        scrollTop: m.scrollTop,
+        scrollHeight: m.scrollHeight,
+        clientHeight: pageViewport.bottom - pageViewport.top,
+        content: largestVisualRect(document, pageViewport),
+      });
+    }
     this.layout = layout;
     this.tracker.setLayout(layout, reason);
     this.bus.emit('layout', layout);
     return layout;
+  }
+
+  private onReadingModeChanged(mode: ReadingMode): void {
+    this.readingMode = mode;
+    this.bindScroller(this.pickScroller());
+    this.fixations.reset();
+    this.pageEnd.notifyScrolled(performance.now()); // no turn on the very first sample of the new mode
+    this.refreshState();
+    if (mode !== 'page' || pageModeExplained) return;
+    pageModeExplained = true;
+    const how = this.getSettings().glanceDownToTurn
+      ? 'Glance at the bottom edge of the page to turn it.'
+      : 'Rest your eyes at the bottom right of the page to turn it.';
+    this.say(`I can't read the text on this page, so I'll watch the bottom edge instead. ${how}`, 'high', 'thinking');
+  }
+
+  /** How the next page turn moves the page (see PageTurnMethod). */
+  private turnVia(): PageTurnVia {
+    return resolvePageTurn(this.ext.pageTurn, this.readingMode, this.scroller ? scrollMetrics(this.scroller) : null);
   }
 
   private onScrollSettled(): void {
@@ -686,7 +784,7 @@ export class PageSession {
   private needCalibration(): void {
     this.setBase('paused', NOT_CALIBRATED);
     this.pill.notify({
-      text: 'Webcam reading needs a 30-second calibration first.',
+      text: 'Webcam reading needs a one-minute calibration first.',
       tone: 'info',
       actions: [
         { label: 'Calibrate', run: () => this.recalibrate() },
@@ -696,7 +794,7 @@ export class PageSession {
   }
 
   private onStoredCalibration(value: unknown): void {
-    // Another tab calibrated, or the reader chose "Forget it" in the popup: pick it up.
+    // Another tab calibrated, or the reader chose "Forget calibration" in the popup: pick it up.
     if (value === undefined) {
       if (!this.model) return;
       this.model = null;
@@ -726,7 +824,7 @@ export class PageSession {
     if (m.viewportChange({ width: window.innerWidth, height: window.innerHeight }) < 0.2) return;
     this.viewportWarned = true;
     this.pill.notify({
-      text: 'Your window size changed since you calibrated. A quick recalibration keeps page turns accurate.',
+      text: 'Your window size changed since you calibrated. Recalibrating (about a minute) keeps page turns accurate.',
       tone: 'info',
       actions: [{ label: 'Recalibrate', run: () => this.recalibrate() }],
       timeoutMs: 15_000,
@@ -752,9 +850,11 @@ export class PageSession {
 
     const scroll = this.scroll;
     if (!scroll || this.turning || scroll.animating || this.paused || !this.getSettings().autoScroll) return;
-    const decision = this.pageEnd.update({ t: s.t, gaze: s, estimate: this.tracker.estimate, layout: this.layout });
+    // Page mode's pseudo-lines were never read: only the geometric rules (glance-down, bottom-dwell) may fire.
+    const estimate = this.readingMode === 'page' ? null : this.tracker.estimate;
+    const decision = this.pageEnd.update({ t: s.t, gaze: s, estimate, layout: this.layout });
     if (!decision.trigger) return;
-    if (scroll.atEnd()) {
+    if (this.turnVia() === 'scroll' && scroll.atEnd()) {
       this.pageEnd.notifyScrolled(s.t);
       if (!this.endAnnounced) {
         this.endAnnounced = true;
@@ -769,6 +869,10 @@ export class PageSession {
   private async turnPage(targetLineIndex: number, auto: boolean, reason: string): Promise<void> {
     const scroll = this.scroll;
     if (!scroll || this.turning || this.disposed) return;
+    if (this.turnVia() === 'keys') {
+      this.pressKeys('forward', auto, reason);
+      return;
+    }
     const layout = this.layout ?? this.remeasure('scroll');
     const anchorDocTop = layout?.lines[targetLineIndex]?.docTop ?? null;
     const destination = scroll.computeTarget(layout, targetLineIndex, this.getSettings().overlapLines);
@@ -791,6 +895,28 @@ export class PageSession {
     }
     this.fixations.reset();
     this.pageEnd.notifyScrolled(performance.now());
+  }
+
+  /**
+   * Turns the page the way the reader's own keyboard would (ArrowRight +
+   * PageDown, or back with ArrowLeft + PageUp). Best effort: many readers
+   * ignore synthetic key events. Whatever the page shows next, reading starts
+   * over at its top.
+   */
+  private pressKeys(direction: 'forward' | 'back', auto = false, reason = 'keyboard'): void {
+    if (this.disposed || this.turning) return;
+    pressPageKeys(document, direction);
+    if (direction === 'forward') {
+      this.otherTurns++;
+      this.bus.emit('page-turn', { from: 0, to: 0, auto, reason, pageIndex: this.pagesTurned() });
+    }
+    this.fixations.reset();
+    this.tracker.afterPageTurn(0);
+    this.pageEnd.notifyScrolled(performance.now());
+  }
+
+  private pagesTurned(): number {
+    return (this.scroll?.pagesTurned ?? 0) + this.otherTurns;
   }
 
   private async pageBack(): Promise<void> {
@@ -919,6 +1045,8 @@ export class PageSession {
       return;
     }
     if (location.href !== this.href) this.remeasure('content'); // SPA navigation
+    // Little or no text in view: nothing else says when page mode should start, or when text is back.
+    else if (this.modeMonitor.needsPolling) this.remeasure('resize');
     // A hidden tab has released the camera on purpose: no "can't see you" for that.
     if (this.hidden) return;
 
@@ -952,7 +1080,7 @@ export class PageSession {
       fraction,
       wordsRead: Math.round(fraction * this.wordCount),
       wpm: null,
-      pagesTurned: this.scroll?.pagesTurned ?? 0,
+      pagesTurned: this.pagesTurned(),
       minutesReading: Math.floor(this.totalReadingMs / 60_000),
     });
   }

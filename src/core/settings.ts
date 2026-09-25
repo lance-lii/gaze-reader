@@ -1,8 +1,10 @@
 import type { AppSettings, EventBus } from '../types';
 import { readJSON, writeJSON } from './storage';
+import { IS_ARTIFACT } from './target';
 
 export const DEFAULT_SETTINGS: Readonly<AppSettings> = Object.freeze({
-  gazeSource: 'webcam',
+  // The Artifact build has no camera: it starts with the demo reader.
+  gazeSource: IS_ARTIFACT ? 'simulated' : 'webcam',
   autoScroll: true,
   sensitivity: 'balanced',
   overlapLines: 1,
@@ -46,7 +48,7 @@ export function sanitizeSettings(input: unknown): AppSettings {
     typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi;
   const bool = (v: unknown) => typeof v === 'boolean';
 
-  pick('gazeSource', oneOf('webcam', 'mouse', 'simulated'));
+  pick('gazeSource', IS_ARTIFACT ? oneOf('mouse', 'simulated') : oneOf('webcam', 'mouse', 'simulated'));
   pick('autoScroll', bool);
   pick('sensitivity', oneOf('relaxed', 'balanced', 'eager'));
   pick('overlapLines', num(0, 3));

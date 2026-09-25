@@ -20,7 +20,9 @@ import type {
  *  2. bottom-dwell — drift-corrected gaze at/below L.top − 0.25 pitch in the
  *     right half of L, but still on the page, for `Tzone` (fallback while the
  *     tracker is unsure).
- *  3. glance-down — gaze at/below the bottom edge for `Tglance` (opt-in gesture).
+ *  3. glance-down — gaze at/below the bottom edge for `Tglance` (on by default; can be
+ *     switched off). A tracker confident the reader is above the last two lines vetoes it,
+ *     as for rule 2, so a look at the keyboard or a phone mid-page doesn't turn the page.
  *
  * Guards: cooldown after any scroll (and after firing); ≥ 60 % valid samples in
  * the last second; ≥ 4 fixations on the page or ≥ 2.5 s since the last turn
@@ -412,7 +414,9 @@ export class PageEndDetector {
 
     // Rule 3: deliberate glance below the page; must come back up before it can fire again.
     if (valid && yc < zones.glanceTop - GLANCE_REARM_LINES * pitch) this.glanceArmed = true;
-    const c3: Tri = !this.opts.glanceDownToTurn ? false : valid ? this.glanceArmed && yc >= zones.glanceTop : null;
+    // A look at the keyboard or a phone mid-page is an excursion for the line tracker (it keeps its
+    // line), so a tracker sure the reader is above the last two lines vetoes the gesture, as for rule 2.
+    const c3: Tri = !this.opts.glanceDownToTurn ? false : valid ? this.glanceArmed && !vetoed && yc >= zones.glanceTop : null;
     this.glanceDwell.step(c3, dt);
 
     const lineReady = sweep || this.lineDwell.held >= dwellMs;

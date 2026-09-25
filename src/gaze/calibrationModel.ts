@@ -8,12 +8,16 @@
  *  2. z-score every feature (constant features are neutralized, not divided by ~0).
  *  3. Pick the "dominant" gaze features: the ones most correlated with the
  *     target x or y, taken alternately per axis so the hard vertical axis gets
- *     its share, skipping near-duplicates of features already picked.
+ *     its share, skipping near-duplicates of features already picked. Posture
+ *     features (head pose, distance; known from `featureNames`) are never picked:
+ *     they enter the design linearly only.
  *  4. Per target, reject samples > 2.5 robust SDs (MAD) from the target's
  *     median in any dominant feature (glances away, half-blinks, tracker
  *     glitches); then redo 2–3 on the clean data.
  *  5. Design = every feature linearly + squares and pairwise products of the
- *     dominant features, re-standardized so one ridge penalty fits all.
+ *     dominant (eye) features, re-standardized so one ridge penalty fits all.
+ *     A square of a head feature would turn a small posture change (many of
+ *     calibration's tiny head SDs) into a shift of several lines on both axes.
  *  6. Two ridge regressions (x, y) sharing one factorization; λ chosen by
  *     leave-one-target-out cross-validation on mean Euclidean error.
  *
@@ -62,8 +66,10 @@ const Z_REJECT = 10;
  * Head pose and distance. The head barely moves during calibration, so its SDs are tiny, and
  * a reader who leans back or slouches later is legitimately "10 SDs out". These features are
  * never grounds for rejecting a prediction (Z_CLAMP bounds their influence instead);
- * otherwise a head feature picked as dominant would silence the tracker for the rest of the
- * session, reading as "can't see you" with the face in plain view.
+ * otherwise a head feature would silence the tracker for the rest of the session, reading as
+ * "can't see you" with the face in plain view. They enter the model linearly only (never as
+ * squares or products), as ARCHITECTURE.md specifies; models saved before that rule may still
+ * carry posture terms in `quad`, which is why the glitch check still filters them.
  */
 const POSTURE_FEATURES: ReadonlySet<string> = new Set<FeatureName>(['yaw', 'pitch', 'roll', 'tx', 'ty', 'tz', 'faceScale']);
 const MAD_TO_SD = 1.4826;
@@ -181,6 +187,15 @@ export interface GazeModelParams {
   viewport: { width: number; height: number };
   /** window.screenX/Y at calibration time. */
   origin: Point;
+  /**
+   * Browser chrome above the viewport at calibration (outerHeight − innerHeight), or null when
+   * unknown (old models, iframes). The window origin says nothing about where the viewport sits
+   * inside the window: entering fullscreen moves it up by the toolbar height with screenY
+   * unchanged, so a change here means the calibration no longer lines up.
+   */
+  chromeTop?: number | null;
+  /** devicePixelRatio when chromeTop was measured (a zoom change also changes it). */
+  dprAtCalibration?: number | null;
   adjust: AxisAffine;
   /** Epoch ms (Date.now()) — persisted across sessions, so not performance.now(). */
   trainedAt: number;
@@ -197,6 +212,9 @@ export class RidgeGazeModel implements GazeModel {
   readonly featureLength: number;
   readonly featureSignature: string | null;
   readonly dominantFeatures: readonly number[];
+  /** See GazeModelParams.chromeTop. */
+  readonly chromeTop: number | null;
+  readonly dprAtCalibration: number | null;
   private readonly params: GazeModelParams;
   private readonly glitchCheck: readonly number[];
   // Scratch buffers: predict runs at camera rate, so avoid per-call allocation.
@@ -211,6 +229,8 @@ export class RidgeGazeModel implements GazeModel {
     this.featureLength = params.featureLength;
     this.featureSignature = params.featureSignature;
     this.dominantFeatures = Object.freeze([...params.quad]);
+    this.chromeTop = params.chromeTop ?? null;
+    this.dprAtCalibration = params.dprAtCalibration ?? null;
     this.glitchCheck = Object.freeze([...(params.glitchCheck ?? params.quad)]);
     this.zBuf = new Float64Array(params.featureLength);
     this.phiBuf = new Float64Array(params.expMean.length);
@@ -258,12 +278,17 @@ export class RidgeGazeModel implements GazeModel {
   }
 
   /** A copy with a different screen-space correction (quick recalibration). */
-  withAdjustment(adjust: AxisAffine, meta: { viewport: { width: number; height: number }; trainedAt: number }): RidgeGazeModel {
+  withAdjustment(
+    adjust: AxisAffine,
+    meta: { viewport: { width: number; height: number }; trainedAt: number; chromeTop?: number | null; dprAtCalibration?: number | null },
+  ): RidgeGazeModel {
     return new RidgeGazeModel({
       ...this.params,
       adjust: { ...adjust },
       viewport: { ...meta.viewport },
       trainedAt: meta.trainedAt,
+      ...(meta.chromeTop !== undefined ? { chromeTop: meta.chromeTop } : {}),
+      ...(meta.dprAtCalibration !== undefined ? { dprAtCalibration: meta.dprAtCalibration } : {}),
     });
   }
 
@@ -287,6 +312,8 @@ export class RidgeGazeModel implements GazeModel {
       lambda: P.lambda,
       viewport: { width: P.viewport.width, height: P.viewport.height },
       origin: { x: P.origin.x, y: P.origin.y },
+      chromeTop: this.chromeTop,
+      dprAtCalibration: this.dprAtCalibration,
       adjust: { ...P.adjust },
       trainedAt: P.trainedAt,
     };
@@ -329,8 +356,16 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
   // Quadratic terms need several distinct targets to be identifiable at all.
   const qMax = Math.min(qWanted, Math.max(0, initialGroups.length - 3));
 
+  // Posture features enter linearly only (see POSTURE_FEATURES).
+  const noQuad = new Uint8Array(p);
+  if (opts.featureNames) {
+    opts.featureNames.forEach((name, j) => {
+      if (POSTURE_FEATURES.has(name)) noQuad[j] = 1;
+    });
+  }
+
   let stats = columnStats(rows, p);
-  let dominant = selectDominant(rows, stats, qMax);
+  let dominant = selectDominant(rows, stats, qMax, noQuad);
   let rejected = 0;
   if (opts.rejectOutliers !== false && dominant.length > 0) {
     const keep = rejectOutliers(rows, initialGroups, stats, dominant);
@@ -338,7 +373,7 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     if (rejected > 0) {
       rows = keep.map((i) => rows[i]);
       stats = columnStats(rows, p);
-      dominant = selectDominant(rows, stats, qMax);
+      dominant = selectDominant(rows, stats, qMax, noQuad);
     }
   }
   const groups = groupRows(rows);
@@ -407,6 +442,8 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     lambda,
     viewport,
     origin: currentScreenOrigin(),
+    chromeTop: currentChromeTop(),
+    dprAtCalibration: currentDevicePixelRatio(),
     adjust: { ...IDENTITY },
     trainedAt: Date.now(),
   });
@@ -484,7 +521,13 @@ export function refineGazeModel(
     oy: fit.sy * old.oy + fit.oy,
   };
   const viewport = resolveViewport(opts.viewport, rows);
-  const model = inner.withAdjustment(composed, { viewport, trainedAt: Date.now() });
+  // The refresh re-fits the offset in the current window layout, so it is the new reference.
+  const model = inner.withAdjustment(composed, {
+    viewport,
+    trainedAt: Date.now(),
+    chromeTop: currentChromeTop(),
+    dprAtCalibration: currentDevicePixelRatio(),
+  });
 
   const points = obs.map((o, h) => {
     const f = obs.length >= 3 ? fitAffine(obs.filter((_, k) => k !== h), fitScale, kappa) : fit;
@@ -533,7 +576,8 @@ export function evaluateModel(model: GazeModel, samples: CalibrationSample[], op
  *
  * Two yardsticks, and the worse one wins:
  *
- * • Lines of text (typical pitch 22 px × 1.9 ≈ 42 px). At a normal laptop
+ * • Lines of text at the reader's line pitch (`linePitchPx`; 22 px × 1.9 ≈ 42 px,
+ *   the app default, when it is unknown). At a normal laptop
  *   viewing distance one line is roughly 1° of visual angle, about the best a
  *   webcam tracker can do.
  *   – excellent ≤ 1.25 lines: raw gaze alone nearly pins the line.
@@ -549,9 +593,14 @@ export function evaluateModel(model: GazeModel, samples: CalibrationSample[], op
  *   near a 720 px viewport (~17 lines), so on bigger screens the line rule
  *   governs and on small windows the viewport rule does.
  */
-export function qualityFromError(errorPx: number, viewportHeight: number): CalibrationQuality {
+export function qualityFromError(
+  errorPx: number,
+  viewportHeight: number,
+  linePitchPx: number = DEFAULT_LINE_PITCH_PX,
+): CalibrationQuality {
   if (!Number.isFinite(errorPx) || errorPx < 0) return 'poor';
-  const lines = errorPx / DEFAULT_LINE_PITCH_PX;
+  const pitch = Number.isFinite(linePitchPx) && linePitchPx >= 8 ? linePitchPx : DEFAULT_LINE_PITCH_PX;
+  const lines = errorPx / pitch;
   let rank = lines <= 1.25 ? 0 : lines <= 2.25 ? 1 : lines <= 3.5 ? 2 : 3;
   if (Number.isFinite(viewportHeight) && viewportHeight > 0) {
     const frac = errorPx / viewportHeight;
@@ -605,6 +654,10 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
     const origin = json.origin;
     if (!isRecord(origin) || !isFiniteNumber(origin.x) || !isFiniteNumber(origin.y)) return null;
 
+    // Models saved before these fields existed: null, which skips the window-layout check.
+    const chromeTop = isFiniteNumber(json.chromeTop) && json.chromeTop >= 0 ? json.chromeTop : null;
+    const dprAtCalibration = isPositive(json.dprAtCalibration) ? json.dprAtCalibration : null;
+
     let adjust: AxisAffine = { ...IDENTITY };
     if (json.adjust !== undefined) {
       const a = json.adjust;
@@ -630,6 +683,8 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
       lambda,
       viewport: { width: vp.width, height: vp.height },
       origin: { x: origin.x, y: origin.y },
+      chromeTop,
+      dprAtCalibration,
       adjust,
       trainedAt,
     });
@@ -678,6 +733,40 @@ export function currentScreenOrigin(): Point {
   if (typeof window === 'undefined' || !window) return { x: 0, y: 0 };
   const w: Partial<Pick<Window, 'screenX' | 'screenY' | 'screenLeft' | 'screenTop'>> = window;
   return { x: firstFinite(w.screenX, w.screenLeft), y: firstFinite(w.screenY, w.screenTop) };
+}
+
+/**
+ * Height of the browser chrome above the viewport (tab strip, toolbar, bookmarks bar), in CSS
+ * px: outerHeight − innerHeight. Null in iframes (the frame's position is unknown) or when the
+ * browser reports nothing usable. Only used to *detect* a moved viewport, never to compensate.
+ */
+export function currentChromeTop(): number | null {
+  if (typeof window === 'undefined' || !window) return null;
+  try {
+    if (window.top !== window) return null;
+  } catch {
+    return null;
+  }
+  const d = window.outerHeight - window.innerHeight;
+  return Number.isFinite(d) && d >= 0 ? d : null;
+}
+
+function currentDevicePixelRatio(): number | null {
+  if (typeof window === 'undefined' || !window) return null;
+  const r = window.devicePixelRatio;
+  return Number.isFinite(r) && r > 0 ? r : null;
+}
+
+/**
+ * The chrome height the model was calibrated with, when it is still comparable with
+ * {@link currentChromeTop}: null for old models, other model classes, or after a zoom
+ * change (the viewport-size check covers that case).
+ */
+export function modelChromeTop(model: GazeModel | null | undefined): number | null {
+  if (!(model instanceof RidgeGazeModel) || model.chromeTop === null) return null;
+  const dpr = currentDevicePixelRatio();
+  if (model.dprAtCalibration !== null && dpr !== null && Math.abs(dpr - model.dprAtCalibration) > 1e-3) return null;
+  return model.chromeTop;
 }
 
 // ─────────────────────────────── Internals ───────────────────────────────────
@@ -822,7 +911,7 @@ function standardizeColumns(m: Float64Array, n: number, D: number): { mean: Floa
  * the hard one for webcams — always gets its share), skipping features that
  * are near-duplicates (|r| > 0.95) of one already chosen.
  */
-function selectDominant(rows: readonly Row[], stats: ColumnStats, q: number): number[] {
+function selectDominant(rows: readonly Row[], stats: ColumnStats, q: number, noQuad: Uint8Array): number[] {
   const n = rows.length;
   const p = stats.mean.length;
   if (q <= 0 || n < 2) return [];
@@ -841,7 +930,8 @@ function selectDominant(rows: readonly Row[], stats: ColumnStats, q: number): nu
       const tc = (t[i] - tm) / ts;
       for (let j = 0; j < p; j++) r[j] += z[i][j] * tc;
     }
-    for (let j = 0; j < p; j++) r[j] = stats.constant[j] ? 0 : Math.abs(r[j] / n);
+    // A score of 0 is below MIN_DOMINANT_CORR, so constant and posture features are never picked.
+    for (let j = 0; j < p; j++) r[j] = stats.constant[j] || noQuad[j] ? 0 : Math.abs(r[j] / n);
     return r;
   };
   const score = { x: corrWithTarget('x'), y: corrWithTarget('y') };

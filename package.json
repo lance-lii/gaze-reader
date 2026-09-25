@@ -12,9 +12,11 @@
     "build": "vite build",
     "preview": "vite preview",
     "build:ext": "node scripts/build-extension.mjs",
+    "package:ext": "node scripts/package-extension.mjs",
+    "build:artifact": "node scripts/build-artifact.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p extension/tsconfig.json",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run test && npm run build && npm run build:ext"
+    "check": "npm run typecheck && npm run test && npm run build && npm run build:ext && npm run build:artifact"
   },
   "license": "MIT",
   "dependencies": {

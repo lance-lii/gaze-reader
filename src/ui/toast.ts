@@ -10,6 +10,12 @@ export interface ToastAction {
   primary?: boolean;
 }
 
+/** A real link (opens in a new tab), for destinations outside the app. */
+export interface ToastLink {
+  label: string;
+  href: string;
+}
+
 export interface ToastOptions {
   /** A toast with the same id replaces the existing one instead of stacking. */
   id?: string;
@@ -17,6 +23,8 @@ export interface ToastOptions {
   message: string;
   tone?: ToastTone;
   actions?: readonly ToastAction[];
+  /** Shown after the actions, as links that open in a new tab. */
+  links?: readonly ToastLink[];
   /** Milliseconds; 0 keeps it until dismissed. Defaults: 5 s, 9 s with actions, 8 s for errors. */
   durationMs?: number;
 }
@@ -66,7 +74,8 @@ export class Toaster implements Mountable {
     const id = opts.id ?? `gr-toast-${++toastSeq}`;
     const tone = opts.tone ?? 'info';
     const actions = opts.actions ?? [];
-    const duration = opts.durationMs ?? (actions.length > 0 ? 9000 : tone === 'error' ? 8000 : 5000);
+    const links = opts.links ?? [];
+    const duration = opts.durationMs ?? (actions.length + links.length > 0 ? 9000 : tone === 'error' ? 8000 : 5000);
 
     const existing = this.entries.get(id);
     if (existing) this.removeNow(id, existing);
@@ -93,7 +102,7 @@ export class Toaster implements Mountable {
     msg.textContent = opts.message;
     text.appendChild(msg);
 
-    if (actions.length > 0) {
+    if (actions.length + links.length > 0) {
       const row = document.createElement('div');
       row.className = 'gr-toast__actions';
       for (const a of actions) {
@@ -106,6 +115,15 @@ export class Toaster implements Mountable {
           a.run();
         });
         row.appendChild(b);
+      }
+      for (const l of links) {
+        const a = document.createElement('a');
+        a.className = 'gr-btn gr-btn--soft gr-btn--sm';
+        a.href = l.href;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = l.label;
+        row.appendChild(a);
       }
       text.appendChild(row);
     }

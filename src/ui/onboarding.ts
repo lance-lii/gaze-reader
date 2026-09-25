@@ -1,6 +1,8 @@
 import { Z } from '../core/constants';
 import { readJSON, writeJSON } from '../core/storage';
+import { IS_ARTIFACT } from '../core/target';
 import type { BuddyMood, EventBus, GazeSourceKind, Mountable } from '../types';
+import { fullAppLinkHtml, WEBCAM_UNAVAILABLE_SHORT } from './fullApp';
 import { ModalLayer } from './helpDialog';
 import { icon, type IconName } from './topbar';
 
@@ -45,6 +47,30 @@ const ART_PRIVACY = `
   <path class="gr-art-check" d="M108 66l8 8 15-16"/>
 </svg>`;
 
+const PRIVACY_STEP: Step = {
+  title: 'Your camera stays yours',
+  art: ART_PRIVACY,
+  body: `<ul class="gr-onb__list">
+           <li>${icon('check')}<span>Face tracking runs right here in your browser.</span></li>
+           <li>${icon('check')}<span>Video is never recorded, uploaded or shared.</span></li>
+           <li>${icon('check')}<span>The camera runs only while a book is open, and a status pill always says so.</span></li>
+           <li>${icon('check')}<span>Books and reading progress stay on this device.</span></li>
+         </ul>`,
+  dewey: { text: "Your video never leaves this device. Librarian's honor!", mood: 'happy' },
+};
+
+/** The Artifact build has no camera; say so up front and point to the full app. */
+const artifactStep = (): Step => ({
+  title: 'No camera needed here',
+  art: ART_PRIVACY,
+  body: `<ul class="gr-onb__list">
+           <li>${icon('check')}<span>This embedded version runs without your camera: a demo reader or your mouse stands in for your eyes.</span></li>
+           <li>${icon('check')}<span>For hands-free reading with your webcam, ${fullAppLinkHtml('open the full Gaze Reader')}.</span></li>
+           <li>${icon('check')}<span>Books and reading progress stay in this browser.</span></li>
+         </ul>`,
+  dewey: { text: 'No camera in this version, so I brought a demo reader instead!', mood: 'happy' },
+});
+
 const STEPS: readonly Step[] = [
   {
     title: 'Read without lifting a finger',
@@ -53,30 +79,36 @@ const STEPS: readonly Step[] = [
            <p>Dewey, your reading buddy, reads along from the corner.</p>`,
     dewey: { text: "Hi, I'm Dewey! I'll read along with you.", mood: 'happy' },
   },
-  {
-    title: 'Your camera stays yours',
-    art: ART_PRIVACY,
-    body: `<ul class="gr-onb__list">
-             <li>${icon('check')}<span>Face tracking runs right here in your browser.</span></li>
-             <li>${icon('check')}<span>Video is never recorded, uploaded or shared.</span></li>
-             <li>${icon('check')}<span>The camera runs only while a book is open, and a status pill always says so.</span></li>
-             <li>${icon('check')}<span>Books and reading progress stay on this device.</span></li>
-           </ul>`,
-    dewey: { text: "Your video never leaves this device. Librarian's honor!", mood: 'happy' },
-  },
+  IS_ARTIFACT ? artifactStep() : PRIVACY_STEP,
   {
     title: 'How would you like to start?',
     art: '',
-    body: '<p class="gr-onb__lead">You can switch any time from the top bar.</p>',
+    body: '<p class="gr-onb__lead">You can switch any time in Settings.</p>',
     dewey: { text: 'Pick whichever you like. We can always switch later.', mood: 'excited' },
   },
 ];
 
-const CHOICES: readonly { kind: GazeSourceKind; icon: IconName; title: string; text: string; badge?: string }[] = [
+interface Choice {
+  kind: GazeSourceKind;
+  icon: IconName;
+  title: string;
+  text: string;
+  badge?: string;
+}
+
+const WEB_CHOICES: readonly Choice[] = [
   { kind: 'webcam', icon: 'eye', title: 'Use my webcam', text: 'Hands-free reading, after a one-minute calibration.', badge: 'Recommended' },
   { kind: 'mouse', icon: 'mouse', title: 'Try with my mouse', text: 'Point where you are reading; no camera needed.' },
   { kind: 'simulated', icon: 'sparkle', title: 'Watch a demo', text: 'A simulated reader reads a sample book so you can see a page turn.' },
 ];
+
+/** The Artifact build can't use the camera: the demo leads, and the webcam card says where to find it. */
+const ARTIFACT_CHOICES: readonly Choice[] = [
+  { kind: 'simulated', icon: 'sparkle', title: 'Watch a demo', text: 'A simulated reader reads a sample book so you can see a page turn.', badge: 'Recommended' },
+  { kind: 'mouse', icon: 'mouse', title: 'Try with my mouse', text: 'Point where you are reading; the page turns at the bottom.' },
+];
+
+const CHOICES: readonly Choice[] = IS_ARTIFACT ? ARTIFACT_CHOICES : WEB_CHOICES;
 
 let onbSeq = 0;
 
@@ -206,6 +238,18 @@ export class Onboarding implements Mountable {
         ${icon('chevronRight', 'gr-choice__chevron')}`;
       b.addEventListener('click', () => this.finish(c.kind));
       list.appendChild(b);
+    }
+    if (IS_ARTIFACT) {
+      const card = document.createElement('div');
+      card.className = 'gr-choice gr-choice--unavailable';
+      card.dataset.choice = 'webcam';
+      card.innerHTML = `
+        <span class="gr-choice__icon">${icon('eye')}</span>
+        <span class="gr-choice__text">
+          <strong>Use my webcam</strong>
+          <small>${WEBCAM_UNAVAILABLE_SHORT} ${fullAppLinkHtml()}</small>
+        </span>`;
+      list.appendChild(card);
     }
     return list;
   }

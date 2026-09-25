@@ -205,8 +205,17 @@ function openDatabase(factory: IDBFactory, onLost: () => void): Promise<IDBDatab
   });
 }
 
+/** The IndexedDB factory, or null. Merely reading the global can throw (sandboxed frames, blocked storage). */
+function idbFactory(): IDBFactory | null {
+  try {
+    return typeof indexedDB === 'undefined' ? null : indexedDB;
+  } catch {
+    return null;
+  }
+}
+
 async function createBackend(onLost: () => void): Promise<Backend> {
-  const factory = typeof indexedDB === 'undefined' ? null : indexedDB;
+  const factory = idbFactory();
   if (!factory) return new MemoryBackend();
   try {
     return new IdbBackend(await openDatabase(factory, onLost));

@@ -3,10 +3,14 @@ import type { AppSettings } from '../../src/types';
 import { createEventBus } from '../../src/core/events';
 import { DEFAULT_SETTINGS, createSettingsStore } from '../../src/core/settings';
 import {
+  DEFAULT_EXT_SETTINGS,
   KEYS,
   clearCalibrationJSON,
   loadCalibrationJSON,
+  loadExtSettings,
   loadSettings,
+  parseExtSettings,
+  saveExtSettings,
   saveCalibrationJSON,
   syncSettings,
   watchKey,
@@ -140,5 +144,22 @@ describe('calibration in chrome.storage.local', () => {
     await storage.area.set({ [KEYS.cameraGrantedAt]: 456 });
     await flush();
     expect(seen).toEqual([123]);
+  });
+
+  it('extension-only settings: defaults, validation, and a round trip under their own key', async () => {
+    const storage = new FakeStorage();
+    expect(await loadExtSettings(storage.area)).toEqual(DEFAULT_EXT_SETTINGS);
+    expect(DEFAULT_EXT_SETTINGS.pageTurn).toBe('auto');
+    expect(parseExtSettings({ pageTurn: 'teleport' })).toEqual({ pageTurn: 'auto' });
+    expect(parseExtSettings(null)).toEqual({ pageTurn: 'auto' });
+    expect(parseExtSettings(['keys'])).toEqual({ pageTurn: 'auto' });
+
+    expect(await saveExtSettings(storage.area, { pageTurn: 'keys' })).toBe(true);
+    expect(storage.data.get(KEYS.extSettings)).toEqual({ pageTurn: 'keys' });
+    expect(await loadExtSettings(storage.area)).toEqual({ pageTurn: 'keys' });
+    expect(storage.data.has(KEYS.settings)).toBe(false); // the shared AppSettings record is untouched
+
+    storage.failWrites = true;
+    expect(await saveExtSettings(storage.area, { pageTurn: 'scroll' })).toBe(false);
   });
 });

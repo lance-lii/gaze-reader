@@ -7,6 +7,7 @@ import { CameraFeatureSource } from '../../src/gaze/faceTracker';
 import type { FeatureFrame, TrackerErrorCode } from '../../src/types';
 import {
   PORT_OFFSCREEN,
+  cameraLossCode,
   errorMessage,
   isHubToOffscreen,
   isTrackerErrorCode,
@@ -43,12 +44,10 @@ camera.onFrame((frame: FeatureFrame) => {
   if (state === 'running' && port) post({ type: 'frame', frame });
 });
 
-// The camera was unplugged or taken by another app; the source has already stopped.
+// The camera was unplugged, taken by another app, or its permission revoked; the source has already stopped.
 camera.onError((err) => {
   if (state !== 'running') return;
-  startSeq++;
-  state = 'error';
-  report({ state: 'error', code: err.code, message: err.message });
+  reportLoss(err.code, err.message);
 });
 
 setInterval(() => {
@@ -56,8 +55,7 @@ setInterval(() => {
   if (performance.now() - lastFrameAt > STALL_MS) {
     const code: TrackerErrorCode = videoTrackEnded() ? 'no-camera' : 'unknown';
     stopCamera();
-    state = 'error';
-    report({ state: 'error', code, message: code === 'no-camera' ? 'The camera was disconnected.' : 'The camera stopped sending pictures.' });
+    reportLoss(code, code === 'no-camera' ? 'The camera was disconnected.' : 'The camera stopped sending pictures.');
     return;
   }
   report(runningStatus());
@@ -107,6 +105,21 @@ async function startCamera(): Promise<void> {
     const code = (err as { code?: unknown } | null)?.code;
     report({ state: 'error', code: isTrackerErrorCode(code) ? code : 'unknown', message: errorMessage(err) });
   }
+}
+
+/**
+ * A running camera stopped. Revoking the camera permission also ends the
+ * track, so check the permission before blaming the device: without a grant
+ * the tab must offer the setup page, not "Try again".
+ */
+function reportLoss(code: TrackerErrorCode, message: string): void {
+  const seq = ++startSeq;
+  state = 'error';
+  void cameraPermission().then((permission) => {
+    if (seq !== startSeq) return; // a new start (or stop) came in meanwhile and reports for itself
+    const actual = cameraLossCode(code, permission);
+    report({ state: 'error', code: actual, message: actual === code ? message : 'Camera access for Gaze Reader was turned off.' });
+  });
 }
 
 function runningStatus(): CameraStatus {

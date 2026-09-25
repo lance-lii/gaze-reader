@@ -5,6 +5,7 @@ import { DEFAULT_SETTINGS } from '../../src/core/settings';
 import { LineTracker } from '../../src/reading/lineTracker';
 import { KEYS } from './extStorage';
 import { PORT_TAB, type HubToTab } from './messages';
+import { PagePill } from './pagePill';
 import { HOST_TAG, PageSession, type PageSessionDeps } from './pageSession';
 import { FakePort, FakeStorage, flush, portPair } from './testing/fakes';
 import { eyeFeatures, linearGazeModel } from './testing/models';
@@ -268,6 +269,54 @@ describe('PageSession', () => {
     vi.unstubAllGlobals();
   });
 
+  it('forgets undo history when the window width changes (the text reflows), not on height-only resizes', async () => {
+    document.body.innerHTML = `<div id="app" style="overflow-y: auto"><article>${'<p>Some reading text that goes on for a while.</p>'.repeat(30)}</article></div>`;
+    const app = document.getElementById('app')!;
+    let top = 0;
+    Object.defineProperty(app, 'scrollHeight', { configurable: true, value: 6000 });
+    Object.defineProperty(app, 'clientHeight', { configurable: true, value: 800 });
+    Object.defineProperty(app, 'scrollTop', { configurable: true, get: () => top, set: (v: number) => (top = v) });
+    app.scrollTo = ((opts: ScrollToOptions) => {
+      top = opts.top ?? top;
+    }) as typeof app.scrollTo;
+    const saved = (['innerWidth', 'innerHeight'] as const).map((k) => [k, Object.getOwnPropertyDescriptor(window, k)] as const);
+    const resizeTo = (width: number, height: number) => {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: height });
+      window.dispatchEvent(new Event('resize'));
+    };
+    resizeTo(1024, 768);
+
+    const t = setup({ gazeSource: 'mouse', scrollDurationMs: 0 });
+    const session = await PageSession.start(t.deps);
+    const said = record('buddy-say');
+
+    altShift('ArrowDown');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(top).toBeGreaterThan(500);
+    resizeTo(1024, 700); // height only: same text, same offsets
+    await vi.advanceTimersByTimeAsync(300);
+    altShift('KeyU');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(top).toBe(0);
+
+    altShift('ArrowDown');
+    await vi.advanceTimersByTimeAsync(500);
+    const turnedTo = top;
+    expect(turnedTo).toBeGreaterThan(500);
+    resizeTo(800, 700); // narrower: the text reflows
+    await vi.advanceTimersByTimeAsync(300);
+    altShift('KeyU');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(top).toBe(turnedTo);
+    expect(said.map((s) => s.text)).toContain('Nothing to undo yet.');
+    session.destroy();
+    for (const [k, desc] of saved) {
+      if (desc) Object.defineProperty(window, k, desc);
+      else Reflect.deleteProperty(window, k);
+    }
+  });
+
   it('ends itself when the extension is reloaded underneath it', async () => {
     const t = setup({ gazeSource: 'mouse' });
     const session = await PageSession.start(t.deps);
@@ -324,9 +373,12 @@ describe('PageSession', () => {
     await flush(10);
     expect(session.state()).toMatchObject({ tracking: 'tracking', calibrated: true });
 
-    await t.storage.area.remove([KEYS.calibration]); // popup: "Forget it"
+    const notify = vi.spyOn(PagePill.prototype, 'notify');
+    await t.storage.area.remove([KEYS.calibration]); // popup: "Forget calibration"
     await flush(10);
     expect(session.state()).toMatchObject({ tracking: 'paused', detail: 'Not calibrated yet', calibrated: false });
+    // The full calibration (13 dots + 4 checks) takes about a minute: don't promise 30 seconds.
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: 'Webcam reading needs a one-minute calibration first.' }));
 
     // The service worker restarts: the tab reconnects, the camera is reported running again…
     t.hubEnds[0]!.disconnect();

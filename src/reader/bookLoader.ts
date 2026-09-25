@@ -47,6 +47,20 @@ export function collapseWhitespace(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * Drops trailing spaces and tabs (only those: a trailing NBSP is kept). A loop, not
+ * `/[ \t]+$/`, which backtracks quadratically on a long run of spaces before a non-space.
+ */
+function trimEndSpTab(s: string): string {
+  let e = s.length;
+  while (e > 0) {
+    const c = s.charCodeAt(e - 1);
+    if (c !== 32 && c !== 9) break;
+    e--;
+  }
+  return s.slice(0, e);
+}
+
 const CJK_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/gu;
 const WORD = /[\p{L}\p{N}\p{M}]+(?:['’.\-\u2010][\p{L}\p{N}\p{M}]+)*/gu;
 
@@ -513,7 +527,7 @@ function splitBlocks(text: string): TextBlock[] {
   let blank = 0;
   let blankBefore = 0;
   for (const raw of text.split('\n')) {
-    const line = raw.replace(/\s+$/, '');
+    const line = raw.trimEnd(); // the same characters as /\s+$/, but linear
     if (!line.trim()) {
       if (cur.length) {
         blocks.push({ lines: cur, blankBefore, blankAfter: 0 });
@@ -850,7 +864,21 @@ function parsePlainText(raw: string): ParsedText {
 // ───────────────────────────────── Markdown ─────────────────────────────────
 
 const FENCE_RE = /^( {0,3})(`{3,}|~{3,})[^`]*$/;
-const ATX_RE = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/;
+// Trailing blanks and the optional closing #s are stripped by atxText: folding them into this
+// regex, as `(.*?)(?:[ \t]+#+)?[ \t]*$`, backtracks quadratically on a long run of spaces.
+const ATX_RE = /^ {0,3}(#{1,6})(?:[ \t]+(.*))?$/;
+
+/** An ATX heading's text: trailing blanks and an optional closing `#` sequence removed. */
+function atxText(m: RegExpExecArray): string {
+  let t = trimEndSpTab(m[2] ?? '');
+  let e = t.length;
+  while (e > 0 && t.charCodeAt(e - 1) === 35) e--;
+  if (e < t.length && e > 0) {
+    const p = t.charCodeAt(e - 1);
+    if (p === 32 || p === 9) t = trimEndSpTab(t.slice(0, e));
+  }
+  return t;
+}
 const HR_RE = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 const QUOTE_RE = /^ {0,3}>/;
 const LIST_RE = /^( {0,3})([*+-]|\d{1,9}[.)])(?:([ \t]+)(.*))?$/;
@@ -911,7 +939,8 @@ function renderInlineInto(src: string, slots: Slots): string {
     return pre + slot(`<code>${escapeHtml(text)}</code>`);
   });
   s = s.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, (_m, c: string) => slot(escapeHtml(c)));
-  s = s.replace(/(?: {2,}|\\)\n/g, () => slot('<br>'));
+  // The lookbehind lets a match start only at the beginning of a space run (else it's quadratic).
+  s = s.replace(/(?<! ) {2,}\n|\\\n/g, () => slot('<br>'));
   s = s.replace(/<(https?:\/\/[^\s<>]+)>/gi, (_m, url: string) => slot(`<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>`));
   s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, () => ''); // images: dropped, like the sanitizer does
   s = s.replace(
@@ -1046,7 +1075,7 @@ function renderMdBlocks(lines: string[], tight: boolean, depth = 0): string {
     m = ATX_RE.exec(line);
     if (m) {
       const level = m[1].length;
-      out.push(`<h${level}>${renderInline(m[2] ?? '')}</h${level}>`);
+      out.push(`<h${level}>${renderInline(atxText(m))}</h${level}>`);
       i++;
       continue;
     }
@@ -1103,7 +1132,7 @@ function renderMdBlocks(lines: string[], tight: boolean, depth = 0): string {
       para.push(lines[i].replace(/^[ \t]+/, ''));
       i++;
     }
-    const text = para.join('\n').replace(/[ \t]+$/, '');
+    const text = trimEndSpTab(para.join('\n'));
     if (setext) out.push(`<h${setext}>${renderInline(text)}</h${setext}>`);
     else out.push(tight ? renderInline(text) : `<p>${renderInline(text)}</p>`);
   }

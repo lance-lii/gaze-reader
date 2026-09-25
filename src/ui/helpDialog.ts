@@ -182,7 +182,7 @@ export function dialogHeader(surface: HTMLElement, titleId: string, title: strin
 const PILL_LEGEND: readonly { label: string; tone: PillTone; text: string }[] = [
   { ...pick('tracking', 'webcam'), text: 'Your eyes are being followed; pages turn when you reach the bottom.' },
   { ...pick('no-face', 'webcam'), text: "The camera can't see your face right now." },
-  { ...pick('poor', 'webcam'), text: 'Tracking is unsure. More light or sitting closer helps.' },
+  { ...pick('poor', 'webcam'), text: 'Tracking is unsure. More light on your face, at about an arm’s length, helps.' },
   { ...pick('paused', 'webcam'), text: 'Auto-scroll is paused (P). Tracking continues.' },
   { ...pick('off', null), text: 'The camera is off. It only runs while a book is open.' },
   { ...pick('tracking', 'mouse'), text: 'Following your mouse pointer instead of your eyes.' },

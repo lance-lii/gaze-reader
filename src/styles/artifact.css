@@ -1,0 +1,73 @@
+/*
+ * Gaze Reader — extra styles for the Artifact build only.
+ *
+ * scripts/build-artifact.mjs appends this file to the inlined stylesheet; the
+ * web app never loads it. The Artifact host wraps our content in its own
+ * document whose :root is padded by the safe-area insets, so the one-screen
+ * app is sized with height: 100% (padding included) instead of 100vh.
+ */
+
+html {
+  box-sizing: border-box;
+  height: 100%;
+}
+body {
+  height: 100%;
+  min-height: 0;
+}
+#app {
+  height: 100%;
+}
+.gr-library {
+  min-height: 100%;
+}
+
+/* Links in running text (notes about the full app). */
+.gr-artifact-link {
+  color: var(--gr-accent);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.gr-artifact-link:hover {
+  text-decoration-thickness: 2px;
+}
+.gr-artifact-link:focus-visible {
+  outline: 2px solid var(--gr-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* The "Eyes" option in the top bar's source switch: visible, but plainly not available here. */
+.gr-seg__opt[data-unavailable] .gr-seg__face {
+  opacity: 0.5;
+}
+.gr-seg__opt[data-unavailable] .gr-seg__face .gr-seg__text {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+/* Onboarding: the webcam card, shown as unavailable with a link to the full app. */
+.gr-choice--unavailable,
+.gr-choice--unavailable:hover {
+  border-style: dashed;
+  background: transparent;
+  cursor: default;
+  transform: none;
+}
+.gr-choice--unavailable .gr-choice__icon,
+.gr-choice[data-choice='webcam'].gr-choice--unavailable .gr-choice__icon {
+  background: var(--gr-surface-2);
+  color: var(--gr-muted);
+}
+.gr-choice--unavailable small {
+  color: var(--gr-muted);
+}
+
+/* Settings: the note that replaces the camera controls. */
+.gr-artifact-note {
+  margin: 4px 0 0;
+  color: var(--gr-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}

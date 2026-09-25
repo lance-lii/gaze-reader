@@ -39,7 +39,8 @@ const shared = {
   publicDir: false,
   logLevel: 'warn',
   // Library builds leave process.env.NODE_ENV alone; nothing may reach the browser unreplaced.
-  define: { 'process.env.NODE_ENV': JSON.stringify('production') },
+  // __GR_TARGET__: shared app modules (src/core/target.ts) build as the web target here.
+  define: { 'process.env.NODE_ENV': JSON.stringify('production'), __GR_TARGET__: JSON.stringify('web') },
 };
 
 const sharedBuild = {

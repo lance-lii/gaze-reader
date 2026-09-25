@@ -3,6 +3,7 @@ import type { FeatureFrame } from '../../src/types';
 import {
   MAX_FEATURE_LENGTH,
   PAGE_OFF,
+  cameraLossCode,
   isCameraStatus,
   isFeatureFrame,
   isHubToOffscreen,
@@ -135,6 +136,8 @@ describe('one-shot message guards', () => {
     expect(isPageState(on)).toBe(true);
     expect(isPageState({ ...on, tracking: 'confused' })).toBe(false);
     expect(isPageState({ ...on, fps: Number.NaN })).toBe(false);
+    expect(isPageState({ ...on, pageMode: true })).toBe(true);
+    expect(isPageState({ ...on, pageMode: 'yes' })).toBe(false);
     expect(isRuntimeResponse({ ok: true })).toBe(true);
     expect(isRuntimeResponse({ ok: true, state: on })).toBe(true);
     expect(isRuntimeResponse({ ok: true, state: { enabled: 'maybe' } })).toBe(false);
@@ -146,5 +149,14 @@ describe('one-shot message guards', () => {
     expect(isCameraStatus({ state: 'starting' })).toBe(true);
     expect(isCameraStatus({ state: 'error', code: 'model-load-failed', message: 'offline' })).toBe(true);
     expect(isCameraStatus({ code: 'unknown' })).toBe(false);
+  });
+});
+
+describe('cameraLossCode', () => {
+  it('blames a revoked permission, not the device, when the grant is gone', () => {
+    expect(cameraLossCode('camera-in-use', 'prompt')).toBe('camera-denied');
+    expect(cameraLossCode('no-camera', 'denied')).toBe('camera-denied');
+    expect(cameraLossCode('camera-in-use', 'granted')).toBe('camera-in-use');
+    expect(cameraLossCode('unknown', 'unknown')).toBe('unknown');
   });
 });

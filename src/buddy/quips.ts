@@ -109,7 +109,7 @@ const QUIP_TABLE = {
   calibrationPoor: [
     'Tricky one. More light on your face and less glare might help.',
     'I’m struggling a bit. Want to try again with brighter light?',
-    'That was rough. Try sitting a little closer and redo it?',
+    'That was rough. Sit about an arm’s length away and let’s redo it?',
   ],
   calibrationCancelled: [
     'No problem. We can calibrate whenever you like.',
@@ -190,7 +190,7 @@ const QUIP_TABLE = {
     'Dewey narrows by digit: 500 is science, 590 is animals, 595 is arthropods.',
     'Dewey files American poetry at 811 and English poetry at 821.',
     '“Library” comes from Latin liber: the inner bark of a tree, and later “book.”',
-    'Andrew Carnegie funded over 2,500 public libraries between 1883 and 1929.',
+    'Andrew Carnegie funded over 2,500 libraries between 1883 and 1929, most of them public.',
   ],
 } as const satisfies Record<string, readonly string[]>;
 

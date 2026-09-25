@@ -8,6 +8,26 @@ Face tracking runs entirely in your browser with [MediaPipe Face Landmarker](htt
 Video never leaves your device, there is no account, and nothing is uploaded. A Chrome extension
 brings the same page turning (and Dewey) to articles and online books on any website.
 
+## Try it
+
+- **Web app: <https://lance-lii.github.io/gaze-reader/>.** Nothing to install. The site is served
+  over HTTPS, so the webcam works there in a recent Chrome, Edge, Firefox or Safari. The first run
+  asks how you'd like to read: **webcam**, **mouse** or **demo**. With the webcam, the browser asks
+  for camera access and the app downloads the face model (about 3.6 MB) once. Without one, pick
+  **Demo** and watch a simulated reader turn the pages, or **Mouse** and point at the line you're
+  reading. For private documents, read the note on the shared origin under [Privacy](#privacy).
+- **claude.ai Artifact preview.** The same reader, built to run inside a claude.ai Artifact
+  (`npm run build:artifact`). The Artifact frame doesn't allow camera access, so this version offers
+  **Demo** and **Mouse** only, and its webcam option links to the web app above. See
+  [Artifact build](#artifact-build).
+- **Chrome extension.** Page turns and Dewey on any website. It isn't in the Chrome Web Store yet;
+  [docs/INSTALL-EXTENSION.md](docs/INSTALL-EXTENSION.md) walks through building it and loading it
+  in Chrome or Edge.
+- **Privacy.** [PRIVACY.md](PRIVACY.md) lists what the app and the extension access, what they
+  store and every network request they make.
+
+What's new in each release is in [CHANGELOG.md](CHANGELOG.md).
+
 ## Features
 
 - **Hands-free page turns.** A one-minute calibration maps your eyes to the screen. From then on,
@@ -48,7 +68,8 @@ like to read: **webcam**, **mouse** or **demo**.
 
 `npm run dev` first copies the MediaPipe WASM runtime from `node_modules` into
 `public/mediapipe/wasm/`, so it's served from your own origin. The face model (about 3.6 MB) is
-downloaded once from Google's model storage and cached by the browser.
+downloaded from Google's model storage and cached by the browser, but the web app has no offline
+mode: the webcam needs a connection the first time it starts in a tab.
 
 Browsers only allow camera access in a secure context. `localhost` counts as one. To use another
 device on your network, serve the app over HTTPS.
@@ -76,8 +97,8 @@ Tips for good tracking:
   or seating, recalibrate (**C**; takes about a minute).
 - **Glasses:** tilt the screen or the lamp to get rid of reflections on the lenses. Glare over
   the iris confuses the tracker.
-- **Window size:** calibration is tied to the window size. If you resize, the app offers a quick
-  5-dot refresh.
+- **Window size:** calibration is tied to the window's size and layout. If you resize or zoom the
+  window, or go fullscreen or show a toolbar, the app offers a quick 5-dot refresh.
 - If pages turn too early, choose **Relaxed** sensitivity. If they turn too late, choose **Eager**.
   **U** undoes a turn, and after a couple of undos the app suggests Relaxed.
 
@@ -107,7 +128,7 @@ In the app (shortcuts are ignored while you're typing in a field):
 | Space, Page Down | Next page |
 | Shift+Space, Page Up | Previous page |
 | U | Undo the last page turn |
-| P | Pause or resume automatic page turns |
+| P | Pause or resume auto-scroll |
 | C | Recalibrate the camera |
 | D | Show or hide the debug overlay |
 | G | Show or hide the gaze dot |
@@ -149,7 +170,9 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
      its end for a moment, or you finish it and your eyes jump back to the left looking for a
      next line that isn't there;
    - your gaze rests at the bottom right of the text (a fallback for when the tracker is unsure);
-   - you deliberately look below the page (glance-down, which you can switch off).
+   - you deliberately look below the page (glance-down, which you can switch off). It is ignored
+     while the tracker is confident you're still above the last two lines, so a look at the
+     keyboard mid-page doesn't turn it.
 
    Guards prevent false turns: a cooldown after every scroll, enough valid tracking in the last
    second, some reading on the new page, and never a turn during a blink. After a turn, the
@@ -168,8 +191,16 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
   pill says so.
 - Books, reading progress, settings and calibration stay in your browser (IndexedDB,
   `localStorage`, or `chrome.storage.local` for the extension).
+- The hosted demo runs on https://lance-lii.github.io, and every GitHub Pages project site of
+  that account (for example `/habitat-designer/`) shares that origin. Those sites can read the
+  library (IndexedDB `gazeReader`) and settings/calibration (`localStorage` `gazeReader.*`). If
+  you choose a persistent camera grant, they can also use the camera without asking. For private
+  documents, run it locally (`npm run dev` / `npm run preview`) or host it on its own origin, and
+  prefer "Allow this time" for the camera on the hosted demo. Forks deployed to
+  `<you>.github.io` have the same property.
 - There are no analytics, no telemetry and no remote logging. The only network requests are the
-  face-landmark model file and any book URL you ask the reader to open.
+  face-landmark model file and any book URL you ask the reader to open. MediaPipe's built-in
+  usage logging to Google (`odml.pa.googleapis.com`) is blocked before it can send anything.
 
 ## Chrome extension
 
@@ -189,9 +220,36 @@ npm run build:ext
 5. Calibrate on the page. The calibration is shared across sites and adjusts automatically for
    each site's zoom level.
 
-The popup can switch between webcam and mouse, change sensitivity, show or hide Dewey and the
-gaze dot, and recalibrate. The extension only runs in tabs where you turn it on. It needs the
-`activeTab`, `scripting`, `storage` and `offscreen` permissions.
+The popup can switch between webcam and mouse, change sensitivity, choose how pages turn, show or
+hide Dewey and the gaze dot, and recalibrate. The extension only runs in tabs where you turn it
+on. It needs the `activeTab`, `scripting`, `storage` and `offscreen` permissions.
+
+Some readers draw their pages as pictures (Kindle Cloud Reader, Google Play Books, some PDF
+viewers), so there are no text lines to follow. On those pages the extension switches to **page
+mode**: looking at the bottom edge of the page turns it, either by scrolling or by pressing the
+reader's own next-page keys (→ and Page Down). The popup's **Turn pages by: Auto / Scrolling /
+Next-page key** setting chooses which. Simulated key presses are best effort, because many readers
+ignore them.
+
+Step-by-step install for Chrome and Edge, with troubleshooting, is in
+[docs/INSTALL-EXTENSION.md](docs/INSTALL-EXTENSION.md). `npm run package:ext` zips the build for
+the Chrome Web Store (see [docs/CHROME-WEB-STORE.md](docs/CHROME-WEB-STORE.md)). What the app and
+the extension access and store is in [PRIVACY.md](PRIVACY.md).
+
+## Artifact build
+
+`npm run build:artifact` builds a version that runs inside a claude.ai Artifact frame, in
+`dist-artifact/`: `gaze-reader.html` (content only: the frame supplies the doctype, head and body;
+all CSS and JS are inline), `pdf.worker.min.mjs` and `samples/`. Publish all of them together.
+
+The frame refuses camera access and blocks MediaPipe's model and runtime, so this build leaves
+MediaPipe out and offers **Demo** and **Mouse** only. The webcam option says it needs the
+[full app](https://lance-lii.github.io/gaze-reader/) and links there. "Open from URL" is hidden
+(cross-origin fetches are blocked), and the "auto" theme follows the viewer's theme on the host
+page. The target is a compile-time constant (`__GR_TARGET__`, read through `src/core/target.ts`),
+so the web app contains none of this and the Artifact page none of MediaPipe. The build checks
+the page against the frame's rules (no document tags, scripts only inline or from the allowed
+CDNs, no network URLs in `fetch()`, no leftover chunks, under 16 MB) and fails otherwise.
 
 ## Project structure
 
@@ -210,10 +268,11 @@ src/ui/                     Calibration overlay, top bar, library, settings, hel
                             toasts, camera preview, gaze dot, debug overlay
 src/app/                    Controller (wires everything) and pure shell logic
 src/styles/app.css          App shell styles and theme tokens
+src/styles/artifact.css     Extra styles for the Artifact build (layout inside the frame)
 public/samples/             The two sample books
 extension/                  Chrome MV3 extension: service worker, offscreen tracker, content
                             script, popup, camera setup page
-scripts/                    Extension build, MediaPipe WASM copy, icon generator
+scripts/                    Extension and Artifact builds, MediaPipe WASM copy, icon generator
 docs/ARCHITECTURE.md        Module contracts and design notes
 ```
 
@@ -225,6 +284,8 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 | `npm run build` | Production build of the web app into `dist/` (relative paths, so it works on any static host, e.g. GitHub Pages) |
 | `npm run preview` | Serve the production build locally |
 | `npm run build:ext` | Build the Chrome extension into `dist-extension/` and check the package |
+| `npm run package:ext` | Zip `dist-extension/` into `release/gaze-reader-extension-v<version>.zip` for the Chrome Web Store |
+| `npm run build:artifact` | Build the claude.ai Artifact version into `dist-artifact/` and check it (see [Artifact build](#artifact-build)) |
 | `npm run typecheck` | TypeScript checks for the app and the extension |
 | `npm test` | Run the unit and integration tests (Vitest, with jsdom for DOM tests) |
 | `npm run check` | All of the above: typecheck, tests, app build, extension build |
@@ -240,16 +301,19 @@ docs/ARCHITECTURE.md        Module contracts and design notes
   noticeably worse, and so does a camera that sees you from a steep angle.
 - **Posture drift.** Calibration assumes you sit roughly as you did while calibrating. The model
   compensates for window moves and learns slow vertical drift, but after a big change in posture
-  it's best to recalibrate. Page zoom and browser toolbar changes aren't compensated in the web
-  app (the extension handles zoom).
+  it's best to recalibrate. The web app doesn't compensate for page zoom, fullscreen or toolbar
+  changes; it notices them and offers a quick 5-dot refresh instead (the extension compensates for
+  zoom).
 - **Not validated at scale.** The page-end rules were tuned against a simulated reader with noise,
   drift, blinks and calibration bias, not against recordings of real readers. Expect to adjust
   sensitivity to taste.
 - **Books.** Images are dropped, since only text is rendered. PDFs need selectable text (there's
   no OCR), and PDFs using CJK/CID fonts may extract poorly. DRM-protected EPUBs can't be opened.
 - **Extension.** It needs Chrome 116 or later. A site's main content is detected heuristically,
-  so it can miss articles that single-page apps render late. It must be turned on again after a
-  full page navigation.
+  so it can miss articles that single-page apps render late. Text inside frames isn't measured.
+  It must be turned on again after a full page navigation. On canvas and image readers, page mode
+  can only watch the bottom edge, not follow the lines, and some readers ignore its simulated
+  next-page keys.
 
 ## License
 

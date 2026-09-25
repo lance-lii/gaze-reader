@@ -1,4 +1,5 @@
-import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import bundledWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { IS_ARTIFACT } from '../core/target';
 import {
   BookLoadError,
   collapseWhitespace,
@@ -391,12 +392,25 @@ export function reconstructBlocks(pages: readonly PdfPageText[]): PdfBlock[] {
 // ─────────────────────────────── pdf.js driver ───────────────────────────────
 
 type PdfJs = typeof import('pdfjs-dist');
+
+/**
+ * Where pdf.js loads its worker from. The Artifact build publishes the worker
+ * next to the page under this fixed name (scripts/build-artifact.mjs), and the
+ * frame only lets the page load files it published, by a document-relative URL.
+ */
+export const ARTIFACT_PDF_WORKER_FILE = 'pdf.worker.min.mjs';
+
+function workerUrl(): string {
+  if (!IS_ARTIFACT) return bundledWorkerUrl;
+  const base = typeof document !== 'undefined' ? document.baseURI : globalThis.location?.href;
+  return base ? new URL(ARTIFACT_PDF_WORKER_FILE, base).href : ARTIFACT_PDF_WORKER_FILE;
+}
 let pdfjsPromise: Promise<PdfJs> | null = null;
 
 function loadPdfJs(): Promise<PdfJs> {
   pdfjsPromise ??= import('pdfjs-dist')
     .then((pdfjs) => {
-      pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+      pdfjs.GlobalWorkerOptions.workerSrc = workerUrl();
       return pdfjs;
     })
     .catch((err: unknown) => {

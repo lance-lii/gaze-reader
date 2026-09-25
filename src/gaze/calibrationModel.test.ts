@@ -10,6 +10,7 @@ import {
   evaluateModel,
   featureSignature,
   loadCalibration,
+  modelChromeTop,
   qualityFromError,
   refineGazeModel,
   saveCalibration,
@@ -266,7 +267,8 @@ describe('RidgeGazeModel.predict', () => {
   });
 
   it('never rejects a prediction because the reader sits differently (posture features), only for eye glitches', () => {
-    // The reader nodded slightly toward each dot, so head `ty` tracks the targets and is picked as dominant.
+    // The reader nodded slightly toward each dot, so head `ty` tracks the targets. Named as a posture
+    // feature it enters linearly only: never squared, never a glitch check.
     const names = Array.from({ length: FEATURE_COUNT }, (_, i) => (i === 5 ? 'ty' : `f${i}`));
     const r = rng(86);
     const nod = (s: CalibrationSample): CalibrationSample => {
@@ -274,8 +276,10 @@ describe('RidgeGazeModel.predict', () => {
       v[5] = 0.8 * (s.target.y / VIEWPORT.height - 0.5) + 0.01 * gaussian(r);
       return { ...s, features: { ...s.features, vector: v } };
     };
-    const trained = trainGazeModel(collect(GRID, 25, 87).map(nod), { viewport: VIEWPORT, featureNames: names }).model;
-    expect(trained.dominantFeatures).toContain(5);
+    const nodding = collect(GRID, 25, 87).map(nod);
+    const trained = trainGazeModel(nodding, { viewport: VIEWPORT, featureNames: names }).model;
+    expect(trained.dominantFeatures).not.toContain(5);
+    expect(trained.dominantFeatures.length).toBeGreaterThan(0);
     const f = nod({ target: GRID[12], features: eyeFeatures(GRID[12], rng(88), { noise: 0 }), t: 0 }).features;
     // Leaning back 20 cm later is hundreds of calibration SDs in `ty`: still a prediction.
     expect(trained.predict({ ...f, vector: f.vector.map((v, i) => (i === 5 ? v + 20 : v)) })).not.toBeNull();
@@ -283,9 +287,13 @@ describe('RidgeGazeModel.predict', () => {
     const eye = trained.dominantFeatures.find((j) => j !== 5)!;
     expect(trained.predict({ ...f, vector: f.vector.map((v, i) => (i === eye ? v + 100 : v)) })).toBeNull();
 
-    // Models saved before this rule learn it on load from the running build's names…
-    const legacy = { ...trained.toJSON() } as Record<string, unknown>;
+    // Models saved before these rules could carry `ty` as a dominant feature (trained here without
+    // names, so it is picked). They learn the glitch rule on load from the running build's names…
+    const old = trainGazeModel(nodding, { viewport: VIEWPORT }).model;
+    expect(old.dominantFeatures).toContain(5);
+    const legacy = { ...old.toJSON() } as Record<string, unknown>;
     delete legacy.glitchCheck;
+    delete legacy.featureSignature;
     const leaned = { ...f, vector: f.vector.map((v, i) => (i === 5 ? v + 20 : v)) };
     expect(deserializeGazeModel(legacy, { featureNames: names })!.predict(leaned)).not.toBeNull();
     // …and without names keep the old, all-dominant check.
@@ -321,6 +329,33 @@ describe('serialization', () => {
   function names(count = FEATURE_COUNT): string[] {
     return Array.from({ length: count }, (_, i) => `f${i}`);
   }
+
+  it('records the browser chrome height for the window-layout check, and tolerates models without it', () => {
+    const win = { screenX: 0, screenY: 0, innerWidth: VIEWPORT.width, innerHeight: 700, outerHeight: 810, devicePixelRatio: 1, top: null as unknown };
+    win.top = win;
+    vi.stubGlobal('window', win);
+    const trained = trainGazeModel(collect(GRID, 25, 95), { viewport: VIEWPORT }).model;
+    expect(trained.chromeTop).toBe(110);
+    expect(modelChromeTop(trained)).toBe(110);
+    const restored = deserializeGazeModel(JSON.parse(JSON.stringify(trained.toJSON())) as unknown)!;
+    expect(restored.chromeTop).toBe(110);
+    // A zoom change makes the heights incomparable (the size check covers that case).
+    win.devicePixelRatio = 1.25;
+    expect(modelChromeTop(restored)).toBeNull();
+    // Models saved before the field existed: no check.
+    const legacy = { ...trained.toJSON() } as Record<string, unknown>;
+    delete legacy.chromeTop;
+    delete legacy.dprAtCalibration;
+    const old = deserializeGazeModel(legacy)!;
+    expect(old).toBeInstanceOf(RidgeGazeModel);
+    expect(old.chromeTop).toBeNull();
+    expect(modelChromeTop(old)).toBeNull();
+    // A quick refresh re-fits the offset in the current layout, so it becomes the new reference.
+    win.devicePixelRatio = 1;
+    win.outerHeight = 700; // fullscreen: no toolbar
+    const refined = refineGazeModel(trained, collect(GRID.slice(0, 5), 20, 96)).model;
+    expect(refined.chromeTop).toBe(0);
+  });
 
   it('round-trips through JSON with bit-identical predictions', () => {
     const json = JSON.parse(JSON.stringify(model.toJSON())) as unknown;
@@ -512,6 +547,17 @@ describe('qualityFromError', () => {
     expect(qualityFromError(80, 1000)).toBe('good');
     expect(qualityFromError(130, 1000)).toBe('fair');
     expect(qualityFromError(200, 1000)).toBe('poor');
+  });
+
+  it('grades by lines at the reader’s own line pitch', () => {
+    expect(qualityFromError(50, 1000, 18.2)).toBe('fair'); // small text: ≈ 2.7 lines
+    expect(qualityFromError(50, 1000)).toBe('excellent'); // same error at the default pitch
+    expect(qualityFromError(150, 1000, 93.6)).toBe('fair'); // large text: 1.6 lines, but 15 % of the page
+    expect(qualityFromError(150, 1000)).toBe('poor'); // at the default pitch that is 3.6 lines
+    expect(qualityFromError(100, 1000, 93.6)).toBe('good');
+    for (const bad of [0, Number.NaN, -5, 4]) {
+      expect(qualityFromError(80, 1000, bad)).toBe(qualityFromError(80, 1000));
+    }
   });
 
   it('is stricter on short viewports', () => {

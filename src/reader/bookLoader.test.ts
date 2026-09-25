@@ -884,3 +884,41 @@ describe('sample books', () => {
     expect((await mod.listSampleBooks()).map((s) => s.id)).toEqual(['s1']);
   });
 });
+
+describe('long runs of spaces (regression: quadratic regexes froze the tab)', () => {
+  const spaces = ' '.repeat(200_000);
+  const fast = (run: () => unknown): void => {
+    const start = performance.now();
+    run();
+    expect(performance.now() - start).toBeLessThan(1000);
+  };
+
+  it('loads a plain-text line with a huge run of spaces quickly', () => {
+    fast(() => loadBookFromText('a' + spaces + 'b', { format: 'txt' }));
+  });
+
+  it('renders Markdown headings and paragraphs with huge runs of spaces quickly', () => {
+    fast(() => markdownToHtml('# a' + spaces + 'b'));
+    fast(() => markdownToHtml('a' + spaces + 'b'));
+    fast(() => markdownToHtml('a' + spaces + 'b' + spaces + '\nc'));
+  });
+
+  it('loads an HTML book whose link has a huge run of spaces quickly', () => {
+    fast(() => loadBookFromText(`<html><body><p>Some text with <a href="a${spaces}b">a link</a> in it.</p></body></html>`, { format: 'html' }));
+  });
+
+  it('keeps the ATX heading and hard-break rules unchanged', () => {
+    expect(markdownToHtml('# foo ##')).toContain('<h1>foo</h1>');
+    expect(markdownToHtml('## foo ## ')).toContain('<h2>foo</h2>');
+    expect(markdownToHtml('# foo#')).toContain('<h1>foo#</h1>');
+    expect(markdownToHtml('# foo#bar ##')).toContain('<h1>foo#bar</h1>');
+    expect(markdownToHtml('# #')).toContain('<h1>#</h1>');
+    expect(markdownToHtml('# ##')).toContain('<h1>##</h1>');
+    expect(markdownToHtml('#')).toContain('<h1></h1>');
+    expect(markdownToHtml('#\tfoo  ')).toContain('<h1>foo</h1>');
+    expect(markdownToHtml('#5 bolts')).not.toContain('<h1>');
+    expect(markdownToHtml('x  \ny')).toContain('<br>');
+    expect(markdownToHtml('x\\\ny')).toContain('<br>');
+    expect(markdownToHtml('x \ny')).not.toContain('<br>');
+  });
+});

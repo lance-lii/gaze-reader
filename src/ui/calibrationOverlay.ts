@@ -31,6 +31,7 @@ import {
   DEFAULT_LINE_PITCH_PX,
   asRidgeGazeModel,
   evaluateModel,
+  qualityFromError,
   refineGazeModel,
   trainGazeModel,
 } from '../gaze/calibrationModel';
@@ -549,6 +550,9 @@ export class CalibrationOverlay implements Mountable {
           if (checked.sampleCount > 0) report = checked;
         }
       }
+      // Grade at the reader's own text size, so the badge agrees with the "≈ N lines" stat.
+      const vh = trained.model.viewport.height > 0 ? trained.model.viewport.height : this.measureViewport().height;
+      report = { ...report, quality: qualityFromError(report.meanErrorPx, vh, this.linePitch()) };
 
       const choice = await this.results(trained.model, report, mode, signal);
       if (choice === 'use') return { model: trained.model, report };
