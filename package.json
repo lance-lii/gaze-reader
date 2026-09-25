@@ -1,6 +1,6 @@
 {
   "name": "gaze-reader",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Webcam eye-tracking book reader that turns the page when your eyes reach the bottom — with Dewey, a tiny nerd reading buddy.",
   "type": "module",
