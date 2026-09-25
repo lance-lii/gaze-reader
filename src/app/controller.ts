@@ -527,6 +527,10 @@ export class AppController {
   }
 
   private async openBook(book: Book, seq: number): Promise<void> {
+    if (this.session?.book.id === book.id) {
+      this.toasts.show({ id: 'already-open', message: `“${book.title}” is already open.` });
+      return;
+    }
     // Saving and restoring progress are conveniences: failures must not block reading.
     try {
       await saveBook(book);
@@ -1264,6 +1268,7 @@ export class AppController {
     }
     if (base) return true;
     this.webcamHold = { reason: 'uncalibrated' };
+    this.bus.emit('buddy-say', { text: 'No rush! We can calibrate whenever you like, or try the mouse.', priority: 'high', mood: 'thinking' });
     this.toasts.show({
       id: 'camera',
       tone: 'warn',
@@ -1485,7 +1490,11 @@ export class AppController {
       if (s.autoScroll) this.pageEnd.reset();
       this.refreshTracking(performance.now());
     }
-    if (changed.includes('gazeSource')) this.syncSource();
+    if (changed.includes('gazeSource')) {
+      // Choosing the webcam (from anywhere) is a fresh request: retry even after a failure.
+      if (s.gazeSource === 'webcam') this.webcamHold = null;
+      this.syncSource();
+    }
     if (any(OVERLAY_KEYS)) this.updateOverlays();
   }
 

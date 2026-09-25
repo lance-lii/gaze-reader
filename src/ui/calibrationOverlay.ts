@@ -857,7 +857,10 @@ export class CalibrationOverlay implements Mountable {
     }
   };
 
+  /** Keeps wheel/touch from scrolling the page behind; an overflowing card may still scroll itself. */
   private readonly blockScroll = (e: Event): void => {
+    const panel = e.target instanceof Element ? e.target.closest<HTMLElement>(`.${P}-center`) : null;
+    if (panel && panel.scrollHeight > panel.clientHeight + 1) return; // overscroll-behavior stops chaining
     if (e.cancelable) e.preventDefault();
   };
 
@@ -1894,7 +1897,7 @@ function buildStyles(): string {
 .${p}-center {
   position: absolute; inset: 0;
   display: grid; place-items: center;
-  padding: 24px; overflow: auto;
+  padding: 24px; overflow: auto; overscroll-behavior: contain;
 }
 .${p}-card {
   width: min(540px, 100%);
@@ -1936,7 +1939,8 @@ function buildStyles(): string {
 
 /* ── positioning ── */
 .${p}-preview {
-  position: relative; width: 100%; max-width: 420px; align-self: center;
+  /* Shrinks with the viewport height so the whole card fits without scrolling. */
+  position: relative; width: min(100%, 420px, max(220px, calc((100vh - 420px) * 4 / 3))); align-self: center; flex: none;
   aspect-ratio: 4 / 3; border-radius: 16px; overflow: hidden;
   background: #0c0e12; isolation: isolate;
 }
@@ -1999,7 +2003,7 @@ function buildStyles(): string {
 .${p}-stat-value { font-size: 30px; line-height: 1.1; font-weight: 750; font-variant-numeric: tabular-nums; color: var(--c-fg); }
 .${p}-stat-unit { font-size: 15px; font-weight: 600; color: var(--c-muted); }
 .${p}-stat-label { font-size: 13px; color: var(--c-muted); }
-.${p}-map { display: block; width: 100%; height: auto; max-height: 170px; }
+.${p}-map { display: block; width: 100%; height: clamp(110px, 22vh, 170px); }
 .${p}-map-frame { fill: var(--c-tint); stroke: var(--c-border); }
 .${p}-map-link { stroke: var(--c-muted); stroke-width: 1.5; stroke-dasharray: 3 3; }
 .${p}-map-target { fill: none; stroke: var(--c-fg); stroke-width: 2; }
@@ -2017,6 +2021,11 @@ function buildStyles(): string {
   overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
 }
 
+@media (max-height: 760px) {
+  .${p}-center { padding: 16px; }
+  .${p}-card { gap: 12px; padding: 22px 24px 18px; }
+  .${p}-title { font-size: 21px; }
+}
 @media (max-width: 520px) {
   .${p}-card { padding: 22px 18px 18px; gap: 14px; border-radius: 18px; }
   .${p}-title { font-size: 21px; }

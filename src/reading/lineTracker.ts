@@ -142,7 +142,7 @@ export class LineTracker {
   /** Indices (into layout.lines) of the readable lines, top to bottom. */
   private states: number[] = [];
   /** Joint posterior, row k (state) × column b (drift bin). */
-  private joint = new Float64Array(0);
+  private joint: Float64Array = new Float64Array(0);
   /** Drift belief independent of the layout; seeds new layouts. */
   private driftBelief: Float64Array;
   /** Line posterior per layout line (0 for unreadable lines); published as-is, never mutated. */

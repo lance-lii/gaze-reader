@@ -168,8 +168,9 @@ export class Onboarding implements Mountable {
     this.pending = new Promise((resolve) => {
       this.resolve = resolve;
     });
-    this.layer.open(this.next);
+    // Reset to the first step before opening, so the initial focus target is visible.
     this.goTo(0, false);
+    this.layer.open(this.next);
     return this.pending;
   }
 

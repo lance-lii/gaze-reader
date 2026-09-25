@@ -371,7 +371,7 @@ export class PageEndDetector {
     );
     const status = (): string =>
       `L=${L} p(L+)=${fmtP(pEnd)} x=${Number.isFinite(progress) ? fmtP(progress) : '–'} · ` +
-      `dwell ${fmtMs(this.lineDwell.held)}/${dwellMs}${doubt ? " (doubt)" : ""} · zone ${fmtMs(this.zoneDwell.held)}/${th.zoneMs}` +
+      `dwell ${fmtMs(this.lineDwell.held)}/${dwellMs}${doubt ? ' (doubt)' : ''} · zone ${fmtMs(this.zoneDwell.held)}/${th.zoneMs}` +
       (this.opts.glanceDownToTurn ? ` · glance ${fmtMs(this.glanceDwell.held)}/${th.glanceMs}` : '');
 
     // Guards.
@@ -419,7 +419,7 @@ export class PageEndDetector {
     this.disarm();
     // A deliberate glance means "next page"; the other rules hedge when the tracker isn't sure.
     const target = reason === 'glance-down' ? targetLineIndex : cautiousTarget;
-    if (target !== targetLineIndex) detail += ` · anchored at L−1 (p=${fmtP(est!.posterior[L - 1]!)})`;
+    if (target !== targetLineIndex) detail += ` · anchored at L−1 (p=${fmtP(pAbove)})`;
     return { trigger: true, reason, confidence, targetLineIndex: target, detail };
   }
 
