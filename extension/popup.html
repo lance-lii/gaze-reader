@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Gaze Reader</title>
+  </head>
+  <body>
+    <main class="popup" aria-busy="true">
+      <header class="head">
+        <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+          <rect width="64" height="64" rx="15" fill="url(#logo-bg)" />
+          <defs>
+            <linearGradient id="logo-bg" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#ffbe5c" />
+              <stop offset="1" stop-color="#ef7d2d" />
+            </linearGradient>
+          </defs>
+          <g fill="#fff6e6" stroke="#2b1d14" stroke-width="4.5">
+            <circle cx="20" cy="34" r="11" />
+            <circle cx="44" cy="34" r="11" />
+          </g>
+          <path d="M28.5 31.5q3.5-3.5 7 0M9 32l-4-3M55 32l4-3" fill="none" stroke="#2b1d14" stroke-width="4" stroke-linecap="round" />
+          <circle cx="23" cy="37" r="3.2" fill="#2b1d14" />
+          <circle cx="47" cy="37" r="3.2" fill="#2b1d14" />
+          <path d="M14 28.5a7 7 0 0 1 5-3.5M38 28.5a7 7 0 0 1 5-3.5" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" />
+        </svg>
+        <div>
+          <h1>Gaze Reader</h1>
+          <p class="tagline">Turns the page when your eyes reach the bottom.</p>
+        </div>
+      </header>
+
+      <section class="card power">
+        <label class="row" for="enabled">
+          <span class="row-text">
+            <span class="row-title">On this page</span>
+            <span class="status" id="status" role="status" aria-live="polite">Checking…</span>
+          </span>
+          <input class="switch" id="enabled" type="checkbox" role="switch" disabled />
+        </label>
+        <p class="notice" id="notice" hidden></p>
+      </section>
+
+      <section class="card settings" aria-label="Settings">
+        <div class="row">
+          <span class="row-title" id="source-label">Follow my</span>
+          <fieldset class="segmented" aria-labelledby="source-label">
+            <label title="Webcam eye tracking, processed on this device"
+              ><input type="radio" name="source" value="webcam" />
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z" /></svg>
+              Eyes</label
+            >
+            <label title="Follow the mouse pointer instead (no camera)"
+              ><input type="radio" name="source" value="mouse" />
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="3" width="10" height="18" rx="5" /><path d="M12 7v3" /></svg>
+              Mouse</label
+            >
+          </fieldset>
+        </div>
+        <p class="calibration" id="calibration" hidden></p>
+
+        <div class="row">
+          <span class="row-text">
+            <span class="row-title" id="sensitivity-label">Page turns</span>
+            <span class="hint" id="sensitivity-hint"></span>
+          </span>
+          <fieldset class="segmented" aria-labelledby="sensitivity-label">
+            <label><input type="radio" name="sensitivity" value="relaxed" />Relaxed</label>
+            <label><input type="radio" name="sensitivity" value="balanced" />Balanced</label>
+            <label><input type="radio" name="sensitivity" value="eager" />Eager</label>
+          </fieldset>
+        </div>
+
+        <label class="row" for="buddy">
+          <span class="row-text">
+            <span class="row-title">Dewey</span>
+            <span class="hint">Your reading buddy in the corner</span>
+          </span>
+          <input class="switch" id="buddy" type="checkbox" role="switch" />
+        </label>
+
+        <label class="row" for="gaze-dot">
+          <span class="row-text">
+            <span class="row-title">Gaze dot</span>
+            <span class="hint">Show where Gaze Reader thinks you look</span>
+          </span>
+          <input class="switch" id="gaze-dot" type="checkbox" role="switch" />
+        </label>
+      </section>
+
+      <div class="actions">
+        <button class="btn" id="recalibrate" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7" /><circle cx="12" cy="12" r="2.5" /><path d="M12 2v3M12 19v3M2 12h3M19 12h3" /></svg>
+          Recalibrate
+        </button>
+        <button class="btn" id="setup" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="7" width="13" height="10" rx="2" /><path d="M16 11l5-3v8l-5-3z" /></svg>
+          Camera setup
+        </button>
+      </div>
+
+      <footer class="foot">
+        <p>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2" /><path d="M8 11V8a4 4 0 0 1 8 0v3" /></svg>
+          Video never leaves this device.
+        </p>
+        <p><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>G</kbd> turns it on or off · <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd> for shortcuts</p>
+      </footer>
+    </main>
+    <script type="module" src="./src/popup.ts"></script>
+  </body>
+</html>

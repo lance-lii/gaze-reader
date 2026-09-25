@@ -28,8 +28,16 @@ export interface BlendshapeLike {
 export const LANDMARK_COUNT = 478;
 const MESH_POINT_COUNT = 468;
 
+export interface EyeLandmarkIndices {
+  readonly iris: number;
+  readonly inner: number;
+  readonly outer: number;
+  readonly upper: number;
+  readonly lower: number;
+}
+
 /** Face-mesh indices used here, exported for preview overlays. */
-export const EYE_LANDMARKS = Object.freeze({
+export const EYE_LANDMARKS: Readonly<{ right: EyeLandmarkIndices; left: EyeLandmarkIndices; chin: number }> = Object.freeze({
   right: Object.freeze({ iris: 468, inner: 133, outer: 33, upper: 159, lower: 145 }),
   left: Object.freeze({ iris: 473, inner: 362, outer: 263, upper: 386, lower: 374 }),
   chin: 152,

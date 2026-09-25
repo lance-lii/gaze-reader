@@ -133,8 +133,30 @@ const SWEEP_MIN_DX_COL = 0.4;
 const SWEEP_LAND_COL = 0.4;
 const SWEEP_MAX_RISE_LINES = 0.5;
 const SWEEP_CONFIRM_SAMPLES = 2;
+/** Lines narrower than this (× column width) are "short" (paragraph-final) for the sweep shortcut. */
+const SHORT_LINE_COL = 0.7;
+const SHORT_SWEEP_MIN_DY_LINES = 0.3;
 /** Bottom-dwell is vetoed when the tracker is this sure the reader is above the last two lines. */
 const ZONE_VETO_CONFIDENCE = 0.8;
+/** Fixations after a return sweep, jump or fresh page whose line counts as "the line entered". */
+const ENTRY_FIXATIONS = 2;
+/** The tracker being this sure of one line for this many fixations in a row also counts as entering it. */
+const SETTLED_CONFIDENCE = 0.9;
+const SETTLED_FIXATIONS = 3;
+/**
+ * Doubt: the tracker still gives the line above the last at least this much
+ * probability. Then rule 1 waits twice as long and the sweep shortcut stays
+ * off — if the reader is really finishing the line above, their return sweep
+ * resets the dwell before it completes.
+ */
+const DOUBT = 0.1;
+const DOUBT_DWELL_FACTOR = 2;
+/**
+ * Even more doubt at the moment of firing anchors the turn one line higher: a
+ * turn that comes a line early then repeats a line instead of scrolling
+ * unread text away.
+ */
+const ANCHOR_DOUBT = 0.25;
 /** Glance-down re-arms once the gaze has come back this far above the glance threshold. */
 const GLANCE_REARM_LINES = 1;
 
@@ -188,6 +210,11 @@ export class PageEndDetector {
   private armY = NaN;
   private sweepRun = 0;
   private lastFixCount = -1;
+  /** docTop of the line the tracker put the reader on when they last entered a line. */
+  private enteredDocTop: number | null = null;
+  private entryLeft = 0;
+  private settledDocTop: number | null = null;
+  private settledRun = 0;
   private glanceArmed = true;
 
   constructor(opts: Partial<PageEndOptions> = {}) {
@@ -236,6 +263,10 @@ export class PageEndDetector {
     this.armY = NaN;
     this.sweepRun = 0;
     this.lastFixCount = -1;
+    this.enteredDocTop = null;
+    this.entryLeft = 0;
+    this.settledDocTop = null;
+    this.settledRun = 0;
     this.glanceArmed = true;
   }
 
@@ -270,32 +301,49 @@ export class PageEndDetector {
     if (est) for (let j = L; j < est.posterior.length; j++) pEnd += est.posterior[j]!;
     const x = valid ? g!.x : NaN;
     const yc = valid ? g!.y - drift : NaN;
-    const lineW = Lline.right - Lline.left;
-    const progress = valid ? (lineW > 0 ? clamp01((x - Lline.left) / lineW) : x >= Lline.right ? 1 : 0) : NaN;
+    const progress = valid ? endProgress(Lline, x, zones.columnWidth) : NaN;
+
+    // Which line did the tracker say the reader entered (right after a return sweep, a jump or a
+    // fresh page — or by being very sure of it for a while)? A tracker that slides onto the last
+    // line mid-line on vertical evidence alone hasn't seen the reader get there; the sweep into it
+    // (or a glance back from its end) will show it.
+    let sweep = false;
+    if (est && est.fixationsOnPage !== this.lastFixCount) {
+      if (est.lastSaccade === 'return-sweep' && t <= this.armedUntil && this.lastFixCount >= 0) sweep = true;
+      if (est.lastSaccade !== 'forward' && est.lastSaccade !== 'regression') this.entryLeft = ENTRY_FIXATIONS;
+      const line = layout.lines[est.lineIndex];
+      if (line) {
+        if (this.entryLeft > 0) {
+          this.enteredDocTop = line.docTop;
+          this.entryLeft--;
+        }
+        const same = this.settledDocTop !== null && Math.abs(this.settledDocTop - line.docTop) < 0.5 * pitch;
+        this.settledRun = est.probability >= SETTLED_CONFIDENCE ? (same ? this.settledRun + 1 : 1) : 0;
+        this.settledDocTop = line.docTop;
+        if (this.settledRun >= SETTLED_FIXATIONS) this.enteredDocTop = line.docTop;
+      }
+      this.lastFixCount = est.fixationsOnPage;
+    }
+    const entered = this.enteredDocTop !== null && this.enteredDocTop >= Lline.docTop - 0.5 * pitch;
 
     // Rule 1: on the last line, far enough along it.
-    const onLastLine = est !== null && pEnd >= th.minPosterior;
+    const pAbove = est && L > 0 ? est.posterior[L - 1]! : 0;
+    const doubt = pAbove >= DOUBT;
+    const dwellMs = doubt ? th.dwellMs * DOUBT_DWELL_FACTOR : th.dwellMs;
+    const onLastLine = est !== null && entered && pEnd >= th.minPosterior;
     const c1: Tri = valid ? onLastLine && progress >= th.minProgress : est ? null : false;
     this.lineDwell.step(c1, dt);
 
-    // Rule 1b: return sweep after having been at the end of the last line.
-    let sweep = false;
-    if (c1 === true) {
+    // Rule 1b: return sweep after having been (confidently) at the end of the last line.
+    if (c1 === true && !doubt) {
       this.armedUntil = t + SWEEP_ARM_MS;
       this.armMaxX = Math.max(this.armMaxX, x);
       this.armY = yc;
     }
     if (t > this.armedUntil) this.disarmSweep();
     if (valid && t <= this.armedUntil) {
-      const leftward = this.armMaxX - x >= SWEEP_MIN_DX_COL * zones.columnWidth;
-      const landed = x <= zones.columnLeft + SWEEP_LAND_COL * zones.columnWidth;
-      const notUp = !(yc < this.armY - SWEEP_MAX_RISE_LINES * pitch);
-      this.sweepRun = leftward && landed && notUp ? this.sweepRun + 1 : 0;
+      this.sweepRun = this.isSweep(x, yc, Lline, zones) ? this.sweepRun + 1 : 0;
       if (this.sweepRun >= SWEEP_CONFIRM_SAMPLES) sweep = true;
-    }
-    if (est && est.fixationsOnPage !== this.lastFixCount) {
-      if (est.lastSaccade === 'return-sweep' && t <= this.armedUntil && this.lastFixCount >= 0) sweep = true;
-      this.lastFixCount = est.fixationsOnPage;
     }
 
     // Rule 2: parked at the bottom right, and the tracker isn't confidently elsewhere.
@@ -308,20 +356,22 @@ export class PageEndDetector {
     const c3: Tri = !this.opts.glanceDownToTurn ? false : valid ? this.glanceArmed && yc >= zones.glanceTop : null;
     this.glanceDwell.step(c3, dt);
 
-    const lineReady = sweep || this.lineDwell.held >= th.dwellMs;
+    const lineReady = sweep || this.lineDwell.held >= dwellMs;
     const glanceReady = this.glanceDwell.held >= th.glanceMs;
     const zoneReady = this.zoneDwell.held >= th.zoneMs;
 
     const targetLineIndex =
       est && est.lineIndex >= L - 1 && est.lineIndex >= 0 ? Math.min(est.lineIndex, L) : L;
+    const cautiousTarget =
+      targetLineIndex === L && L > 0 && est && pAbove >= ANCHOR_DOUBT ? L - 1 : targetLineIndex;
     const closeness = Math.max(
-      onLastLine ? clamp01(this.lineDwell.held / th.dwellMs) * pEnd : 0,
+      onLastLine ? clamp01(this.lineDwell.held / dwellMs) * pEnd : 0,
       clamp01(this.zoneDwell.held / th.zoneMs) * 0.6,
       clamp01(this.glanceDwell.held / th.glanceMs) * 0.9,
     );
     const status = (): string =>
       `L=${L} p(L+)=${fmtP(pEnd)} x=${Number.isFinite(progress) ? fmtP(progress) : '–'} · ` +
-      `dwell ${fmtMs(this.lineDwell.held)}/${th.dwellMs} · zone ${fmtMs(this.zoneDwell.held)}/${th.zoneMs}` +
+      `dwell ${fmtMs(this.lineDwell.held)}/${dwellMs}${doubt ? " (doubt)" : ""} · zone ${fmtMs(this.zoneDwell.held)}/${th.zoneMs}` +
       (this.opts.glanceDownToTurn ? ` · glance ${fmtMs(this.glanceDwell.held)}/${th.glanceMs}` : '');
 
     // Guards.
@@ -367,7 +417,10 @@ export class PageEndDetector {
 
     this.lastFireAt = t;
     this.disarm();
-    return { trigger: true, reason, confidence, targetLineIndex, detail };
+    // A deliberate glance means "next page"; the other rules hedge when the tracker isn't sure.
+    const target = reason === 'glance-down' ? targetLineIndex : cautiousTarget;
+    if (target !== targetLineIndex) detail += ` · anchored at L−1 (p=${fmtP(est!.posterior[L - 1]!)})`;
+    return { trigger: true, reason, confidence, targetLineIndex: target, detail };
   }
 
   /** Fraction of valid samples in the rolling window, including this one. */
@@ -389,6 +442,23 @@ export class PageEndDetector {
     return n > 0 ? this.vValid / n : 0;
   }
 
+  /**
+   * Gaze now looks like a return sweep off the (armed) last line: a long jump
+   * back to the left margin that doesn't go up. From a short paragraph-final
+   * line the jump back is short, so there it's "back over half the line and
+   * down a bit" — the eyes looking for the next line.
+   */
+  private isSweep(x: number, yc: number, L: TextLine, z: PageEndZones): boolean {
+    const back = this.armMaxX - x;
+    const dy = yc - this.armY;
+    if (dy < -SWEEP_MAX_RISE_LINES * z.pitch) return false;
+    const w = L.right - L.left;
+    if (w < SHORT_LINE_COL * z.columnWidth) {
+      return back >= 0.5 * w && x <= z.columnLeft + SWEEP_LAND_COL * z.columnWidth && dy >= SHORT_SWEEP_MIN_DY_LINES * z.pitch;
+    }
+    return back >= SWEEP_MIN_DX_COL * z.columnWidth && x <= z.columnLeft + SWEEP_LAND_COL * z.columnWidth;
+  }
+
   private disarmSweep(): void {
     this.armedUntil = -Infinity;
     this.armMaxX = -Infinity;
@@ -403,6 +473,22 @@ export class PageEndDetector {
     this.disarmSweep();
     this.glanceArmed = false;
   }
+}
+
+/**
+ * How far along the last line the gaze is, 0..1, for the θx test. On a full
+ * line this is plain progress. On a short paragraph-final line the distance
+ * still to read is measured against the column width, so θx means the same
+ * "only a few words left" everywhere: a 12-character last line is nearly done
+ * as soon as it's reached.
+ */
+export function endProgress(line: TextLine, x: number, columnWidth: number): number {
+  if (!Number.isFinite(x)) return NaN;
+  const w = line.right - line.left;
+  const along = w > 0 ? clamp01((x - line.left) / w) : x >= line.right ? 1 : 0;
+  const remaining = Math.max(0, line.right - x);
+  const byColumn = columnWidth > 0 ? clamp01(1 - remaining / columnWidth) : along;
+  return Math.max(along, byColumn);
 }
 
 function idle(targetLineIndex: number, detail: string, confidence = 0): PageEndDecision {

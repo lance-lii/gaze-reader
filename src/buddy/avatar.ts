@@ -71,6 +71,11 @@ const C = {
   starEdge: '#e0a526',
 } as const;
 
+/** Argyle vest outline: V-neck front, rounded hem. */
+const VEST =
+  'M33.5 138 C33.5 116 40.5 104.5 50.5 100.5 L60 117 L69.5 100.5 C79.5 104.5 86.5 116 86.5 138 ' +
+  'C86.5 143.5 80 145.5 60 145.5 C40 145.5 33.5 143.5 33.5 138 Z';
+
 type Attrs = Readonly<Record<string, string | number>>;
 
 /**
@@ -370,10 +375,6 @@ export function createAvatar(doc: Document, uid: string): AvatarParts {
 
   return { svg, eyes: [eyeL.parts, eyeR.parts] };
 }
-
-const VEST =
-  'M33.5 138 C33.5 116 40.5 104.5 50.5 100.5 L60 117 L69.5 100.5 C79.5 104.5 86.5 116 86.5 138 ' +
-  'C86.5 143.5 80 145.5 60 145.5 C40 145.5 33.5 143.5 33.5 138 Z';
 
 function r1(v: number): number {
   return Math.round(v * 10) / 10;

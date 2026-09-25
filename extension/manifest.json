@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Gaze Reader — eye-tracking auto-scroll",
+  "short_name": "Gaze Reader",
+  "version": "0.1.0",
+  "description": "Turns the page when your eyes reach the bottom. Webcam eye tracking that stays on your device, plus Dewey, a reading buddy.",
+  "minimum_chrome_version": "116",
+  "permissions": ["activeTab", "scripting", "storage", "offscreen"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Gaze Reader",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "commands": {
+    "toggle-gaze-reader": {
+      "suggested_key": { "default": "Alt+Shift+G" },
+      "description": "Turn Gaze Reader on or off for this tab"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  }
+}

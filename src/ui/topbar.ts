@@ -127,7 +127,7 @@ export class Topbar implements Mountable {
             <span class="gr-pill__cam">${icon('camera')}</span>
             <span class="gr-pill__label">Camera off</span>
           </span>
-          <span class="gr-demo-chip" hidden>${icon('sparkle')}<span>Demo: a simulated reader is reading</span></span>
+          <span class="gr-demo-chip" hidden>${icon('sparkle')}<span class="gr-demo-chip__long">Demo: a simulated reader is reading</span><span class="gr-demo-chip__short" aria-hidden="true">Demo reader</span></span>
         </div>
         <div class="gr-topbar__end gr-topbar__fade">
           <fieldset class="gr-seg gr-topbar__source">
@@ -203,6 +203,7 @@ export class Topbar implements Mountable {
     pill.setAttribute('aria-label', `${view.label}. ${description}`);
     const demo = s.kind === 'simulated';
     demoChip.hidden = !demo;
+    this.el.dataset.demo = String(demo);
     // Privacy: whenever the camera is on, its indicator never hides.
     this.el.dataset.persist = s.cameraOn || demo ? 'true' : 'false';
   }

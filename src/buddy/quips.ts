@@ -122,7 +122,7 @@ const QUIP_TABLE = {
   break: [
     'Eye break! Look at something about 20 feet (6 m) away for 20 seconds.',
     '20-20-20 time: gaze at something ~6 m (20 ft) away for 20 seconds.',
-    'Rest your eyes: find something far away (about 20 ft) and watch it for 20 s.',
+    'Rest your eyes: find something about 6 m (20 ft) away and watch it for 20 s.',
     'Mini break! Look ~6 m (20 ft) away for 20 seconds, and blink a few times.',
   ],
   bookFinished: [

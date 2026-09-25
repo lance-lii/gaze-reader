@@ -1,0 +1,21 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["chrome", "vite/client"]
+  },
+  "include": [
+    "./src",
+    "../src/types.ts",
+    "../src/core",
+    "../src/signal",
+    "../src/gaze",
+    "../src/reading",
+    "../src/reader/lineGeometry.ts",
+    "../src/reader/scrollController.ts",
+    "../src/ui/calibrationOverlay.ts",
+    "../src/ui/gazeDot.ts",
+    "../src/ui/debugOverlay.ts",
+    "../src/buddy"
+  ],
+  "exclude": ["../src/**/*.test.ts"]
+}

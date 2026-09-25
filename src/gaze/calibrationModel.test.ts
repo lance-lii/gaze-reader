@@ -149,11 +149,11 @@ describe('trainGazeModel', () => {
     expect(quad.report.meanErrorPx).toBeLessThan(linear.report.meanErrorPx);
   });
 
-  it('drops blinks and gross per-target outliers', () => {
+  it('drops blinks, and gross per-target outliers do not wreck the fit', () => {
     const r = rng(41);
     const clean = collect(GRID, 30, 42);
     const dirty = clean.map((s, i) => {
-      // ~15 % of samples on four targets: eyes were somewhere else entirely.
+      // ~15 % of samples on four targets: the eyes were somewhere else entirely.
       const target = s.target;
       const onBadTarget = [0, 3, 7, 12].some((g) => GRID[g].x === target.x && GRID[g].y === target.y);
       if (onBadTarget && i % 7 === 0) {
@@ -169,17 +169,22 @@ describe('trainGazeModel', () => {
     }));
     const robust = trainGazeModel([...dirty, ...blinks], { viewport: VIEWPORT });
     const naive = trainGazeModel([...dirty, ...blinks], { viewport: VIEWPORT, rejectOutliers: false });
+    const reference = trainGazeModel(clean, { viewport: VIEWPORT });
     const injected = dirty.filter((s, i) => s !== clean[i]).length;
 
     expect(robust.diagnostics.droppedInvalid).toBe(GRID.length);
     expect(robust.diagnostics.rejectedOutliers).toBeGreaterThanOrEqual(Math.floor(injected * 0.7));
     expect(naive.diagnostics.rejectedOutliers).toBe(0);
 
-    const valSamples = collect(VALIDATION, 30, 43);
-    const robustVal = evaluateModel(robust.model, valSamples);
-    const naiveVal = evaluateModel(naive.model, valSamples);
-    expect(robustVal.meanErrorPx).toBeLessThan(30);
-    expect(robustVal.meanErrorPx).toBeLessThan(naiveVal.meanErrorPx);
+    // Judge on a dense fresh grid: four validation points are too few to rank two decent models.
+    const dense: Point[] = [];
+    for (const fx of [0.1, 0.3, 0.5, 0.7, 0.9]) for (const fy of [0.1, 0.3, 0.5, 0.7, 0.9]) dense.push({ x: fx * VIEWPORT.width, y: fy * VIEWPORT.height });
+    const held = collect(dense, 30, 43);
+    const robustErr = evaluateModel(robust.model, held).meanErrorPx;
+    const naiveErr = evaluateModel(naive.model, held).meanErrorPx;
+    const referenceErr = evaluateModel(reference.model, held).meanErrorPx;
+    expect(robustErr).toBeLessThan(referenceErr * 1.2 + 1);
+    expect(naiveErr).toBeGreaterThan(robustErr * 1.5);
   });
 
   it('rejects inconsistent feature lengths and hopeless inputs', () => {

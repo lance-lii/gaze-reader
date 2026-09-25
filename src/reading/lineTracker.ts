@@ -10,20 +10,40 @@ import type {
 import { classifySaccade } from '../signal/fixations';
 
 /**
- * Which line is the reader on? A hidden Markov model (forward filter) whose
- * hidden state is the visible line being read. Webcam gaze is decent
- * horizontally but noisy and drifty vertically, so the model leans on the
- * structure of reading: fixations march rightwards along a line and a return
- * sweep moves to the next one. The vertical position only has to be good
- * enough to keep that count honest, and its slow bias (drift) is learned.
+ * Which line is the reader on?
+ *
+ * A hidden Markov model (forward filter) over the readable lines of the
+ * current layout. Webcam gaze is decent horizontally but noisy and drifty
+ * vertically, so the model leans on the structure of reading: fixations march
+ * rightwards along a line and a return sweep moves to the next one. Vertical
+ * position only has to keep that count honest.
+ *
+ * The vertical bias of the gaze signal (drift) is part of the hidden state:
+ * the state is (line, drift) with drift on a grid of ±maxDriftLines. That is
+ * what lets it learn drift without first being sure of the line (and be sure
+ * of the line without first knowing the drift): "line 7 with +0.5 lines of
+ * drift" and "line 8 with −0.5" stay separate hypotheses until the page
+ * itself tells them apart — the top of the page, a paragraph gap, a short
+ * line, a return sweep — instead of an early guess locking in.
+ *
+ * - Emission: N(y − drift; line.centerY, σ_y²) (+ a small floor so one wild
+ *   fixation can't wipe out the posterior), times a horizontal plausibility
+ *   factor that penalizes x far outside the line (short paragraph-final lines).
+ * - Line transitions by saccade kind: forward → stay .85 / next .07 / prev .03;
+ *   regression → stay .85 / prev .08 / next .03; return sweep → next .75 /
+ *   next+1 .08 / stay .07 / prev .03; jump → 60 % uniform + 40 % where dy
+ *   points. The remaining mass is spread uniformly.
+ * - Drift transitions: a slow Gaussian random walk (driftRate × 0.5 lines per
+ *   fixation) plus a small chance of a sudden shift (the head moved).
+ * - σ_y adapts from the residuals of confident fixations (0.4–3 lines).
  */
 
 export interface LineTrackerOptions {
-  /** Vertical emission σ in lines (adapted online, clamped 0.4–3). */
+  /** Initial vertical emission σ, in lines (adapted online, clamped 0.4–3). */
   sigmaYLines: number;
-  /** EMA rate of the drift estimate per confident fixation. */
+  /** How fast the drift may wander: the random-walk step is driftRate × 0.5 lines per fixation. */
   driftRate: number;
-  /** Drift clamp, in lines. */
+  /** Drift range modeled, ± lines. */
   maxDriftLines: number;
 }
 
@@ -49,7 +69,7 @@ interface TransitionRow {
   prev: number;
 }
 
-/** Transition probabilities by saccade kind; the remainder is spread uniformly over all lines. */
+/** Line transition probabilities by saccade kind; the remainder is spread uniformly over all lines. */
 export const LINE_TRANSITIONS: Readonly<Record<Exclude<SaccadeKind, 'jump'>, Readonly<TransitionRow>>> = Object.freeze({
   forward: Object.freeze({ stay: 0.85, next: 0.07, next2: 0, prev: 0.03 }),
   regression: Object.freeze({ stay: 0.85, next: 0.03, next2: 0, prev: 0.08 }),
@@ -60,23 +80,41 @@ export const LINE_TRANSITIONS: Readonly<Record<Exclude<SaccadeKind, 'jump'>, Rea
 const JUMP_UNIFORM = 0.6;
 const JUMP_KERNEL_SIGMA_LINES = 1;
 
+/** Drift grid resolution, lines; the grid never exceeds MAX_DRIFT_BINS. */
+const DRIFT_STEP_LINES = 0.1;
+const MAX_DRIFT_BINS = 81;
+/** Random-walk step per fixation = driftRate × this, in lines. */
+const DRIFT_WALK_PER_RATE = 0.8;
+/** Per-fixation probability that the drift jumps anywhere on the grid (head movement). */
+const DRIFT_JUMP = 0.004;
+/** Drift prior on a fresh start: N(0, σ) in lines (calibration is decent but rarely perfect). */
+const DRIFT_PRIOR_SIGMA_LINES = 0.5;
+
 /** Additive floor on the vertical likelihood: one wild fixation can shift the odds by at most ~1/floor. */
 const EMISSION_FLOOR = 0.01;
 /** Minimum horizontal plausibility (x far outside a line's extent). */
 const HORIZONTAL_FLOOR = 0.05;
 
-/** Drift and σ only learn from fixations the tracker is sure about... */
+/** σ_y learns only from fixations the tracker is sure about... */
 const LEARN_CONFIDENCE = 0.8;
-/** ...and σ learns slowly, inflated to offset the selection bias of learning only when confident. */
+/** ...whose drift-corrected residual is plausible (not a glance off the text), in lines... */
+const LEARN_MAX_RESIDUAL_LINES = 0.75;
+/** ...slowly, inflated to offset the selection bias of learning only when confident. */
 const SIGMA_RATE = 0.04;
-const SIGMA_INFLATE = 1.3;
+const SIGMA_INFLATE = 1.6;
 const SIGMA_MIN_LINES = 0.4;
 const SIGMA_MAX_LINES = 3;
 
 /** A line counts as readable (a state) when at least this much of its height is inside the viewport. */
 const READABLE_FRACTION = 0.6;
-/** Probability mass kept uniform when carrying the posterior across a layout change. */
+/** Line-probability mass kept uniform when carrying the posterior across a layout change. */
 const REMAP_UNIFORM = 0.02;
+/**
+ * On a fresh layout people usually start at the top of the page: a gentle
+ * top bias (the first line is 3× as likely as one far down).
+ */
+const TOP_PRIOR_BOOST = 2;
+const TOP_PRIOR_DECAY_LINES = 3;
 
 /** Prior after a page turn, relative to the resume line. */
 const PAGE_TURN_PRIOR: ReadonlyArray<readonly [offset: number, weight: number]> = [
@@ -88,15 +126,26 @@ const PAGE_TURN_PRIOR: ReadonlyArray<readonly [offset: number, weight: number]> 
 ];
 const PAGE_TURN_UNIFORM = 0.04;
 
+const FALLBACK_PITCH_PX = 40;
+
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 const clamp01 = (v: number): number => clamp(v, 0, 1);
 
 export class LineTracker {
   private readonly opts: LineTrackerOptions;
+  /** Drift grid (lines), symmetric around 0. */
+  private readonly grid: Float64Array;
+  /** Random-walk kernel over drift bins (odd length, centered). */
+  private readonly walk: Float64Array;
+
   private layout: LineLayout | null = null;
   /** Indices (into layout.lines) of the readable lines, top to bottom. */
   private states: number[] = [];
-  /** Posterior per layout line (0 for unreadable lines). */
+  /** Joint posterior, row k (state) × column b (drift bin). */
+  private joint = new Float64Array(0);
+  /** Drift belief independent of the layout; seeds new layouts. */
+  private driftBelief: Float64Array;
+  /** Line posterior per layout line (0 for unreadable lines); published as-is, never mutated. */
   private post: number[] = [];
   private prevFix: Fixation | null = null;
   private driftY = 0;
@@ -119,40 +168,64 @@ export class LineTracker {
     };
     this.sigmaLines = this.opts.sigmaYLines;
     this.residVar = (this.sigmaLines / SIGMA_INFLATE) ** 2;
+
+    const half = Math.min(Math.round(this.opts.maxDriftLines / DRIFT_STEP_LINES), (MAX_DRIFT_BINS - 1) / 2);
+    const step = half > 0 ? this.opts.maxDriftLines / half : 0;
+    this.grid = new Float64Array(2 * half + 1);
+    for (let b = 0; b < this.grid.length; b++) this.grid[b] = (b - half) * step;
+    this.walk = gaussianKernel(step > 0 ? (this.opts.driftRate * DRIFT_WALK_PER_RATE) / step : 0);
+    this.driftBelief = this.driftPrior();
   }
 
   get estimate(): LineEstimate | null {
     return this.est;
   }
 
-  /** Current vertical emission σ, px (NaN without a layout). */
+  /** Current vertical emission σ, px. */
   get sigmaYPx(): number {
     return this.sigmaLines * this.pitch();
   }
 
   setLayout(layout: LineLayout, reason: LayoutChangeReason): void {
     const old = this.layout;
-    const oldPost = this.post;
+    const oldStates = this.states;
+    const oldJoint = this.joint;
     this.layout = layout;
     this.states = readableStates(layout);
-    const n = layout.lines.length;
+    const m = this.states.length;
+    const D = this.grid.length;
+    const joint = new Float64Array(m * D);
 
-    let post: number[] = new Array<number>(n).fill(0);
+    let carried = 0;
     if (old && reason !== 'initial' && reason !== 'content') {
-      const pitch = this.pitch();
-      for (let i = 0; i < oldPost.length; i++) {
-        const p = oldPost[i]!;
-        const ol = old.lines[i];
-        if (!(p > 0) || !ol) continue;
-        const j = findLineByDocTop(layout.lines, ol.docTop, 0.5 * pitch);
-        if (j >= 0) post[j] = post[j]! + p;
-      }
+      const tol = 0.5 * this.pitch();
+      const stateOf = new Map<number, number>();
+      this.states.forEach((i, k) => stateOf.set(i, k));
+      oldStates.forEach((oi, ok) => {
+        const ol = old.lines[oi];
+        if (!ol) return;
+        const k = stateOf.get(findLineByDocTop(layout.lines, ol.docTop, tol));
+        if (k === undefined) return;
+        for (let b = 0; b < D; b++) {
+          const v = oldJoint[ok * D + b]!;
+          joint[k * D + b] = joint[k * D + b]! + v;
+          carried += v;
+        }
+      });
     }
-    post = this.normalizeOverStates(post, REMAP_UNIFORM);
+    if (carried > 1e-9) {
+      for (let i = 0; i < joint.length; i++) joint[i] = (1 - REMAP_UNIFORM) * (joint[i]! / carried);
+      for (let k = 0; k < m; k++) {
+        for (let b = 0; b < D; b++) joint[k * D + b] = joint[k * D + b]! + (REMAP_UNIFORM / m) * this.driftBelief[b]!;
+      }
+      this.joint = joint;
+    } else {
+      this.joint = this.seed(this.topPrior());
+    }
 
     const scrollDelta = old ? layout.scrollTop - old.scrollTop : 0;
     if (reason === 'scroll' && this.prevFix && Number.isFinite(scrollDelta)) {
-      // Text moved up by scrollDelta; keep the last fixation comparable for the next saccade.
+      // The text moved up by scrollDelta; keep the last fixation comparable for the next saccade.
       this.prevFix = { ...this.prevFix, y: this.prevFix.y - scrollDelta };
     } else if (reason !== 'scroll') {
       this.prevFix = null;
@@ -166,60 +239,60 @@ export class LineTracker {
       this.fixCount = 0;
     }
     if (reason === 'page-turn') this.lastSaccade = null;
-
-    this.post = post;
+    this.summarize();
     if (this.est) this.publish(this.est.t);
   }
 
   onFixation(f: Fixation): LineEstimate {
     const layout = this.layout;
     const t = Number.isFinite(f.end) ? f.end : this.est?.t ?? 0;
-    if (!layout || this.states.length === 0 || !Number.isFinite(f.x) || !Number.isFinite(f.y)) {
+    const m = this.states.length;
+    if (!layout || m === 0 || !Number.isFinite(f.x) || !Number.isFinite(f.y)) {
       this.fixCount++;
       return this.publish(t);
     }
     const lines = layout.lines;
     const pitch = this.pitch();
-    const m = this.states.length;
-
-    let prior = this.states.map((i) => this.post[i] ?? 0);
-    if (!(sum(prior) > 0)) prior = new Array<number>(m).fill(1 / m);
+    const D = this.grid.length;
 
     let kind: SaccadeKind | null = null;
     if (this.prevFix) {
       const bestPrev = argmax(this.post);
       const hint = bestPrev >= 0 && this.post[bestPrev]! >= 0.4 ? lines[bestPrev]! : null;
       kind = classifySaccade(this.prevFix, f, layout, hint);
-      prior = transition(prior, kind, (f.y - this.prevFix.y) / pitch);
+      this.predict(kind, (f.y - this.prevFix.y) / pitch);
     }
 
-    const sigma = this.sigmaLines * pitch;
-    const yc = f.y - this.driftY;
+    const sigma = this.sigmaLines;
+    const yL = f.y / pitch;
     const colW = Math.max(layout.column.right - layout.column.left, pitch);
-    const postStates = new Array<number>(m);
+    const joint = this.joint;
     let total = 0;
     for (let k = 0; k < m; k++) {
       const line = lines[this.states[k]!]!;
-      const z = (yc - line.centerY) / sigma;
-      const e = (Math.exp(-0.5 * z * z) + EMISSION_FLOOR) * horizontalPlausibility(f.x, line, colW, pitch);
-      const v = prior[k]! * e;
-      postStates[k] = v;
-      total += v;
+      const base = yL - line.centerY / pitch;
+      const h = horizontalPlausibility(f.x, line, colW, pitch);
+      for (let b = 0; b < D; b++) {
+        const z = (base - this.grid[b]!) / sigma;
+        const v = joint[k * D + b]! * (Math.exp(-0.5 * z * z) + EMISSION_FLOOR) * h;
+        joint[k * D + b] = v;
+        total += v;
+      }
     }
-    if (!(total > 0) || !Number.isFinite(total)) {
-      postStates.fill(1 / m);
-      total = 1;
+    if (!(total > 0) || !Number.isFinite(total)) this.joint = this.seed(this.topPrior());
+    else for (let i = 0; i < joint.length; i++) joint[i] = joint[i]! / total;
+
+    this.summarize();
+    const best = argmax(this.post);
+    const line = lines[best];
+    if (line) {
+      const e = (f.y - this.driftY - line.centerY) / pitch;
+      if (this.post[best]! > LEARN_CONFIDENCE && kind !== 'return-sweep' && kind !== 'jump' && this.plausible(e, best)) {
+        this.residVar += SIGMA_RATE * (e * e - this.residVar);
+        this.sigmaLines = clamp(Math.sqrt(this.residVar) * SIGMA_INFLATE, SIGMA_MIN_LINES, SIGMA_MAX_LINES);
+      }
+      this.progressX = progressAlong(line, f.x);
     }
-    const post = new Array<number>(lines.length).fill(0);
-    for (let k = 0; k < m; k++) post[this.states[k]!] = postStates[k]! / total;
-    this.post = post;
-
-    const best = argmax(post);
-    const p = post[best]!;
-    const line = lines[best]!;
-    if (p > LEARN_CONFIDENCE && kind !== 'return-sweep' && kind !== 'jump') this.learn(f.y - line.centerY, pitch);
-
-    this.progressX = progressAlong(line, f.x);
     this.lastSaccade = kind;
     this.prevFix = f;
     this.fixCount++;
@@ -239,8 +312,8 @@ export class LineTracker {
 
   afterPageTurn(resumeLineIndex: number): void {
     const layout = this.layout;
-    if (!layout || this.states.length === 0) return;
     const m = this.states.length;
+    if (!layout || m === 0) return;
     let r: number;
     if (!Number.isFinite(resumeLineIndex) || resumeLineIndex < 0) {
       r = Math.max(0, this.states.findIndex((i) => layout.lines[i]!.fullyVisible));
@@ -253,55 +326,149 @@ export class LineTracker {
       const k = r + off;
       if (k >= 0 && k < m) w[k] = w[k]! + weight;
     }
-    const z = sum(w);
-    const post = new Array<number>(layout.lines.length).fill(0);
-    for (let k = 0; k < m; k++) post[this.states[k]!] = w[k]! / z;
-    this.post = post;
+    this.joint = this.seed(w);
     this.prevFix = null;
     this.lastSaccade = null;
     this.fixCount = 0;
     this.progressX = 0;
+    this.summarize();
     this.publish(this.est?.t ?? layout.measuredAt);
   }
 
   reset(): void {
-    this.post = this.layout ? this.normalizeOverStates(new Array<number>(this.layout.lines.length).fill(0), 1) : [];
+    this.driftBelief = this.driftPrior();
+    this.joint = this.seed(this.topPrior());
     this.prevFix = null;
-    this.driftY = 0;
     this.sigmaLines = this.opts.sigmaYLines;
     this.residVar = (this.sigmaLines / SIGMA_INFLATE) ** 2;
     this.fixCount = 0;
     this.lastSaccade = null;
     this.progressX = 0;
+    this.summarize();
+    this.driftY = 0;
     this.est = null;
   }
 
+  // ── internals ──
+
   private pitch(): number {
     const p = this.layout?.linePitch;
-    return p !== undefined && Number.isFinite(p) && p > 0 ? p : 40;
+    return p !== undefined && Number.isFinite(p) && p > 0 ? p : FALLBACK_PITCH_PX;
   }
 
-  private learn(residualPx: number, pitch: number): void {
-    const e = (residualPx - this.driftY) / pitch;
-    this.residVar += SIGMA_RATE * (e * e - this.residVar);
-    this.sigmaLines = clamp(Math.sqrt(this.residVar) * SIGMA_INFLATE, SIGMA_MIN_LINES, SIGMA_MAX_LINES);
-    const maxDrift = this.opts.maxDriftLines * pitch;
-    this.driftY = clamp(this.driftY + this.opts.driftRate * (residualPx - this.driftY), -maxDrift, maxDrift);
-  }
-
-  /** Restricts `post` to readable lines, mixes in `uniform` mass and normalizes (uniform if empty). */
-  private normalizeOverStates(post: number[], uniform: number): number[] {
+  /** Joint prior from line weights (any scale) × the current drift belief. */
+  private seed(lineWeights: readonly number[]): Float64Array {
     const m = this.states.length;
-    const out = new Array<number>(post.length).fill(0);
-    if (m === 0) return out;
+    const D = this.grid.length;
+    const joint = new Float64Array(m * D);
     let z = 0;
-    for (const i of this.states) z += post[i]! > 0 ? post[i]! : 0;
-    const u = z > 0 ? uniform : 1;
-    for (const i of this.states) {
-      const p = post[i]! > 0 ? post[i]! : 0;
-      out[i] = (z > 0 ? (1 - u) * (p / z) : 0) + u / m;
+    for (const w of lineWeights) z += w > 0 ? w : 0;
+    if (!(z > 0)) return joint;
+    for (let k = 0; k < m; k++) {
+      const w = (lineWeights[k]! > 0 ? lineWeights[k]! : 0) / z;
+      for (let b = 0; b < D; b++) joint[k * D + b] = w * this.driftBelief[b]!;
     }
-    return out;
+    return joint;
+  }
+
+  private topPrior(): number[] {
+    return this.states.map((_, k) => 1 + TOP_PRIOR_BOOST * Math.exp(-k / TOP_PRIOR_DECAY_LINES));
+  }
+
+  private driftPrior(): Float64Array {
+    const p = new Float64Array(this.grid.length);
+    let z = 0;
+    for (let b = 0; b < p.length; b++) {
+      const u = this.grid[b]! / DRIFT_PRIOR_SIGMA_LINES;
+      p[b] = Math.exp(-0.5 * u * u);
+      z += p[b]!;
+    }
+    for (let b = 0; b < p.length; b++) p[b] = p[b]! / z;
+    return p;
+  }
+
+  /** A confident fixation's residual is fit to learn σ from (not a glance past the first/last line). */
+  private plausible(e: number, best: number): boolean {
+    if (!(Math.abs(e) <= LEARN_MAX_RESIDUAL_LINES)) return false;
+    if (best === this.states[this.states.length - 1] && e > 0.5) return false;
+    if (best === this.states[0] && e < -0.5) return false;
+    return true;
+  }
+
+  /** HMM prediction: line transition for this saccade kind, then the drift random walk. */
+  private predict(kind: SaccadeKind, dyLines: number): void {
+    const m = this.states.length;
+    const D = this.grid.length;
+    const src = this.joint;
+    const out = new Float64Array(m * D);
+    const col = new Array<number>(m);
+    for (let b = 0; b < D; b++) {
+      for (let k = 0; k < m; k++) col[k] = src[k * D + b]!;
+      const next = transitionLines(col, kind, dyLines);
+      for (let k = 0; k < m; k++) out[k * D + b] = next[k]!;
+    }
+    // Drift random walk (+ a small chance of a sudden shift), row by row.
+    const walk = this.walk;
+    const r = (walk.length - 1) / 2;
+    const row = new Float64Array(D);
+    for (let k = 0; k < m; k++) {
+      let mass = 0;
+      for (let b = 0; b < D; b++) mass += out[k * D + b]!;
+      if (!(mass > 0)) continue;
+      row.fill(0);
+      for (let b = 0; b < D; b++) {
+        const v = out[k * D + b]!;
+        if (v === 0) continue;
+        for (let j = -r; j <= r; j++) {
+          const c = b + j;
+          if (c >= 0 && c < D) row[c] = row[c]! + v * walk[j + r]!;
+        }
+      }
+      let kept = 0;
+      for (let b = 0; b < D; b++) kept += row[b]!;
+      const scale = kept > 0 ? ((1 - DRIFT_JUMP) * mass) / kept : 0;
+      for (let b = 0; b < D; b++) out[k * D + b] = row[b]! * scale + (DRIFT_JUMP * mass) / D;
+    }
+    this.joint = out;
+  }
+
+  /** Recomputes the line marginal, the drift belief and driftY from the joint. */
+  private summarize(): void {
+    const layout = this.layout;
+    const m = this.states.length;
+    const D = this.grid.length;
+    const post = new Array<number>(layout?.lines.length ?? 0).fill(0);
+    const belief = new Float64Array(D);
+    let total = 0;
+    for (let k = 0; k < m; k++) {
+      let s = 0;
+      for (let b = 0; b < D; b++) {
+        const v = this.joint[k * D + b]!;
+        s += v;
+        belief[b] = belief[b]! + v;
+      }
+      post[this.states[k]!] = s;
+      total += s;
+    }
+    if (total > 0) {
+      for (let i = 0; i < post.length; i++) post[i] = post[i]! / total;
+      for (let b = 0; b < D; b++) belief[b] = belief[b]! / total;
+      this.driftBelief = belief;
+    }
+    this.post = post;
+    // Report the drift that goes with the most likely line (the overall mean would blur competing hypotheses).
+    const best = argmax(post);
+    const k = best >= 0 ? this.states.indexOf(best) : -1;
+    if (k >= 0) {
+      let s = 0;
+      let w = 0;
+      for (let b = 0; b < D; b++) {
+        const v = this.joint[k * D + b]!;
+        s += v * this.grid[b]!;
+        w += v;
+      }
+      if (w > 0) this.driftY = (s / w) * this.pitch();
+    }
   }
 
   private publish(t: number): TrackedLineEstimate {
@@ -339,7 +506,7 @@ function readableStates(layout: LineLayout): number[] {
   return out;
 }
 
-/** Index of the line whose docTop is nearest to `docTop` (within `tol`), or -1. */
+/** Index of the line whose docTop is nearest to `docTop` (within `tol`), or -1. Lines must be sorted by top. */
 export function findLineByDocTop(lines: readonly TextLine[], docTop: number, tol: number): number {
   let lo = 0;
   let hi = lines.length - 1;
@@ -362,9 +529,27 @@ export function findLineByDocTop(lines: readonly TextLine[], docTop: number, tol
   return best;
 }
 
-function transition(a: number[], kind: SaccadeKind, dyLines: number): number[] {
+/** Normalized Gaussian kernel with σ in bins (a delta for σ ≈ 0), truncated at 3σ. */
+function gaussianKernel(sigmaBins: number): Float64Array {
+  if (!(sigmaBins > 0.05)) return Float64Array.of(1);
+  const r = Math.max(1, Math.ceil(3 * sigmaBins));
+  const k = new Float64Array(2 * r + 1);
+  let z = 0;
+  for (let j = -r; j <= r; j++) {
+    k[j + r] = Math.exp(-0.5 * (j / sigmaBins) ** 2);
+    z += k[j + r]!;
+  }
+  for (let j = 0; j < k.length; j++) k[j] = k[j]! / z;
+  return k;
+}
+
+/** Line transition of one probability vector (over readable states, top to bottom). */
+function transitionLines(a: readonly number[], kind: SaccadeKind, dyLines: number): number[] {
   const m = a.length;
   const out = new Array<number>(m).fill(0);
+  let mass = 0;
+  for (const v of a) mass += v;
+  if (!(mass > 0)) return out;
   if (kind === 'jump') {
     const shift = Number.isFinite(dyLines) ? dyLines : 0;
     const kernel = new Array<number>(m);
@@ -380,7 +565,7 @@ function transition(a: number[], kind: SaccadeKind, dyLines: number): number[] {
       if (!(z > 0)) continue;
       for (let j = 0; j < m; j++) out[j] = out[j]! + ((1 - JUMP_UNIFORM) * ai * kernel[j]!) / z;
     }
-    for (let j = 0; j < m; j++) out[j] = out[j]! + JUMP_UNIFORM / m;
+    for (let j = 0; j < m; j++) out[j] = out[j]! + (JUMP_UNIFORM * mass) / m;
     return out;
   }
   const T = LINE_TRANSITIONS[kind];
@@ -425,7 +610,7 @@ function progressAlong(line: TextLine, x: number): number {
 
 function argmax(a: readonly number[]): number {
   let best = -1;
-  let bv = -Infinity;
+  let bv = 0;
   for (let i = 0; i < a.length; i++) {
     const v = a[i]!;
     if (v > bv) {
@@ -433,11 +618,5 @@ function argmax(a: readonly number[]): number {
       best = i;
     }
   }
-  return bv > 0 ? best : -1;
-}
-
-function sum(a: readonly number[]): number {
-  let s = 0;
-  for (const v of a) s += v;
-  return s;
+  return best;
 }

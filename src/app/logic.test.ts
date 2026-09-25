@@ -11,11 +11,11 @@ import {
   calibrationFitsViewport,
   cameraErrorInfo,
   computeWpm,
-  deriveTitle,
+  errorMessage,
   firstFullyVisibleIndex,
+  isBenignGlobalError,
   formatMinutes,
   formatPercent,
-  guessTextFormat,
   keyTargetKind,
   lastFullyVisibleIndex,
   minutesLeft,
@@ -428,6 +428,24 @@ describe('camera errors', () => {
   });
 });
 
+describe('error helpers', () => {
+  it('errorMessage extracts something readable', () => {
+    expect(errorMessage(new Error(' boom '))).toBe('boom');
+    expect(errorMessage('plain')).toBe('plain');
+    expect(errorMessage({ message: 'from object' })).toBe('from object');
+    expect(errorMessage(new Error(''), 'fallback')).toBe('fallback');
+    expect(errorMessage(undefined, 'fallback')).toBe('fallback');
+    expect(errorMessage(42, 'fallback')).toBe('fallback');
+  });
+
+  it('isBenignGlobalError filters noise, not real errors', () => {
+    expect(isBenignGlobalError('ResizeObserver loop completed with undelivered notifications.')).toBe(true);
+    expect(isBenignGlobalError('Script error.')).toBe(true);
+    expect(isBenignGlobalError('x is undefined', 'chrome-extension://abc/content.js')).toBe(true);
+    expect(isBenignGlobalError('x is undefined', 'http://localhost:5173/src/app/controller.ts')).toBe(false);
+  });
+});
+
 describe('small helpers', () => {
   it('calibrationFitsViewport', () => {
     expect(calibrationFitsViewport({ width: 1440, height: 900 }, { width: 1440, height: 860 })).toBe(true);
@@ -446,23 +464,6 @@ describe('small helpers', () => {
     expect(previewCorner('bottom-left')).toBe('bottom-right');
     expect(previewCorner('bottom-right')).toBe('bottom-left');
     expect(previewCorner('top-left')).toBe('bottom-left');
-  });
-
-  it('guessTextFormat', () => {
-    expect(guessTextFormat('# Title\n\nSome text with **bold**.')).toBe('md');
-    expect(guessTextFormat('- one\n- two\n- three')).toBe('md');
-    expect(guessTextFormat('It was a bright cold day in April.\n\nThe clocks were striking.')).toBe('txt');
-    expect(guessTextFormat('Price: 5 * 3 = 15. A single - dash.')).toBe('txt');
-    expect(guessTextFormat('')).toBe('txt');
-  });
-
-  it('deriveTitle', () => {
-    expect(deriveTitle('\n\n# The Reading Eye\n\nText')).toBe('The Reading Eye');
-    expect(deriveTitle('   ')).toBe('Pasted text');
-    expect(deriveTitle('*')).toBe('Pasted text');
-    const long = deriveTitle('word '.repeat(40));
-    expect(long.length).toBeLessThanOrEqual(61);
-    expect(long.endsWith('…')).toBe(true);
   });
 
   it('normalizeUrl', () => {

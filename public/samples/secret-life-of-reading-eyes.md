@@ -182,7 +182,9 @@ Everything described here runs locally, inside your browser. The video from your
 
 Webcam gaze estimates are usually much better from side to side than up and down, for several reasons.
 
-The opening of the eye is roughly three times as wide as it is tall, so the iris has far more room to travel horizontally, and horizontal eye movements shift it by more pixels in the image. Vertical movements are also partly hidden: when you look down, your upper eyelid follows your eye downward and covers part of the iris, and eyelashes and glasses frames get in the way. The webcam usually sits above the screen, looking down at your eyes at an angle, which makes matters harder still. And small head movements, such as a slight nod, can masquerade as vertical eye movements.
+The opening of the eye is roughly three times as wide as it is tall. From side to side, the iris has a stretch of white to travel across, and the camera can watch it go; above and below, the lids already cover its edges. Screens are wider than they are tall, too, so looking from one side of a screen to the other turns your eyes through a bigger angle, and moves the iris by more pixels, than looking from top to bottom.
+
+Vertical movements are also partly hidden: when you look down, your upper eyelid follows your eye downward and covers part of the iris, and eyelashes and glasses frames get in the way. The webcam usually sits at the top edge of the screen, so it sees your eyes from a little above or below rather than straight on, which makes matters harder still. And small head movements, such as a slight nod, can masquerade as vertical eye movements.
 
 The result is that webcam trackers are commonly off by a few degrees. On a laptop at arm’s length, that can span several lines of text, which is a real problem for an app that needs to know when you’ve reached the last line.
 
