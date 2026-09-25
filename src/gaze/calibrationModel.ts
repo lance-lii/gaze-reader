@@ -6,6 +6,11 @@
  *
  *  1. Drop blinks (blink > maxBlink, default 0.5) and non-finite rows.
  *  2. z-score every feature (constant features are neutralized, not divided by ~0).
+ *     Features named in GAZE_EXCLUDED_FEATURES (lid aperture, lid position,
+ *     lid-referenced iris, blink scores; known from `featureNames`) are
+ *     neutralized too: their standardized value is always 0, so they get zero
+ *     weight and can never be picked below. Light changes the lids, and a model
+ *     that reads vertical gaze from them moves by lines when a lamp is switched on.
  *  3. Pick the "dominant" gaze features: the ones most correlated with the
  *     target x or y, taken alternately per axis so the hard vertical axis gets
  *     its share, skipping near-duplicates of features already picked. Posture
@@ -26,22 +31,38 @@
  * *current* window position, so dragging the browser window doesn't break the
  * calibration. Quick recalibration stacks a per-axis affine correction in the
  * same screen space, so it also survives window moves.
+ *
+ * Every model carries a CalibrationEnvironment: the lighting signature the
+ * caller measured during calibration and an eyelid-appearance baseline
+ * computed here from the samples, so the app can tell when the conditions
+ * the calibration was made in no longer hold.
  */
 import type {
+  AppearanceBaseline,
+  CalibrationEnvironment,
   CalibrationQuality,
   CalibrationReport,
   CalibrationSample,
   EyeFeatures,
   GazeModel,
+  LightingComponent,
+  LightingSignature,
   Point,
   SerializedGazeModel,
 } from '../types';
 import { readJSON, removeKey, writeJSON } from '../core/storage';
-import type { FeatureName } from './features';
+import { FEATURE_NAMES, type FeatureName } from './features';
 import { RidgeNormalEquations, dot, ridgeFit } from './ridge';
 
 export const GAZE_MODEL_VERSION = 1;
-export const GAZE_MODEL_KIND = 'gr-ridge-poly2';
+/**
+ * Bumped whenever a saved model can no longer be used as-is. `gr-ridge-poly2`
+ * (1.0) read vertical gaze from the lids; `-iris5` excludes them
+ * (GAZE_EXCLUDED_FEATURES) and reads the 5-point, corner-referenced iris.
+ */
+export const GAZE_MODEL_KIND = 'gr-ridge-poly2-iris5';
+/** Prefix every kind this module has ever written starts with. */
+const GAZE_MODEL_KIND_FAMILY = 'gr-ridge';
 export const CALIBRATION_STORAGE_KEY = 'calibration.v1';
 export const DEFAULT_LAMBDAS: readonly number[] = Object.freeze([1e-3, 1e-2, 0.03, 0.1, 0.3, 1, 3, 10, 30, 100]);
 /** App default text: 22 px × 1.9 line height. */
@@ -72,6 +93,43 @@ const Z_REJECT = 10;
  * carry posture terms in `quad`, which is why the glitch check still filters them.
  */
 const POSTURE_FEATURES: ReadonlySet<string> = new Set<FeatureName>(['yaw', 'pitch', 'roll', 'tx', 'ty', 'tz', 'faceScale']);
+/**
+ * Features the gaze model never uses (their columns are neutralized: always 0 in the design, so
+ * zero weight, never dominant, never a glitch check). They stay in the vector for the blink gate
+ * and quality checks, and because FEATURE_NAMES is append-only.
+ *
+ * Everything here moves with the eyelids, and the lids move with the light: people squint a little
+ * in bright light or glare and open their eyes wider in dim light. During calibration the upper lid
+ * also follows vertical gaze, so a model that may use the lids learns "narrower = looking lower".
+ * In the lighting simulation (bench/lighting, five brackets on MediaPipe's blendshapes) a 10 %
+ * squint then read as 0.8–5 lines lower. The corner-referenced 5-point iris features (rightU5 …
+ * meanVc5), the eyeLook* scores and posture carry the gaze instead: with this set excluded the same
+ * squint moves the prediction 0.2–1.1 lines (a squint made by the upper lid alone: 0.5–2.8, from
+ * the eyeLook* scores' own lid coupling), and the cross-validated calibration error is equal or
+ * better in every world. The price: an iris reflection biasing the iris landmarks vertically now
+ * moves the gaze 1.4–1.9× more (0.8–1.4 lines per 0.01 eye widths, about 0.3 px of iris), which
+ * is left to the reading layer's drift tracking and the accuracy check / quick refresh.
+ *
+ * - eyeBlink*: the blendshape network's lid-closure score.
+ * - rightOpen/leftOpen, rightLidY/leftLidY: lid aperture and lid midpoint.
+ * - rightV/leftV/meanV: iris measured from the lid midpoint, so a lid move shifts them 3× more
+ *   than gaze does.
+ * - rightU/leftU/meanU: the single-point iris; superseded by the 5-point rightU5/leftU5/meanU5.
+ */
+export const GAZE_EXCLUDED_FEATURES: ReadonlySet<string> = new Set<FeatureName>([
+  'eyeBlinkLeft',
+  'eyeBlinkRight',
+  'rightOpen',
+  'leftOpen',
+  'rightLidY',
+  'leftLidY',
+  'rightV',
+  'leftV',
+  'meanV',
+  'rightU',
+  'leftU',
+  'meanU',
+]);
 const MAD_TO_SD = 1.4826;
 /** Leys et al. (2013) call 2.5 robust SDs "moderately conservative" — our default. */
 const MAD_THRESHOLD = 2.5;
@@ -116,6 +174,20 @@ export interface TrainOptions {
   featureNames?: readonly string[];
   /** Drop samples whose blink score exceeds this (default {@link MAX_BLINK}). */
   maxBlink?: number;
+  /**
+   * Feature names whose columns are neutralized (see {@link GAZE_EXCLUDED_FEATURES}, the
+   * default). Needs `featureNames`; without names nothing is excluded. Pass `[]` to let the
+   * model use every feature (the 1.0 behaviour, kept for comparisons).
+   */
+  excludedFeatures?: Iterable<string>;
+  /** Conditions during calibration, stored with the model (see {@link CalibrationEnvironment}). */
+  environment?: EnvironmentInput;
+}
+
+/** What the caller measured about the calibration conditions; the eyelid baseline is computed here. */
+export interface EnvironmentInput {
+  /** Lighting signature built during calibration, or null when it couldn't be measured. */
+  lighting?: LightingSignature | null;
 }
 
 export interface EvaluateOptions {
@@ -132,6 +204,8 @@ export interface TrainDiagnostics {
   rejectedOutliers: number;
   /** Indices (into EyeFeatures.vector) that received quadratic terms. */
   dominantFeatures: number[];
+  /** Indices whose columns were neutralized (GAZE_EXCLUDED_FEATURES present in `featureNames`). */
+  excludedFeatures: number[];
   /** Columns in the expanded design. */
   expandedDim: number;
   targets: number;
@@ -152,6 +226,25 @@ export interface RefineOptions {
   scaleShrinkage?: number;
   /** Drop samples whose blink score exceeds this (default {@link MAX_BLINK}). */
   maxBlink?: number;
+  /**
+   * Conditions during the refresh. They replace the stored environment: the refresh re-fits the
+   * offset under today's light, so today's light becomes the reference. The eyelid baseline is
+   * recomputed from the refresh samples; a lighting signature that isn't given becomes null.
+   */
+  environment?: EnvironmentInput;
+}
+
+/** Result of {@link measureOffset}. */
+export interface OffsetMeasurement {
+  /** Mean Euclidean error of the per-target mean prediction, px (as {@link evaluateModel}). */
+  meanErrorPx: number;
+  /** Mean signed error (prediction − target) over targets, px; positive y = gaze reads lower. */
+  offsetXPx: number;
+  offsetYPx: number;
+  /** Samples that contributed after blink and per-target outlier filtering (0 → errors are NaN). */
+  n: number;
+  /** Targets that contributed. */
+  targets: number;
 }
 
 /** What the running build expects of a stored model. */
@@ -177,6 +270,8 @@ export interface GazeModelParams {
   quad: readonly number[];
   /** The dominant features a Z_REJECT outlier on means a tracking glitch (no posture features). Default: quad. */
   glitchCheck?: readonly number[];
+  /** Neutralized feature indices: their standardized value is forced to 0. Default: none. */
+  excluded?: readonly number[];
   expMean: Float64Array;
   expStd: Float64Array;
   wx: Float64Array;
@@ -199,6 +294,8 @@ export interface GazeModelParams {
   adjust: AxisAffine;
   /** Epoch ms (Date.now()) — persisted across sessions, so not performance.now(). */
   trainedAt: number;
+  /** Lighting and eyelid appearance at calibration (or the last quick refresh); null when unknown. */
+  environment?: CalibrationEnvironment | null;
 }
 
 const IDENTITY: Readonly<AxisAffine> = Object.freeze({ sx: 1, ox: 0, sy: 1, oy: 0 });
@@ -215,6 +312,10 @@ export class RidgeGazeModel implements GazeModel {
   /** See GazeModelParams.chromeTop. */
   readonly chromeTop: number | null;
   readonly dprAtCalibration: number | null;
+  /** Neutralized feature indices (see GAZE_EXCLUDED_FEATURES). */
+  readonly excludedFeatures: readonly number[];
+  /** Lighting and eyelid appearance at calibration (or the last quick refresh); null when unknown. */
+  readonly environment: CalibrationEnvironment | null;
   private readonly params: GazeModelParams;
   private readonly glitchCheck: readonly number[];
   // Scratch buffers: predict runs at camera rate, so avoid per-call allocation.
@@ -232,6 +333,8 @@ export class RidgeGazeModel implements GazeModel {
     this.chromeTop = params.chromeTop ?? null;
     this.dprAtCalibration = params.dprAtCalibration ?? null;
     this.glitchCheck = Object.freeze([...(params.glitchCheck ?? params.quad)]);
+    this.excludedFeatures = Object.freeze([...(params.excluded ?? [])]);
+    this.environment = params.environment ? cloneEnvironment(params.environment) : null;
     this.zBuf = new Float64Array(params.featureLength);
     this.phiBuf = new Float64Array(params.expMean.length);
   }
@@ -265,6 +368,7 @@ export class RidgeGazeModel implements GazeModel {
     }
     for (const q of this.glitchCheck) if (Math.abs(z[q]) > Z_REJECT) return null;
     for (let j = 0; j < P.featureLength; j++) z[j] = clamp(z[j], -Z_CLAMP, Z_CLAMP);
+    for (const j of this.excludedFeatures) z[j] = 0;
 
     const phi = this.phiBuf;
     expandInto(z, P.quad, phi);
@@ -277,10 +381,16 @@ export class RidgeGazeModel implements GazeModel {
     return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
   }
 
-  /** A copy with a different screen-space correction (quick recalibration). */
+  /** A copy with a different screen-space correction (quick recalibration). Omitted meta fields are kept. */
   withAdjustment(
     adjust: AxisAffine,
-    meta: { viewport: { width: number; height: number }; trainedAt: number; chromeTop?: number | null; dprAtCalibration?: number | null },
+    meta: {
+      viewport: { width: number; height: number };
+      trainedAt: number;
+      chromeTop?: number | null;
+      dprAtCalibration?: number | null;
+      environment?: CalibrationEnvironment | null;
+    },
   ): RidgeGazeModel {
     return new RidgeGazeModel({
       ...this.params,
@@ -289,6 +399,7 @@ export class RidgeGazeModel implements GazeModel {
       trainedAt: meta.trainedAt,
       ...(meta.chromeTop !== undefined ? { chromeTop: meta.chromeTop } : {}),
       ...(meta.dprAtCalibration !== undefined ? { dprAtCalibration: meta.dprAtCalibration } : {}),
+      ...(meta.environment !== undefined ? { environment: meta.environment } : {}),
     });
   }
 
@@ -303,6 +414,7 @@ export class RidgeGazeModel implements GazeModel {
       std: Array.from(P.std),
       quad: [...P.quad],
       glitchCheck: [...this.glitchCheck],
+      excluded: [...this.excludedFeatures],
       expMean: Array.from(P.expMean),
       expStd: Array.from(P.expStd),
       wx: Array.from(P.wx),
@@ -316,6 +428,7 @@ export class RidgeGazeModel implements GazeModel {
       dprAtCalibration: this.dprAtCalibration,
       adjust: { ...P.adjust },
       trainedAt: P.trainedAt,
+      environment: this.environment ? cloneEnvironment(this.environment) : null,
     };
   }
 }
@@ -326,6 +439,8 @@ interface Row {
   target: Point;
   x: Float64Array;
   key: string;
+  /** The sample the row came from (for the eyelid-appearance baseline). */
+  source: CalibrationSample;
 }
 
 interface Group {
@@ -338,6 +453,8 @@ interface ColumnStats {
   mean: Float64Array;
   std: Float64Array;
   constant: Uint8Array;
+  /** Neutralized columns: standardized to 0 whatever the value. */
+  excluded: Uint8Array;
 }
 
 export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions = {}): TrainResult {
@@ -356,15 +473,16 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
   // Quadratic terms need several distinct targets to be identifiable at all.
   const qMax = Math.min(qWanted, Math.max(0, initialGroups.length - 3));
 
-  // Posture features enter linearly only (see POSTURE_FEATURES).
-  const noQuad = new Uint8Array(p);
+  // Posture features enter linearly only (see POSTURE_FEATURES); excluded ones not at all.
+  const excluded = excludedMask(p, opts.featureNames, opts.excludedFeatures);
+  const noQuad = Uint8Array.from(excluded);
   if (opts.featureNames) {
     opts.featureNames.forEach((name, j) => {
       if (POSTURE_FEATURES.has(name)) noQuad[j] = 1;
     });
   }
 
-  let stats = columnStats(rows, p);
+  let stats = columnStats(rows, p, excluded);
   let dominant = selectDominant(rows, stats, qMax, noQuad);
   let rejected = 0;
   if (opts.rejectOutliers !== false && dominant.length > 0) {
@@ -372,7 +490,7 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     rejected = rows.length - keep.length;
     if (rejected > 0) {
       rows = keep.map((i) => rows[i]);
-      stats = columnStats(rows, p);
+      stats = columnStats(rows, p, excluded);
       dominant = selectDominant(rows, stats, qMax, noQuad);
     }
   }
@@ -426,6 +544,8 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
 
   const final = total.solve(lambda);
   const viewport = resolveViewport(opts.viewport, rows);
+  const trainedAt = Date.now();
+  const excludedIndices = maskIndices(excluded);
   const model = new RidgeGazeModel({
     featureLength: p,
     featureSignature: opts.featureNames ? featureSignature(opts.featureNames) : null,
@@ -433,6 +553,7 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     std: stats.std,
     quad: dominant,
     glitchCheck: glitchCheckFor(dominant, opts.featureNames),
+    excluded: excludedIndices,
     expMean: exp.mean,
     expStd: exp.std,
     wx: final.weights[0],
@@ -445,7 +566,16 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     chromeTop: currentChromeTop(),
     dprAtCalibration: currentDevicePixelRatio(),
     adjust: { ...IDENTITY },
-    trainedAt: Date.now(),
+    trainedAt,
+    environment: {
+      lighting: sanitizeLightingSignature(opts.environment?.lighting ?? null),
+      // From the samples the model was fitted on (blinks and glances away already dropped).
+      appearance: computeAppearanceBaseline(
+        rows.map((r) => r.source),
+        viewport.height,
+      ),
+      capturedAt: trainedAt,
+    },
   });
 
   // Honest report: every target predicted by the fold that held it out.
@@ -470,6 +600,7 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
       droppedInvalid: prepared.dropped,
       rejectedOutliers: rejected,
       dominantFeatures: [...dominant],
+      excludedFeatures: excludedIndices,
       expandedDim: D,
       targets: groups.length,
     },
@@ -521,12 +652,21 @@ export function refineGazeModel(
     oy: fit.sy * old.oy + fit.oy,
   };
   const viewport = resolveViewport(opts.viewport, rows);
-  // The refresh re-fits the offset in the current window layout, so it is the new reference.
+  const trainedAt = Date.now();
+  // The refresh re-fits the offset in the current window layout and light, so both are the new reference.
   const model = inner.withAdjustment(composed, {
     viewport,
-    trainedAt: Date.now(),
+    trainedAt,
     chromeTop: currentChromeTop(),
     dprAtCalibration: currentDevicePixelRatio(),
+    environment: {
+      lighting: sanitizeLightingSignature(opts.environment?.lighting ?? null),
+      appearance: computeAppearanceBaseline(
+        rows.map((r) => r.source),
+        viewport.height,
+      ),
+      capturedAt: trainedAt,
+    },
   });
 
   const points = obs.map((o, h) => {
@@ -546,7 +686,7 @@ export function refineGazeModel(
  * standard "accuracy" measure in eye tracking. With nothing evaluable the
  * errors are NaN, `sampleCount` is 0 and quality is 'poor'.
  */
-export function evaluateModel(model: GazeModel, samples: CalibrationSample[], opts: EvaluateOptions = {}): CalibrationReport {
+export function evaluateModel(model: GazeModel, samples: readonly CalibrationSample[], opts: EvaluateOptions = {}): CalibrationReport {
   const maxBlink = blinkCutoff(opts.maxBlink);
   const groups = new Map<string, { target: Point; preds: Point[] }>();
   for (const s of Array.isArray(samples) ? samples : []) {
@@ -569,6 +709,89 @@ export function evaluateModel(model: GazeModel, samples: CalibrationSample[], op
   }
   const vh = model.viewport && Number.isFinite(model.viewport.height) ? model.viewport.height : 0;
   return buildReport([...groups.values()], modelLambda(model), vh, true);
+}
+
+/**
+ * Systematic offset of `model` on a few fixation targets (the accuracy check): the mean over
+ * targets of (mean prediction − target), plus the mean error. Each target's predictions are
+ * filtered like {@link evaluateModel} (blinks by `maxBlink`, then the 2.5-MAD rule), so a few
+ * glances away or tracker glitches don't move it. With nothing evaluable everything is NaN, n 0.
+ */
+export function measureOffset(model: GazeModel, samples: readonly CalibrationSample[], opts: EvaluateOptions = {}): OffsetMeasurement {
+  const report = evaluateModel(model, samples, opts);
+  const k = report.perPoint.length;
+  if (k === 0) return { meanErrorPx: NaN, offsetXPx: NaN, offsetYPx: NaN, n: 0, targets: 0 };
+  let dx = 0;
+  let dy = 0;
+  for (const p of report.perPoint) {
+    dx += p.meanPrediction.x - p.target.x;
+    dy += p.meanPrediction.y - p.target.y;
+  }
+  return { meanErrorPx: report.meanErrorPx, offsetXPx: dx / k, offsetYPx: dy / k, n: report.sampleCount, targets: k };
+}
+
+/** Fewer samples than this with a usable lid aperture: no appearance baseline. */
+const MIN_APPEARANCE_SAMPLES = 10;
+
+/**
+ * How the reader's eyelids looked while calibrating, so that squinting (bright light, glare) or
+ * wide eyes (dim light) can be recognised later. Lid aperture also follows vertical gaze (the
+ * upper lid drops as the eyes look down), so openness is fitted as a line in the target's
+ * height on the page: openness ≈ opennessAt0 + opennessSlope × (target.y / viewportHeight).
+ *
+ * Robust throughout: each target contributes the median openness of its samples (blinks and
+ * half-blinks don't move a median), the slope is the Theil–Sen median of pairwise slopes between
+ * targets at different heights, the intercept is the median of what each target implies, and
+ * the spreads are 1.4826 × MAD. `opennessResidualSd` is per frame (a median over m frames
+ * varies ~1.25/√m of it). `squintMedian`/`squintSd` come from EyeFeatures.squint (0 and 0 when
+ * no sample carries one). Null without a positive viewport height or with fewer than
+ * {@link MIN_APPEARANCE_SAMPLES} samples.
+ */
+export function computeAppearanceBaseline(samples: readonly CalibrationSample[], viewportHeight: number): AppearanceBaseline | null {
+  if (!Array.isArray(samples) || !isPositive(viewportHeight)) return null;
+  const byTarget = new Map<string, { y: number; open: number[] }>();
+  const points: { y: number; open: number }[] = [];
+  const squints: number[] = [];
+  for (const s of samples as readonly unknown[]) {
+    if (!isRecord(s) || !isFinitePoint(s.target) || !isRecord(s.features)) continue;
+    const open = s.features.openness;
+    if (!isFiniteNumber(open) || open < 0) continue;
+    const y = s.target.y / viewportHeight;
+    points.push({ y, open });
+    const key = targetKey(s.target);
+    let g = byTarget.get(key);
+    if (!g) {
+      g = { y, open: [] };
+      byTarget.set(key, g);
+    }
+    g.open.push(open);
+    const squint = s.features.squint;
+    if (isFiniteNumber(squint)) squints.push(clamp(squint, 0, 1));
+  }
+  if (points.length < MIN_APPEARANCE_SAMPLES) return null;
+
+  const targets = [...byTarget.values()].map((g) => ({ y: g.y, open: median(g.open) }));
+  const slopes: number[] = [];
+  for (let a = 0; a < targets.length; a++) {
+    for (let b = a + 1; b < targets.length; b++) {
+      const dy = targets[b].y - targets[a].y;
+      // Targets on the same row say nothing about the slope.
+      if (Math.abs(dy) > 0.02) slopes.push((targets[b].open - targets[a].open) / dy);
+    }
+  }
+  const slope = slopes.length > 0 ? median(slopes) : 0;
+  const at0 = median(targets.map((t) => t.open - slope * t.y));
+  const residuals = points.map((p) => p.open - (at0 + slope * p.y));
+  const squintMedian = squints.length > 0 ? median(squints) : 0;
+  return {
+    v: 1,
+    n: points.length,
+    opennessAt0: at0,
+    opennessSlope: slope,
+    opennessResidualSd: robustSd(residuals),
+    squintMedian,
+    squintSd: squints.length > 0 ? robustSd(squints) : 0,
+  };
 }
 
 /**
@@ -635,6 +858,8 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
     // Models saved before the field existed: derive it from the running build's feature names.
     const glitchCheck = json.glitchCheck === undefined ? glitchCheckFor(quad, expect.featureNames) : indexList(json.glitchCheck, featureLength);
     if (!glitchCheck) return null;
+    const excluded = json.excluded === undefined ? [] : indexList(json.excluded, featureLength);
+    if (!excluded) return null;
     const D = featureLength + (quad.length * (quad.length + 1)) / 2;
     const expMean = finiteVector(json.expMean, D);
     const expStd = finiteVector(json.expStd, D, true);
@@ -674,6 +899,7 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
       std,
       quad,
       glitchCheck,
+      excluded,
       expMean,
       expStd,
       wx,
@@ -687,10 +913,33 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
       dprAtCalibration,
       adjust,
       trainedAt,
+      // Unknown, missing or damaged conditions never cost the reader their calibration.
+      environment: sanitizeEnvironment(json.environment),
     });
   } catch {
     return null;
   }
+}
+
+/**
+ * True when `json` is a gaze model this app saved but the running build can no longer use: an
+ * older (or newer) model kind or version, or a different feature layout. The app then explains
+ * "the tracker was upgraded, please calibrate once more" instead of silently starting over.
+ * False for nothing, garbage, foreign JSON and current models. Works on the extension's stored
+ * JSON too (extra fields are ignored).
+ */
+export function calibrationUpgradeNeeded(json: unknown): boolean {
+  if (!isRecord(json) || typeof json.version !== 'number') return false;
+  const kind = json.kind;
+  if (typeof kind !== 'string' || !kind.startsWith(GAZE_MODEL_KIND_FAMILY)) return false;
+  if (kind !== GAZE_MODEL_KIND || json.version !== GAZE_MODEL_VERSION) return true;
+  if (typeof json.featureLength === 'number' && json.featureLength !== FEATURE_NAMES.length) return true;
+  return typeof json.featureSignature === 'string' && json.featureSignature !== featureSignature(FEATURE_NAMES);
+}
+
+/** {@link calibrationUpgradeNeeded} for the calibration saved by {@link saveCalibration}. */
+export function savedCalibrationNeedsUpgrade(): boolean {
+  return calibrationUpgradeNeeded(readJSON<unknown>(CALIBRATION_STORAGE_KEY, null));
 }
 
 export function saveCalibration(model: GazeModel): void {
@@ -814,7 +1063,7 @@ function prepareRows(
       dropped++;
       continue;
     }
-    rows.push({ target: { x: s.target.x, y: s.target.y }, x, key: targetKey(s.target) });
+    rows.push({ target: { x: s.target.x, y: s.target.y }, x, key: targetKey(s.target), source: s });
   }
   if (len <= 0) throw new Error('Calibration samples carry no features.');
   return { rows, featureLength: len, dropped };
@@ -842,7 +1091,26 @@ function groupRows(rows: readonly Row[]): Group[] {
   return [...map.values()];
 }
 
-function columnStats(rows: readonly Row[], p: number): ColumnStats {
+/** 1 for every feature the gaze model must not use: named in `excluded` (default GAZE_EXCLUDED_FEATURES). */
+function excludedMask(p: number, names: readonly string[] | undefined, excluded: Iterable<string> | undefined): Uint8Array {
+  const mask = new Uint8Array(p);
+  if (!names) return mask;
+  const set: ReadonlySet<string> = excluded === undefined ? GAZE_EXCLUDED_FEATURES : new Set(excluded);
+  names.forEach((name, j) => {
+    if (j < p && set.has(name)) mask[j] = 1;
+  });
+  return mask;
+}
+
+function maskIndices(mask: Uint8Array): number[] {
+  const out: number[] = [];
+  mask.forEach((v, j) => {
+    if (v) out.push(j);
+  });
+  return out;
+}
+
+function columnStats(rows: readonly Row[], p: number, excluded: Uint8Array): ColumnStats {
   const n = rows.length;
   const mean = new Float64Array(p);
   const std = new Float64Array(p);
@@ -866,11 +1134,13 @@ function columnStats(rows: readonly Row[], p: number): ColumnStats {
       std[j] = sd;
     }
   }
-  return { mean, std, constant };
+  return { mean, std, constant, excluded };
 }
 
 function standardizeInto(x: ArrayLike<number>, stats: ColumnStats, out: Float64Array): void {
-  for (let j = 0; j < out.length; j++) out[j] = clamp((x[j] - stats.mean[j]) / stats.std[j], -Z_CLAMP, Z_CLAMP);
+  for (let j = 0; j < out.length; j++) {
+    out[j] = stats.excluded[j] ? 0 : clamp((x[j] - stats.mean[j]) / stats.std[j], -Z_CLAMP, Z_CLAMP);
+  }
 }
 
 /** [z, z_a·z_b for a ≤ b over the dominant features] → out (length p + q(q+1)/2). */
@@ -1023,6 +1293,61 @@ function median(values: readonly number[]): number {
   const s = [...values].sort((a, b) => a - b);
   const mid = s.length >> 1;
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+/** 1.4826 × median absolute deviation from the median (the SD for Gaussian data). */
+function robustSd(values: readonly number[]): number {
+  if (values.length === 0) return NaN;
+  const m = median(values);
+  return MAD_TO_SD * median(values.map((v) => Math.abs(v - m)));
+}
+
+// ─────────────────────────── Environment validation ──────────────────────────
+
+/** Every LightingComponent (a Record literal, so the compiler checks the list is complete). */
+const LIGHTING_COMPONENTS = Object.keys({
+  sclera: true,
+  backlight: true,
+  side: true,
+  shade: true,
+  glare: true,
+  range: true,
+} satisfies Record<LightingComponent, true>) as LightingComponent[];
+
+/** A fresh, validated copy of a lighting signature, or null when it isn't one. */
+function sanitizeLightingSignature(v: unknown): LightingSignature | null {
+  if (!isRecord(v) || v.v !== 1) return null;
+  const { n, yaw, pitch, c, sd } = v;
+  if (!isPositive(n) || !isFiniteNumber(yaw) || !isFiniteNumber(pitch) || !isRecord(c) || !isRecord(sd)) return null;
+  const centre = {} as Record<LightingComponent, number>;
+  const spread = {} as Record<LightingComponent, number>;
+  for (const k of LIGHTING_COMPONENTS) {
+    const ck = c[k];
+    const sk = sd[k];
+    if (!isFiniteNumber(ck) || !isFiniteNumber(sk) || sk < 0) return null;
+    centre[k] = ck;
+    spread[k] = sk;
+  }
+  return { v: 1, n, yaw, pitch, c: centre, sd: spread };
+}
+
+function sanitizeAppearance(v: unknown): AppearanceBaseline | null {
+  if (!isRecord(v) || v.v !== 1) return null;
+  const { n, opennessAt0, opennessSlope, opennessResidualSd, squintMedian, squintSd } = v;
+  if (!isPositive(n) || !isFiniteNumber(opennessAt0) || !isFiniteNumber(opennessSlope)) return null;
+  if (!isFiniteNumber(opennessResidualSd) || opennessResidualSd < 0) return null;
+  if (!isFiniteNumber(squintMedian) || !isFiniteNumber(squintSd) || squintSd < 0) return null;
+  return { v: 1, n, opennessAt0, opennessSlope, opennessResidualSd, squintMedian, squintSd };
+}
+
+/** A validated copy of stored conditions; null when absent or damaged (never a reason to drop the model). */
+function sanitizeEnvironment(v: unknown): CalibrationEnvironment | null {
+  if (!isRecord(v) || !isFiniteNumber(v.capturedAt)) return null;
+  return { lighting: sanitizeLightingSignature(v.lighting), appearance: sanitizeAppearance(v.appearance), capturedAt: v.capturedAt };
+}
+
+function cloneEnvironment(e: CalibrationEnvironment): CalibrationEnvironment | null {
+  return sanitizeEnvironment(e);
 }
 
 function sanitizeLambdas(input: readonly number[] | undefined): number[] {

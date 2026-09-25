@@ -24,6 +24,17 @@ offline mode, so the webcam needs a connection the first time it starts in a tab
             EventBus (typed, src/core/events.ts) connects everything ──► Dewey, HUD, debug overlay
 ```
 
+Lighting (webcam only, see "Lighting robustness" under *As built*):
+
+```
+ FeatureFrame.lighting (17 numbers, ~6.7 Hz) ─► LightingWatch ─┬─► 'lighting-state' (1 Hz: flags, distance)
+                                                                └─ changed / restored vs calibration ─┐
+ EyeFeatures.openness + .squint, predicted y ─► AppearanceMonitor ── lid step ────────────────────────┤
+                                                                                                      ▼
+                              LineTracker.appearanceChangedAt(t) ◄── 'appearance-changed' { t: onset }
+ light changed, or |driftY| ≥ 1.5 lines for 20 s ─► quick 5-dot refresh offer (rate-limited, at a pause)
+```
+
 ## Ground rules for every module
 
 * **Contracts**: `src/types.ts` is the single source of truth for shared types. Do not edit it.
@@ -140,9 +151,26 @@ anatomical sides): iris centers **468** (right eye) and **473** (left eye); righ
 midpoint → `v` (normalized by eye width); lid aperture → `open`. Add head pose (yaw, pitch, roll,
 tx, ty, tz), face scale and blendshapes `eyeLookUp/Down/In/Out_{Left,Right}` and
 `eyeBlink_{Left,Right}` when present (fill 0 when blendshapes are missing so the vector length stays
-constant). Vertical gaze is the hard axis for webcams: lid aperture, `eyeLookDown/Up` and head
-pitch carry most of the vertical signal — keep all of them. Mirror nothing: features are in raw
-image space; the model learns the mapping.
+constant). Mirror nothing: features are in raw image space; the model learns the mapping.
+
+**Vertical gaze must not come from the lids** (revised in 1.1, after beta testers saw lamps shift
+the reading position). Vertical gaze is the hard axis for webcams, and 1.0 let the model read it
+mostly from lid aperture, lid-referenced `v` and `eyeBlink`. But light moves the lids: bright
+light or glare narrows the aperture by about 0.75 mm at 1,200 lux (mostly the upper lid), dim light
+widens it. A 10 % narrowing moved 1.0's predictions 0.8–5.5 lines down in simulation. The gaze
+features are now corner-referenced iris features with a 5-point iris centre (mean of 468 + 469–472,
+473 + 474–477): `u5` along the corner axis, `vc5` from the corners' midpoint along the down-normal
+(`rightU5, rightVc5, leftU5, leftVc5, meanU5, meanVc5`, appended to FEATURE_NAMES). The lid-driven
+or superseded features (`eyeBlinkLeft/Right, rightOpen, leftOpen, rightLidY, leftLidY, rightV,
+leftV, meanV, rightU, leftU, meanU`, `GAZE_EXCLUDED_FEATURES`) are still extracted (blink gating,
+the eyelid monitor, diagnostics) but get exactly zero weight. `eyeLook*` and head pose stay. A 10 %
+squint now moves the gaze 0.2–1.1 lines with the simulator's default 60/40 lower/upper-lid split.
+When the upper lid alone drops (the typical light response above), it moves 0.5–2.8 lines (1.0:
+1.7–5.5). The residual comes from the `eyeLook*` scores' lid coupling, and the reading layer's
+drift tracking and the accuracy check / quick refresh absorb it. Cross-validated calibration error
+is equal or better in every simulated world, but per-frame vertical spread rose in 4 of 5 (e.g. W1
+24.7 → 30.0 px) (bench/lighting). `EyeFeatures.squint` carries MediaPipe's eyeSquint score for the
+eyelid monitor, never the model.
 
 MediaPipe 1.0.1 facts (verified in `node_modules/@mediapipe/tasks-vision/vision.d.ts`):
 `FilesetResolver.forVisionTasks(basePath)`, `FaceLandmarker.createFromOptions(fileset,
@@ -171,9 +199,16 @@ export function loadCalibration(): GazeModel | null;
 export function clearCalibration(): void;
 export function qualityFromError(errorPx: number, viewportHeight: number, linePitchPx?: number): CalibrationQuality; // pitch default 41.8 px
 ```
-Model: standardize features (z-score from training data), expand with degree-2 terms for the
-strongest gaze features (iris u/v, lookUp/Down) plus linear head pose, then two independent ridge
-regressions (x, y). Choose λ by **leave-one-target-out** cross-validation over a λ grid. Robustness:
+Model: standardize features (z-score from training data), neutralize `GAZE_EXCLUDED_FEATURES`
+(standardized value forced to 0 in training and prediction), expand with degree-2 terms for the
+strongest gaze features (iris `u5`/`vc5`, lookUp/Down) plus linear head pose, then two independent
+ridge regressions (x, y). The model kind is `gr-ridge-poly2-iris5`; 1.0 models are rejected on
+load and `calibrationUpgradeNeeded(json)` / `savedCalibrationNeedsUpgrade()` tell the app to ask
+for one recalibration. Every model stores a `CalibrationEnvironment`: the lighting signature built
+while the dots were shown, and an eyelid `AppearanceBaseline` (openness as a Theil–Sen line in the
+target's height, robust residual SD, squint median/SD). A quick refresh (`refineGazeModel`)
+replaces it: the refresh re-fits the offset under today's light. `measureOffset(model, samples)`
+is the accuracy check's measurement (mean signed prediction − target over the dots). Choose λ by **leave-one-target-out** cross-validation over a λ grid. Robustness:
 drop samples with blink > 0.5 and per-target outliers (> 2.5 MAD) before fitting. `predict`
 returns viewport px compensated for window moves since calibration (store `window.screenX/Y` at
 train time; subtract the delta). Serialize everything needed (means, stds, weights, feature-length,
@@ -217,7 +252,7 @@ export class FixationDetector {
   push(s: GazeSample): { completed: Fixation | null; current: Fixation | null };
   reset(): void;
 }
-export function classifySaccade(prev: Fixation, next: Fixation, layout: LineLayout | null): SaccadeKind;
+export function classifySaccade(prev: Fixation, next: Fixation, layout: LineLayout | null, line?: TextLine | null, opts?: { ignoreDy?: boolean }): SaccadeKind;
 
 // lineTracker.ts — HMM forward filter over the lines of the current layout
 export interface LineTrackerOptions { sigmaYLines: number; driftRate: number; maxDriftLines: number }
@@ -226,9 +261,10 @@ export class LineTracker {
   setLayout(layout: LineLayout, reason: LayoutChangeReason): void; // remap posterior by docTop
   onFixation(f: Fixation): LineEstimate;
   onSample(s: GazeSample): LineEstimate | null; // cheap update of progressX from the live gaze
-  afterPageTurn(resumeLineIndex: number): void;  // concentrate prior near the line reading resumes at
-  reset(): void;
-  readonly estimate: LineEstimate | null;
+  afterPageTurn(resumeLineIndex: number): void;  // prior on the resume line; re-anchors the drift
+  appearanceChangedAt(t: number): void;          // the gaze bias may have jumped at t: keep the line, re-learn the drift
+  reset(opts?: { keepDrift?: boolean }): void;
+  readonly estimate: LineEstimate | null;        // a TrackedLineEstimate (σ_y, excursions, drift belief range)
 }
 
 // pageEndDetector.ts
@@ -252,8 +288,12 @@ export function simulateReading(layout: LineLayout, opts: { wpm?: number; noiseP
   { samples: GazeSample[]; truth: { t: number; lineIndex: number }[]; lastLineEndT: number };
 
 // debugOverlay.ts / gazeDot.ts
-export class DebugOverlay implements Mountable { constructor(opts: { bus: EventBus; getSettings: () => AppSettings }); setVisible(v: boolean): void; }
-export class GazeDot implements Mountable { constructor(opts: { bus: EventBus; getSettings: () => AppSettings }); setVisible(v: boolean): void; }
+export class DebugOverlay implements Mountable { constructor(opts: { bus: EventBus; getSettings: () => AppSettings }); setVisible(v: boolean): void;
+  showDecision(d: PageEndDecision): void; showAppearance(info: AppearanceDebugInfo | null): void; }
+export class GazeDot implements Mountable { constructor(opts: { bus: EventBus; getSettings: () => AppSettings; correctDrift?: boolean }); setVisible(v: boolean): void; }
+// Follows LineEstimate.driftY until the first pinned estimate (lineIndex ≥ 0, probability ≥ PINNED_MIN_PROBABILITY),
+// then holds the last pinned drift while the tracker is unsure; reset() starts that over.
+export class DriftCorrection { noteEstimate(e: Pick<LineEstimate, 't' | 'driftY' | 'probability' | 'lineIndex'>): void; reset(): void; offsetAt(t): number; correct(s: GazeSample): GazeSample }
 ```
 
 **Reading model (the heart of the app).** Webcam gaze is accurate horizontally (~2–4°) but poor
@@ -263,21 +303,47 @@ occasional short regressions, then a **return sweep** — a large leftward sacca
 start of the *next* line. The LineTracker is a hidden Markov model whose hidden state is "which
 visible line is being read":
 
-* *Emission*: `N(y − driftY; line.centerY, σ_y²)` with `σ_y = sigmaYLines × linePitch` (default
-  0.9, adapted online from residuals when confident, clamped 0.4–3 lines), times a horizontal
-  plausibility factor (penalize x far outside the line's [left, right] — matters for short last
-  lines of paragraphs).
-* *Transition*, chosen by the saccade kind between consecutive fixations: forward → stay 0.85 /
-  next 0.07 / prev 0.03; regression → stay 0.85 / prev 0.08 / next 0.03; **return-sweep → next
-  0.75 / next+1 0.08 / stay 0.07 / prev 0.03**; jump → broad (mix 60 % uniform + vertical
-  likelihood). Remaining mass spread uniformly. Normalize.
-* *Drift*: when the posterior max > 0.8, `driftY += driftRate × ((y − centerY) − driftY)`, clamped
-  to ±`maxDriftLines × linePitch`. Drift lives only in the reading layer; GazeSample is never
-  modified.
+* *State*: (line, drift). The vertical bias of the gaze signal is part of the hidden state, on a
+  grid of ±`maxDriftLines` (default **5 lines**, 81 bins of 0.125 lines; 1.0 had ±1.5, which a
+  lamp's squint exceeds, and then the tracker locked onto the wrong line and "learned" a drift that
+  fit it). "Line 7 with +0.5 lines of drift" and "line 8 with −0.5" stay separate hypotheses until
+  the page tells them apart (the top of the page, a paragraph gap, a short line, a return sweep).
+  `driftY` in the estimate is the drift of the most likely line; `TrackedLineEstimate` also gives
+  the 2–98 % belief range (`driftLowY/driftHighY`) and `driftSdY`. Drift lives only in the reading
+  layer; GazeSample is never modified (the gaze dot and Dewey's eyes subtract `driftY` for display).
+* *Emission*: `N(y − drift; line.centerY, σ_y²)` (+ a small floor) with `σ_y = sigmaYLines ×
+  linePitch` (default 0.9, adapted from the residuals of confident fixations only while the drift
+  is pinned, clamped 0.4–3 lines), times a horizontal plausibility factor (penalize x far outside
+  the line's [left, right] — matters for short last lines of paragraphs).
+* *Line transition*, chosen by the saccade kind between consecutive fixations (`LINE_TRANSITIONS`):
+  forward → stay 0.886 / next 0.073 / prev 0.031; regression → stay 0.877 / prev 0.082 / next
+  0.031; **return-sweep → next 0.75 / next+1 0.08 / stay 0.07 / prev 0.03**; jump → 60 % uniform +
+  40 % where dy points. The remainder is spread uniformly (1 % for forward and regression, so a
+  vertical step mid-line isn't cheaply explained as skipping lines). A jump *down* while the eyes
+  keep moving along the line is 30 % treated as the bias stepping; a look away and straight back is
+  rolled back as an excursion.
+* *Drift transition*: a slow random walk (driftRate × 0.8 lines per fixation) plus a small chance of
+  a sudden shift. Fresh start: N(0, 0.5 lines) with 30 % spread uniformly (calibration is usually
+  right, but the light may differ from calibration); right after a new calibration
+  (`reset({ calibrated: true })`, which the app and the extension use then) the Gaussian alone.
 * *Layout changes*: on scroll/resize, carry the posterior across by matching `docTop`; on
-  `page-turn`, `afterPageTurn(resume)` puts ~70 % on the resume line, decaying over the next lines.
+  `page-turn`, `afterPageTurn(resume)` puts the prior on the resume line and **re-anchors the drift**
+  (half of the belief reset to uniform), so a drift learned on a wrong line can't survive turns.
+* *Appearance changes*: `appearanceChangedAt(t)` (the camera saw the light or the eyelids change):
+  at the first fixation starting at or after `t` the tracker keeps the line, resets the drift to
+  90 % uniform and classifies that saccade on dx only (its dy belongs to the sensor).
+* *Excursions*: fixations well off the text for every drift in the 2–98 % belief range don't move
+  the reading state.
+* `reset({ keepDrift })`: a new book with the same gaze source and calibration keeps the learned
+  drift (softened); a new calibration starts over.
 * `progressX` = (x − line.left)/(line.right − line.left) clamped 0..1 using the latest fixation or
   (in `onSample`) the smoothed gaze when valid.
+
+Measured on the simulator (src/reading/offsets.test.ts guards, bench/reading scoreboard, 168 page
+turns per row): constant offsets of ±2 to ±4 lines keep 95–99.5 % of fixations on the true line
+with no early or missed turns (1.0: 0–5 %, every turn early or missed from ±2 lines); steps of ±2
+to ±4 lines with the appearance event 99.5 %, no bad turns; no offset 99.4 → 99.5 %. Known limit:
+horizontal offsets ≥ 200 px.
 
 **Page-end detection.** Let `L` = last fully visible line. Fire when any holds (and all guards pass):
 1. **line-tracker**: `posterior[L] ≥ θp` and `progressX ≥ θx` held for ≥ `dwell` ms — or the
@@ -319,8 +385,12 @@ eager.
 Debug overlay (full-viewport canvas, pointer-events none, `Z.debugOverlay`): raw + smoothed gaze
 trail, current fixation circle, last ~8 fixations with saccade-kind colors, measured line boxes
 tinted by posterior, drift-corrected gaze marker, bottom-dwell/glance zones, and a small text panel
-(line, p, progressX, driftY, σ_y, last decision detail). Throttle drawing to rAF. Gaze dot: small,
-soft, semi-transparent circle following the smoothed gaze (hidden when invalid).
+(line, p, progressX, driftY, σ_y, drift belief range, lighting flags and signature distance, the
+eyelid monitor's residual z, the last appearance change and accuracy check, last decision detail).
+Throttle drawing to rAF. Gaze dot: small, soft, semi-transparent circle following the smoothed gaze
+**minus the line tracker's drift** (what the reader sees matches the reading layer; hidden when
+invalid). Dewey's eyes get the same drift-corrected gaze (the app hands his Buddy a bus view,
+`correctedGazeBus`, whose 'gaze' listeners receive corrected samples).
 
 ### D · Reader — `src/reader/{sanitize,bookLoader,epub,pdf,library,readerView,lineGeometry,scrollController}.ts`
 
@@ -476,8 +546,9 @@ The controller wires everything (see diagram) and owns lifecycle:
   WPM (words advanced ÷ active reading minutes), pages turned, minutes reading. Break timer →
   `break-due`.
 * Commands (from bus, keyboard, top bar, Dewey): Space/PageDown = page forward, Shift+Space/PageUp =
-  back, U = undo last turn, P = pause/resume auto-scroll, C = recalibrate, D = debug overlay,
-  G = gaze dot, S = settings, L = library, ? = help, Esc = close panels.
+  back, U = undo last turn, P = pause/resume auto-scroll, C = recalibrate, A = check accuracy,
+  D = debug overlay, G = gaze dot, S = settings, L = library, ? = help, Esc = close panels.
+* Lighting and eyelids (webcam): see "Lighting robustness" under *As built*.
 * Top bar: title, progress, tracking status pill (camera-on indicator!), source switch, pause,
   recalibrate, settings, library; auto-hides while reading, reappears on pointer near top.
 * Settings panel: all `AppSettings`, grouped (Eye tracking, Page turning, Reading, Dewey, Advanced).
@@ -524,8 +595,10 @@ fixes seams with minimal edits, and writes `README.md`.
 additive, and each module's header comment explains its own. The ones that cross module
 boundaries:
 
-* `TrackerError` lives in `camera.ts` (re-exported by `faceTracker.ts`). `FEATURE_NAMES` has 27
-  entries and is append-only. Blinks are gated over time by `BlinkGate` (`webcamGazeSource.ts`):
+* `TrackerError` lives in `camera.ts` (re-exported by `faceTracker.ts`). `FEATURE_NAMES` has 33
+  entries (27 in 1.0, plus the six 5-point iris features) and is append-only; the 12 lid-driven or
+  superseded ones are extracted but excluded from the gaze model (see *Vertical gaze must not come
+  from the lids*). Blinks are gated over time by `BlinkGate` (`webcamGazeSource.ts`):
   a short high score, or a collapsed lid aperture, is a blink. Sustained moderate scores are
   lowered lids from reading low on the screen, and they stay valid. Calibration uses the same
   gate and passes `maxBlink = 0.85` to training, so the bottom rows are learned rather than
@@ -535,7 +608,9 @@ boundaries:
   tracking glitch only when an *eye* feature is more than 10 calibration SDs out. Head pose and
   distance are exempt: a reader who sits differently later is not a glitch.
 * `PageEndDetector` refinements, tuned on the simulator: rule 1 needs the reader to have *entered*
-  L; a leaky dwell rides out blinks; it fires only on valid samples; the zones are drift-corrected.
+  L; a leaky dwell rides out blinks; it fires only on valid samples; the zones are drift-corrected,
+  with an unpinned drift (line probability < 0.6 or drift SD > 0.5 pitch) clamped to ±1.5 pitches, so
+  a spurious drift in steady light can't move the zones by more than that.
   After a trigger, rules 1 and 2 wait for the gaze to come back up the page, so a resting mouse or
   gaze can't page through the book. Bottom-dwell ignores gaze more than a line below the page
   (that is glance-down's gesture, which the reader can switch off). `notifyScrolled` must be
@@ -572,3 +647,84 @@ boundaries:
   by a document-relative URL; and `HostThemeWatcher` (`src/app/hostTheme.ts`) lets "auto" follow
   the host's `data-theme` stamp while telling it apart from the app's own writes.
   `scripts/artifact-html.mjs` assembles and checks the content-only page.
+* **Lighting robustness (1.1).** Light moves the lids, and 1.0 read vertical gaze from them. The
+  fix has four layers:
+  - *Features and model* (`features.ts`, `calibrationModel.ts`): lid-free vertical gaze, the
+    stored `CalibrationEnvironment`, `measureOffset`, the upgrade check (see above).
+  - *Camera side* (`src/gaze/lighting.ts`, `faceTracker.ts`): a `LightingProbe` in
+    `processFrame` reads a few landmark-defined regions of the frame (`VideoFrame.copyTo`, or one
+    small canvas) about 6.7 times a second, reduces them to `LightingStats` (17 numbers, never
+    pixels) and attaches them to that `FeatureFrame`. `LightingMonitor` turns them into coaching
+    flags (`dark` judged from the sclera, so skin tone doesn't matter; `overexposed`, `glare`,
+    `backlit`, `side-lit`, `unstable`). `LightingWatch` compares a rolling 10-s
+    `LightingSignature` (six ratio components) with the calibration's: "changed" after 5 s at a
+    distance ≥ 1.0, "restored" after 5 s ≤ 0.7, with an onset estimate; "changed-again" when, while
+    changed, the light moves as far again from the last report (a lamp, then the overhead light off).
+    A change that a page-brightness change accounts for (`screenExplainsChange`) is not reported, but
+    only once the caller passes screen luminances (`setReference(…, lum)`, `setScreenLuminance`),
+    which neither the app nor the extension does yet.
+    `AppearanceMonitor` (`src/gaze/appearance.ts`) watches lid openness and eyeSquint against the
+    calibration's `AppearanceBaseline`, at the height a lid-free model says the reader looks, and
+    reports steps (a light switched on: confirmed in ≈ 2.3 s, backdated to the onset).
+  - *Calibration overlay*: lighting coaching while positioning, a signature while the dots show,
+    and a `'check'` mode (5 dots measured with `evaluateModel`; "Correct it" applies a refresh
+    fitted on the same dots, "Done" leaves the model). A check run starts with
+    `calibration {phase: 'start', message: 'check'}` (Dewey then skips calibration coaching; a
+    'point' or 'training' means a real calibration took over). Quick and check runs emit
+    `accuracy-check` with the mean offset, `offsetXFrac` and `maxDotYLines` (the worst dot: the
+    symmetric dots cancel a scale error in the mean). The verdict (badge, words, suggested
+    action) is `offsetVerdict` in `src/app/offsetWords.ts`, shared with the toast after "Done"
+    (`accuracyCheckView`) so the two can't disagree: on target needs the mean within half a line
+    and every dot within 1 line; a dot 1.5 lines off is worth correcting, 2 lines is "Drifted".
+    When the correction would still leave a dot a line off (leave-one-dot-out), "Full
+    calibration" is the suggested action.
+  - *Reading layer*: the ±5-line drift state, re-anchoring and `appearanceChangedAt` (see the
+    reading model above).
+
+  The web app's controller wires them (the extension's page session does the same in
+  `extension/src/conditions.ts` and `touchUp.ts`): it subscribes to the camera's frames, feeds
+  `LightingWatch` (reference: `model.environment.lighting`) and `AppearanceMonitor` (baseline:
+  `model.environment.appearance`; gaze height = the model's predicted y / calibration viewport
+  height), and emits `lighting-state` about once a second from its 250-ms heartbeat. A lids step
+  or a lighting "changed"/"changed-again"/"restored" becomes one `appearance-changed` (`AppearanceChangeFilter`
+  merges reports whose onsets are within 6 s: the lids see a change seconds before the lighting
+  signature does), and every `appearance-changed` reaches `lineTracker.appearanceChangedAt(t)`.
+  After a quick refresh or an applied check correction the app emits `appearance-changed` with
+  reason `'refresh'` (keep the line, re-learn the offset); a full calibration resets the tracker
+  (`reset({ calibrated: true })`).
+  Refreshes are recognised by an unchanged ridge core (`sameRidgeCore`). The drift is kept across
+  book opens while the gaze source and calibration stay the same (`driftOwnerKey`,
+  `reset({ keepDrift: true })`); a different source mid-book re-learns it.
+
+  Guidance (`GuidanceGate`, `DriftWatch`, `SustainedFlags` in `src/app/logic.ts`): a lighting
+  change, or |driftY| ≥ 1.5 lines pinned for 20 s, earns an offer of the quick 5-dot refresh (a
+  Dewey line and a toast "The light changed — a quick 5-dot refresh keeps page turns accurate
+  [Refresh now] [Not now]"). It waits for a page turn or a 2.5-s pause in reading, and comes at
+  most every 10 min, twice per book, never within 3 min of a correction or 20 s of opening a book,
+  and not for 30 min after "Not now". A changed light is a standing reason, not a one-shot
+  trigger: while `changedSinceCalibration` holds and the episode hasn't been offered, the offer is
+  re-requested every lighting tick, so a closed gate only delays it; one offer per episode (reset
+  on "restored", a new reference, or a camera restart). Back-lit, glare or dark flags held for 8 s
+  get one coaching line per book (a toast when Dewey is hidden or set to 'quiet'). A 1.0
+  calibration found at start-up is explained once ("I've learned to handle changing light better
+  — please recalibrate once"): on that visit the web app asks first (a "Please recalibrate once"
+  toast with Calibrate / Use my mouse / Watch a demo) instead of starting the dots, as the
+  extension does; later visits calibrate right away. The accuracy check (A, Settings,
+  `check-accuracy`) runs the overlay in `'check'` mode and sums the result up in a toast and a
+  Dewey line (`accuracyCheckView`, the overlay's verdict).
+
+* **Diagnostics recorder** (`src/app/diagnostics.ts`, web app only). Settings → Advanced →
+  "Record tracking diagnostics (no video)" keeps up to 10 minutes in memory: every feature frame
+  (vector, quality, blink, openness, squint, head pose, lighting without the skin-tone-dependent
+  `faceLuma` / `faceLin`), every gaze sample with whether
+  the pipeline consumed it, every call the controller makes into the reading layer in call order
+  (layouts with their line boxes, resume lines, resets, scroll cooldowns, appearance changes),
+  compact line estimates, fixations, page-end decisions, page turns, lighting/appearance/accuracy
+  events, the model JSON and report, the settings and the environment (browser, screen, device
+  pixel ratio, camera track settings and the track's label — usually the camera model with its USB
+  ids — but no deviceId/groupId; disclosed in PRIVACY.md). "Stop and download" saves JSON; a top-bar
+  chip shows while it records. `bench/replay/replay.ts` re-executes a recording through the
+  current reading layer (open loop: the recorded layouts) and reports drift, confidence, replayed
+  vs recorded page turns and lighting events; `GR_REPLAY=file.json npm run bench -- bench/replay`.
+  A recording made with the same modules replays exactly (src/app/diagnostics.test.ts). Hidden in
+  the Artifact build.

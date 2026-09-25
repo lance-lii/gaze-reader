@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { FeatureFrame } from '../../src/types';
+import type { FeatureFrame, LightingStats } from '../../src/types';
 import {
   MAX_FEATURE_LENGTH,
   PAGE_OFF,
@@ -8,6 +8,7 @@ import {
   isFeatureFrame,
   isHubToOffscreen,
   isHubToTab,
+  isLightingStats,
   isOffscreenToHub,
   isPageRequest,
   isPageState,
@@ -71,6 +72,74 @@ describe('feature frame guard', () => {
     expect(isFeatureFrame({ t: 1, quality: 0.5, features: null })).toBe(false);
     expect(isFeatureFrame(null)).toBe(false);
     expect(isFeatureFrame([frame()])).toBe(false);
+  });
+
+  it('accepts an optional 0..1 squint score and rejects a malformed one', () => {
+    const withSquint = frame();
+    withSquint.features!.squint = 0.12;
+    expect(isFeatureFrame(viaJson(withSquint))).toBe(true);
+    for (const bad of [Number.NaN, -0.1, 1.5]) {
+      const f = frame();
+      f.features!.squint = bad;
+      expect(isFeatureFrame(viaJson(f)), String(bad)).toBe(false);
+    }
+  });
+});
+
+const LIGHT: LightingStats = {
+  faceLuma: 0.5412,
+  faceLin: 0.2531,
+  faceRange: 1.2345,
+  faceClip: 0,
+  frameLin: 0.1822,
+  bgLin: 0.1567,
+  bgClip: 0.0123,
+  scleraR: 0.4012,
+  scleraL: 0.3987,
+  backlight: 1.3571,
+  side: -0.1234,
+  shade: -0.8765,
+  glareR: 0.0011,
+  glareL: 0,
+  irisGlintR: 0,
+  irisGlintL: 0.05,
+  facePx: 18_234,
+};
+
+describe('lighting statistics guard', () => {
+  it('accepts well-formed stats, before and after JSON transport, and tolerates extra keys', () => {
+    expect(isLightingStats(LIGHT)).toBe(true);
+    expect(isLightingStats(viaJson(LIGHT))).toBe(true);
+    expect(isLightingStats({ ...LIGHT, top: -0.2 })).toBe(true);
+    // A frame is small on the port: ≈ 350 bytes of lighting at ≈ 6 Hz.
+    expect(JSON.stringify(LIGHT).length).toBeLessThan(400);
+  });
+
+  it('rejects missing, non-finite and out-of-range fields', () => {
+    for (const key of Object.keys(LIGHT) as (keyof LightingStats)[]) {
+      const { [key]: _gone, ...missing } = LIGHT;
+      expect(isLightingStats(missing), `missing ${key}`).toBe(false);
+      expect(isLightingStats(viaJson({ ...LIGHT, [key]: Number.NaN })), `NaN ${key}`).toBe(false);
+      expect(isLightingStats({ ...LIGHT, [key]: '0.5' }), `string ${key}`).toBe(false);
+    }
+    expect(isLightingStats({ ...LIGHT, faceClip: 1.2 })).toBe(false);
+    expect(isLightingStats({ ...LIGHT, scleraR: -0.01 })).toBe(false);
+    expect(isLightingStats({ ...LIGHT, side: 40 })).toBe(false);
+    expect(isLightingStats({ ...LIGHT, faceRange: -1 })).toBe(false);
+    expect(isLightingStats({ ...LIGHT, facePx: 1e9 })).toBe(false);
+    expect(isLightingStats(null)).toBe(false);
+    expect(isLightingStats([LIGHT])).toBe(false);
+    expect(isLightingStats(new Uint8Array(17))).toBe(false); // never pixels
+  });
+
+  it('lets frames carry lighting, and rejects frames whose lighting is malformed', () => {
+    expect(isFeatureFrame(viaJson(frame({ lighting: LIGHT })))).toBe(true);
+    expect(isFeatureFrame(frame({ faceFound: false, features: null, quality: 0, lighting: LIGHT }))).toBe(true);
+    expect(isFeatureFrame(viaJson({ ...frame(), lighting: { ...LIGHT, bgLin: Number.NaN } }))).toBe(false);
+    expect(isFeatureFrame({ ...frame(), lighting: 'bright' })).toBe(false);
+    expect(isFeatureFrame({ ...frame(), lighting: null })).toBe(false);
+    expect(isHubToTab({ type: 'frame', frame: viaJson(frame({ lighting: LIGHT })) })).toBe(true);
+    expect(isOffscreenToHub({ type: 'frame', frame: { ...frame(), lighting: { faceLuma: 0.5 } } })).toBe(false);
   });
 });
 

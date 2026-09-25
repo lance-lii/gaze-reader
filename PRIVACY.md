@@ -20,11 +20,22 @@ requests they make.
   running as WebAssembly. From each frame it computes face landmarks and a few numbers about your
   eyes (where each iris sits, how open the lids are, head angle). Those numbers are turned into an
   estimate of where you're looking, and then thrown away.
+- A few times a second Gaze Reader also measures the **lighting** in the same frame, so it can
+  suggest better light and notice when the light has changed since you calibrated (a lamp
+  switched on makes most people squint a little, which can throw the tracking off). It reads
+  the pixels of a few small areas that the face landmarks mark out (the whites of your eyes,
+  your cheeks, the area around your eyes, the background) into memory, reduces them to about
+  17 numbers (for example how bright the whites of your eyes are compared with the background,
+  whether one side of your face is lit more than the other, whether your glasses reflect a
+  light), and discards the pixels at once. They are never kept, shown on the page or sent
+  anywhere. The lighting numbers themselves are used like the eye numbers: on your device,
+  then thrown away.
 - Video frames and images are **never recorded, stored, uploaded or shared**. Neither are the
-  landmarks or the gaze positions.
+  landmarks, the gaze positions or the lighting numbers, unless you record tracking diagnostics
+  yourself (see [below](#tracking-diagnostics-web-app-only-if-you-start-it)).
 - In the extension the camera runs in a hidden extension page (an "offscreen document"). Only the
-  eye numbers described above are passed from there to the tab you're reading, inside your
-  browser. No pictures are passed, and nothing is sent over the network.
+  eye and lighting numbers described above are passed from there to the tab you're reading,
+  inside your browser. No pictures are passed, and nothing is sent over the network.
 
 ## What stays on your device
 
@@ -32,20 +43,44 @@ requests they make.
 
 - your library: books you open or paste, their text and your reading positions (IndexedDB);
 - your settings and your calibration (`localStorage`). A calibration is a small set of numbers
-  that map eye measurements to screen positions. It contains no images.
+  that map eye measurements to screen positions. It also keeps a short summary of the
+  conditions while you calibrated: a few lighting ratios (such as the whites of your eyes
+  against the background, or one side of your face against the other) and how open your eyes
+  were, so the app can tell later when the light has changed. The summary uses ratios only,
+  not how light or dark your skin is. It contains no images.
 
 **Extension** (in `chrome.storage.local`, on your computer):
 
 - your settings, including how pages turn;
-- your calibration (the same kind of numbers as above, plus the page zoom it was made at);
+- your calibration (the same kind of numbers as above, including the lighting and eye-openness
+  summary, plus the page zoom it was made at);
 - the time you last granted camera permission on the setup page, so that open tabs know they can
-  retry the camera.
+  retry the camera;
+- when the quick 5-dot refresh was last offered or snoozed (`gr.touchUp.v1`, two timestamps), so
+  that it isn't offered again too soon in another tab.
 
 The extension doesn't keep a history of the pages you read. On a page where you turn it on, it
 measures where the lines of text are, and counts the words and reads the title of the main text
-so Dewey can cheer your progress. This happens in memory only and is forgotten when you turn it
-off or leave the page. It only runs in tabs where you turn it on, and it can only see the page
-in that tab.
+so Dewey can cheer your progress. This happens in memory only. The line positions and the gaze
+offset it learned stay in memory until you leave the page, so turning it back on resumes where
+you were. It only runs in tabs where you turn it on, and it can only see the page in that tab.
+
+## Tracking diagnostics (web app, only if you start it)
+
+If tracking misbehaves, you can record what it measured and send it to the developers:
+**Settings → Advanced → Record tracking diagnostics (no video)**. Nothing is recorded unless you
+start it, and a chip in the top bar shows while it records.
+
+- **What is recorded,** for up to 10 minutes, as numbers: your eye measurements (the numbers
+  described under "The camera", head angle, how open your eyes are), the gaze estimates, the
+  lighting readings (ratios and levels, but not how bright your face itself is, which depends on
+  your skin tone), where the lines of text are and when pages turn, your settings and
+  calibration, and your browser, screen and camera settings, including the camera's name as your
+  computer reports it (usually its model, for example "Integrated Webcam (0bda:5634)").
+- **What is not:** video, images, the book's text or its title.
+- **Where it goes:** it stays in memory until you press **Stop and download**, which saves a JSON
+  file on your computer. It is never uploaded. It reaches the developers only if you send them
+  the file yourself.
 
 You can delete everything at any time. In the app, use **Settings → Forget calibration**, delete
 books from the library, or clear the site's data in your browser. For the extension, use
@@ -87,8 +122,8 @@ section of the README for what that means and how to avoid it for private docume
 
 ## Children
 
-Gaze Reader doesn't knowingly collect information from anyone, including children, because it
-doesn't collect information at all.
+Gaze Reader doesn't knowingly collect information from anyone, including children: it collects
+nothing by itself, and we only receive what you choose to send us (such as a diagnostics file).
 
 ## Changes and contact
 

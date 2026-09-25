@@ -498,6 +498,13 @@ export interface AppEvents {
     offsetXPx: number;
     offsetYPx: number;
     offsetYLines: number;
+    /** offsetXPx as a fraction of the viewport width (> 0 = right), when known. */
+    offsetXFrac?: number;
+    /**
+     * Largest vertical error of a single dot (|mean prediction − target|), lines, when known.
+     * The mean offset hides a scale error (top reads high, bottom reads low); this doesn't.
+     */
+    maxDotYLines?: number;
     /** Whether the measured offset was applied as a quick correction. */
     applied: boolean;
   };

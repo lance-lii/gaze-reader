@@ -5,6 +5,10 @@ import type { AppSettings } from '../../src/types';
 import { KEYS } from './extStorage';
 import { PAGE_OFF, type PageRequest, type PageState, type RuntimeRequest, type RuntimeResponse } from './messages';
 import { FakeStorage } from './testing/fakes';
+import { linearGazeModel } from './testing/models';
+import { OUTDATED_CALIBRATION_SHORT } from './calibrationStatus';
+import type { PageExtraRequest, PageExtraState } from './pageExtras';
+import { zoomAware } from './zoomModel';
 
 const ON: PageState = { ...PAGE_OFF, enabled: true, tracking: 'tracking', source: 'webcam', calibrated: true, fps: 29.7 };
 /** The real popup markup, minus its module script (the test imports popup.ts itself). */
@@ -185,5 +189,69 @@ describe('popup', () => {
     await c.storage.area.set({ [KEYS.extSettings]: { pageTurn: 'scroll' } });
     await vi.advanceTimersByTimeAsync(0);
     expect(choice('scroll').checked).toBe(true);
+  });
+});
+
+describe('popup: accuracy and light', () => {
+  const current = () => JSON.parse(JSON.stringify(zoomAware(linearGazeModel(), () => 1).toJSON())) as unknown;
+
+  it('checks accuracy on the page (turning Gaze Reader on first), only with the webcam and a calibration', async () => {
+    const c = installChrome();
+    c.storage.data.set(KEYS.calibration, current());
+    await openPopup();
+    const check = $<HTMLButtonElement>('#check');
+    expect(check.disabled).toBe(false); // off here, but a calibration is stored
+
+    check.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(c.fake.runtime.sendMessage).toHaveBeenCalledWith({ type: 'set-tab-enabled', tabId: 5, enabled: true });
+    expect(c.fake.tabs.sendMessage).toHaveBeenCalledWith(5, { type: 'page-extra-command', command: 'check-accuracy' }, { frameId: 0 });
+    expect(window.close).toHaveBeenCalled();
+
+    toggle(document.querySelector<HTMLInputElement>('input[name="source"][value="mouse"]')!, true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(check.disabled).toBe(true);
+  });
+
+  it('explains an outdated calibration, which can only be replaced, not checked', async () => {
+    const c = installChrome();
+    const legacy = { ...(current() as Record<string, unknown>), kind: 'gr-ridge-poly2', featureLength: 27 };
+    c.storage.data.set(KEYS.calibration, legacy);
+    await openPopup();
+    expect($('#calibration').textContent).toBe(OUTDATED_CALIBRATION_SHORT);
+    expect($<HTMLButtonElement>('#check').disabled).toBe(true);
+
+    // "Recalibrate" asks the page for it: after an upgrade the page explains first instead of starting on its own.
+    $<HTMLButtonElement>('#recalibrate').click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(c.fake.tabs.sendMessage).toHaveBeenCalledWith(5, { type: 'page-command', command: 'recalibrate' }, { frameId: 0 });
+  });
+
+  it('shows what the page measured about the light, and offers the quick refresh when it changed', async () => {
+    const c = installChrome();
+    c.storage.data.set(KEYS.calibration, current());
+    let extra: PageExtraState = { lighting: { flags: ['backlit'], changedSinceCalibration: false, dominant: null }, canCheck: true };
+    const shaky: PageState = { ...ON, tracking: 'poor', detail: 'Shaky: bright light behind you' };
+    c.fake.tabs.sendMessage.mockImplementation(async (_tabId: number, req: PageRequest | PageExtraRequest): Promise<unknown> => {
+      if (req.type === 'page-query') return shaky;
+      if (req.type === 'page-extra-query') return extra;
+      return ON;
+    });
+    await openPopup();
+    expect($('#status').textContent).toBe('Shaky: bright light behind you');
+    expect($('#light').hidden).toBe(false);
+    expect($('#light').textContent).toMatch(/bright light behind you/);
+
+    extra = { lighting: { flags: [], changedSinceCalibration: true, dominant: 'side' }, canCheck: true };
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect($('#light').textContent).toBe('The light has changed since you calibrated. Quick 5-dot refresh');
+    $<HTMLButtonElement>('#light button').click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(c.fake.tabs.sendMessage).toHaveBeenCalledWith(5, { type: 'page-extra-command', command: 'touch-up' }, { frameId: 0 });
+    expect(window.close).toHaveBeenCalled();
+
+    extra = { lighting: { flags: [], changedSinceCalibration: false, dominant: null }, canCheck: true };
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect($('#light').hidden).toBe(true);
   });
 });

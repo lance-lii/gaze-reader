@@ -11,6 +11,16 @@ import { NEUTRAL_HEAD_POSE, tryHeadPoseFromMatrix } from './headPose';
  *    the chin (positive = down),
  *  - everything is normalized by that eye's width.
  * "Left"/"right" are the subject's anatomical sides throughout.
+ *
+ * Two families of iris position live in the vector. The original `u`/`v` use
+ * the single iris-centre landmark, and `v` is measured from the lid midpoint.
+ * The appended `u5`/`vc5` use a 5-point iris centre (the centre landmark
+ * averaged with its 4 contour points, about 30 % less jitter) and are measured
+ * from the eye corners only. Light changes the lids (people squint in bright
+ * light and glare, and open their eyes wider in dim light) but barely moves the
+ * corners, so the calibration model reads gaze from the corner-referenced
+ * family and leaves the lid measures to the blink gate and the quality checks
+ * (GAZE_EXCLUDED_FEATURES in calibrationModel.ts).
  */
 
 export interface LandmarkLike {
@@ -41,6 +51,15 @@ export const EYE_LANDMARKS: Readonly<{ right: EyeLandmarkIndices; left: EyeLandm
   right: Object.freeze({ iris: 468, inner: 133, outer: 33, upper: 159, lower: 145 }),
   left: Object.freeze({ iris: 473, inner: 362, outer: 263, upper: 386, lower: 374 }),
   chin: 152,
+});
+
+/**
+ * The 4 iris-contour landmarks around each iris centre (MediaPipe's iris
+ * refinement: 468 + 469–472 for the right eye, 473 + 474–477 for the left).
+ */
+export const IRIS_CONTOUR: Readonly<{ right: readonly number[]; left: readonly number[] }> = Object.freeze({
+  right: Object.freeze([469, 470, 471, 472]),
+  left: Object.freeze([474, 475, 476, 477]),
 });
 
 /** MediaPipe blendshape categories copied into the vector (0 when absent). */
@@ -84,6 +103,15 @@ export const FEATURE_NAMES = [
   'tz',
   'faceScale', //    interocular distance, in image widths
   ...BLENDSHAPE_FEATURES,
+  // Corner-referenced iris position from the 5-point iris centre (mean of the
+  // centre landmark and its 4 contour points, IRIS_CONTOUR). No lid landmark
+  // enters these, so squinting or widening the eyes leaves them alone.
+  'rightU5', //      5-point iris along the corner axis, 0 = inner … 1 = outer
+  'rightVc5', //     5-point iris below the corner midpoint, along the down-normal, / eye width
+  'leftU5',
+  'leftVc5',
+  'meanU5', //       (1 − rightU5 + leftU5) / 2, oriented like meanU
+  'meanVc5', //      (rightVc5 + leftVc5) / 2
 ] as const;
 
 export type FeatureName = (typeof FEATURE_NAMES)[number];
@@ -114,6 +142,9 @@ interface EyeMeasures {
   v: number;
   open: number;
   lidY: number;
+  /** Corner-referenced position of the 5-point iris centre. */
+  u5: number;
+  vc5: number;
 }
 
 const MIN_LENGTH = 1e-6;
@@ -123,7 +154,7 @@ const sub = (a: Vec, b: Vec): Vec => ({ x: a.x - b.x, y: a.y - b.y });
 const mid = (a: Vec, b: Vec): Vec => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 const clamp01 = (x: number): number => (x <= 0 ? 0 : x >= 1 ? 1 : x);
 
-function measureEye(inner: Vec, outer: Vec, upper: Vec, lower: Vec, iris: Vec, down: Vec): EyeMeasures | null {
+function measureEye(inner: Vec, outer: Vec, upper: Vec, lower: Vec, iris: Vec, iris5: Vec, down: Vec): EyeMeasures | null {
   const axis = sub(outer, inner);
   const width = Math.hypot(axis.x, axis.y);
   if (!(width > MIN_LENGTH)) return null;
@@ -134,12 +165,28 @@ function measureEye(inner: Vec, outer: Vec, upper: Vec, lower: Vec, iris: Vec, d
   if (dot(n, down) < 0) n = { x: -n.x, y: -n.y };
 
   const lidMid = mid(upper, lower);
+  const cornerMid = mid(inner, outer);
   return {
     u: dot(sub(iris, inner), ux) / width,
     v: dot(sub(iris, lidMid), n) / width,
     open: Math.max(0, dot(sub(lower, upper), n)) / width,
-    lidY: dot(sub(lidMid, mid(inner, outer)), n) / width,
+    lidY: dot(sub(lidMid, cornerMid), n) / width,
+    u5: dot(sub(iris5, inner), ux) / width,
+    vc5: dot(sub(iris5, cornerMid), n) / width,
   };
+}
+
+/** Mean of the iris-centre landmark and its contour points: a steadier iris centre. */
+function irisCentre5(P: (i: number) => Vec, centre: number, contour: readonly number[]): Vec {
+  let x = P(centre).x;
+  let y = P(centre).y;
+  for (const i of contour) {
+    const p = P(i);
+    x += p.x;
+    y += p.y;
+  }
+  const k = contour.length + 1;
+  return { x: x / k, y: y / k };
 }
 
 const normalizeBlendshapeName = (name: string): string => name.replace(/[^a-z]/gi, '').toLowerCase();
@@ -158,6 +205,20 @@ function readBlendshapes(blendshapes: readonly BlendshapeLike[] | null): Map<str
 const BLENDSHAPE_KEYS = BLENDSHAPE_FEATURES.map(normalizeBlendshapeName);
 const BLINK_LEFT_KEY = normalizeBlendshapeName('eyeBlinkLeft');
 const BLINK_RIGHT_KEY = normalizeBlendshapeName('eyeBlinkRight');
+const SQUINT_KEYS = ['eyeSquintLeft', 'eyeSquintRight'].map(normalizeBlendshapeName);
+
+/** Mean of the eyeSquint scores that are present; 0 when neither is. */
+function squintScore(scores: Map<string, number> | null): number {
+  let sum = 0;
+  let count = 0;
+  for (const key of SQUINT_KEYS) {
+    const v = scores?.get(key);
+    if (v === undefined) continue;
+    sum += v;
+    count++;
+  }
+  return count > 0 ? sum / count : 0;
+}
 
 /**
  * Blink estimate from lid aperture, used only when blendshapes are missing.
@@ -214,8 +275,8 @@ export function extractEyeFeatures(
   let down = sub(P(EYE_LANDMARKS.chin), mid(rightCenter, leftCenter));
   if (!(Math.hypot(down.x, down.y) > MIN_LENGTH)) down = { x: 0, y: 1 };
 
-  const right = measureEye(P(R.inner), P(R.outer), P(R.upper), P(R.lower), P(R.iris), down);
-  const left = measureEye(P(L.inner), P(L.outer), P(L.upper), P(L.lower), P(L.iris), down);
+  const right = measureEye(P(R.inner), P(R.outer), P(R.upper), P(R.lower), P(R.iris), irisCentre5(P, R.iris, IRIS_CONTOUR.right), down);
+  const left = measureEye(P(L.inner), P(L.outer), P(L.upper), P(L.lower), P(L.iris), irisCentre5(P, L.iris, IRIS_CONTOUR.left), down);
   if (!right || !left) return null;
 
   const pose: HeadPose = (transformMatrix && tryHeadPoseFromMatrix(transformMatrix)) || { ...NEUTRAL_HEAD_POSE };
@@ -248,6 +309,12 @@ export function extractEyeFeatures(
     pose.tz,
     faceScale,
     ...BLENDSHAPE_KEYS.map((key) => scores?.get(key) ?? 0),
+    right.u5,
+    right.vc5,
+    left.u5,
+    left.vc5,
+    (1 - right.u5 + left.u5) / 2,
+    (right.vc5 + left.vc5) / 2,
   ];
   for (const x of vector) if (!Number.isFinite(x)) return null;
 
@@ -259,6 +326,7 @@ export function extractEyeFeatures(
     openness: (right.open + left.open) / 2,
     faceScale,
     faceCenter,
+    squint: squintScore(scores),
   };
 }
 
