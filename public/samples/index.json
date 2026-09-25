@@ -1,0 +1,16 @@
+[
+  {
+    "id": "reading-eyes",
+    "title": "The Secret Life of Reading Eyes",
+    "author": "Gaze Reader Press",
+    "blurb": "A friendly pocket guide to what your eyes really do while you read, from tiny jumps and skipped words to how a webcam can tell when you’ve reached the last line.",
+    "file": "secret-life-of-reading-eyes.md"
+  },
+  {
+    "id": "midnight-library",
+    "title": "Dewey and the Midnight Library",
+    "author": "Gaze Reader Press",
+    "blurb": "Locked in the library at midnight, a sleepless reader meets Dewey, a very small and extremely earnest resident of shelf 020, who is determined to help her finish the book she has been stuck on for months.",
+    "file": "dewey-and-the-midnight-library.md"
+  }
+]
