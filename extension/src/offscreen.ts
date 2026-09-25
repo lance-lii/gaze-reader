@@ -15,6 +15,7 @@ import {
   type CameraStatus,
   type OffscreenToHub,
 } from './messages';
+import { outgoingFrame } from './frameRelay';
 import { backoffDelay, safeDisconnect, safePost, type PortLike } from './ports';
 
 /** Status heartbeat while running (carries fps for the popup). */
@@ -39,9 +40,11 @@ let startSeq = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let orphanTimer: ReturnType<typeof setTimeout> | null = null;
 
+// A few frames a second also carry lighting numbers (measured on this VideoFrame by the tracker's
+// LightingProbe, never pixels); the tab's lighting watch and the calibration coach read them.
 camera.onFrame((frame: FeatureFrame) => {
   lastFrameAt = performance.now();
-  if (state === 'running' && port) post({ type: 'frame', frame });
+  if (state === 'running' && port) post({ type: 'frame', frame: outgoingFrame(frame) });
 });
 
 // The camera was unplugged, taken by another app, or its permission revoked; the source has already stopped.

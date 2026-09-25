@@ -302,23 +302,35 @@ function geometry(layout: LineLayout | null): SaccadeGeometry {
  * paragraph-final lines produce return sweeps: from the end of a line that is
  * only a few words long the sweep back is short, so it is recognized by
  * "started near the end of that line, landed at the column start, moved down".
+ *
+ * `opts.ignoreDy`: the vertical displacement is not the eyes' (the gaze bias
+ * itself stepped between the two fixations, e.g. a light was switched on), so
+ * the saccade is classified on its horizontal movement alone.
  */
 export function classifySaccade(
   prev: Fixation,
   next: Fixation,
   layout: LineLayout | null,
   line?: TextLine | null,
+  opts: SaccadeClassifyOptions = {},
 ): SaccadeKind {
   const dx = next.x - prev.x;
-  const dy = next.y - prev.y;
-  if (!finite(dx) || !finite(dy)) return 'jump';
+  const ignoreDy = opts.ignoreDy === true;
+  const dy = ignoreDy ? NaN : next.y - prev.y;
+  if (!finite(dx) || (!ignoreDy && !finite(dy))) return 'jump';
   const g = geometry(layout);
-  if (Math.abs(dy) > JUMP_DY_LINES * g.pitch) return 'jump';
+  if (!ignoreDy && Math.abs(dy) > JUMP_DY_LINES * g.pitch) return 'jump';
   if (dx >= 0) return dx <= MAX_FORWARD_COL * g.colWidth ? 'forward' : 'jump';
   if (isReturnSweep(prev, next, dx, dy, g, line ?? null)) return 'return-sweep';
   return -dx <= MAX_REGRESSION_COL * g.colWidth ? 'regression' : 'jump';
 }
 
+export interface SaccadeClassifyOptions {
+  /** Classify on dx alone: the vertical step belongs to the sensor, not the eyes. */
+  ignoreDy?: boolean;
+}
+
+/** `dy` is NaN when the vertical displacement is unknown; the vertical tests are skipped then. */
 function isReturnSweep(
   prev: Fixation,
   next: Fixation,
@@ -327,7 +339,8 @@ function isReturnSweep(
   g: SaccadeGeometry,
   line: TextLine | null,
 ): boolean {
-  if (dy < -SWEEP_MAX_RISE_LINES * g.pitch || -dx > SWEEP_MAX_DX_COL * g.colWidth) return false;
+  const knownDy = finite(dy);
+  if ((knownDy && dy < -SWEEP_MAX_RISE_LINES * g.pitch) || -dx > SWEEP_MAX_DX_COL * g.colWidth) return false;
   if (-dx >= SWEEP_MIN_DX_COL * g.colWidth) {
     if (!g.hasColumn) return true;
     if (prev.x >= g.colLeft + SWEEP_START_COL * g.colWidth && next.x <= g.colLeft + SWEEP_LAND_COL * g.colWidth) {
@@ -340,6 +353,6 @@ function isReturnSweep(
   return (
     prev.x >= line.left + SHORT_SWEEP_START_LINE * w &&
     next.x <= g.colLeft + SHORT_SWEEP_LAND_COL * g.colWidth &&
-    dy >= SHORT_SWEEP_MIN_DY_LINES * g.pitch
+    (!knownDy || dy >= SHORT_SWEEP_MIN_DY_LINES * g.pitch)
   );
 }

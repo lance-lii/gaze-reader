@@ -62,6 +62,27 @@ describe('Topbar', () => {
     bar.destroy();
   });
 
+  it('shows a recording chip, and keeps the status area up, while diagnostics are recorded', () => {
+    const { bar } = setup();
+    const chip = bar.el.querySelector<HTMLElement>('.gr-rec-chip')!;
+    const demo = bar.el.querySelector<HTMLElement>('.gr-demo-chip:not(.gr-rec-chip)')!;
+    expect(chip.hidden).toBe(true);
+    bar.setStatus({ state: 'tracking', kind: 'mouse', cameraOn: false });
+    expect(bar.el.dataset.persist).toBe('false');
+    bar.setRecording(true);
+    expect(chip.hidden).toBe(false);
+    expect(chip.textContent).toMatch(/Recording diagnostics/);
+    expect(chip.title).toMatch(/no video/);
+    expect(demo.hidden).toBe(true);
+    expect(bar.el.dataset.persist).toBe('true');
+    bar.setStatus({ state: 'tracking', kind: 'mouse', cameraOn: false }); // a status update doesn't hide it
+    expect(bar.el.dataset.persist).toBe('true');
+    bar.setRecording(false);
+    expect(chip.hidden).toBe(true);
+    expect(bar.el.dataset.persist).toBe('false');
+    bar.destroy();
+  });
+
   it('explains why the camera is off', () => {
     const { bar } = setup();
     const pill = bar.el.querySelector<HTMLElement>('.gr-pill')!;

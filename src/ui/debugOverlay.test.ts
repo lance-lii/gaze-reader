@@ -167,6 +167,33 @@ describe('DebugOverlay', () => {
     overlay.destroy();
   });
 
+  it('shows the lighting, the eyelid monitor, appearance changes, checks and the drift belief', () => {
+    const { bus, overlay, host } = setup();
+    overlay.mount(host);
+    const pitch = layout.linePitch;
+    bus.emit('layout', layout);
+    const tracked: TrackedLineEstimate = { ...estimate(5), driftLowY: -0.5 * pitch, driftHighY: 1.25 * pitch, driftSdY: 0.25 * pitch };
+    bus.emit('line-estimate', tracked);
+    bus.emit('lighting-state', { flags: ['backlit', 'glare'], distance: 1.234, changedSinceCalibration: true, dominant: 'backlight' });
+    bus.emit('gaze', gaze(300, 300, 10_000));
+    bus.emit('appearance-changed', { t: 7000, reason: 'lighting', detail: 'light changed since calibration' });
+    bus.emit('accuracy-check', { meanErrorPx: 61.4, offsetXPx: 3, offsetYPx: 2.1 * pitch, offsetYLines: 2.1, applied: true });
+    overlay.showAppearance({ state: 'watching', residualZ: -1.26, squintZ: null, levelVsCalibration: -0.0123 });
+    frames.flush();
+    const panel = host.querySelector('.gr-debug-panel')!.textContent!;
+    expect(panel).toMatch(/drift belief -0\.50…\+1\.25 ln {2}sd 0\.25/);
+    expect(panel).toMatch(/light backlit, glare {2}D 1\.23 {2}CHANGED \(backlight\)/);
+    expect(panel).toMatch(/lids watching {2}z -1\.3 {2}squint z – {2}level -0\.012/);
+    expect(panel).toMatch(/appearance change 3 s ago: lighting · light changed/);
+    expect(panel).toMatch(/accuracy check: 61 px, y \+2\.10 ln \(applied\)/);
+    // The belief is drawn as a bracket beside the drift-corrected gaze.
+    expect(rec.calls.filter((c) => c === 'lineTo').length).toBeGreaterThanOrEqual(3);
+    overlay.showAppearance(null);
+    frames.flush();
+    expect(host.querySelector('.gr-debug-panel')!.textContent!).not.toMatch(/lids /);
+    overlay.destroy();
+  });
+
   it('explains every mark it draws in the legend', () => {
     const { overlay, host } = setup();
     overlay.mount(host);

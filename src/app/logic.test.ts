@@ -449,6 +449,8 @@ describe('keyboard mapping', () => {
     expect(shortcutFor({ key: 'u' })).toBe('undo-turn');
     expect(shortcutFor({ key: 'P', shiftKey: true })).toBe('toggle-autoscroll');
     expect(shortcutFor({ key: 'c' })).toBe('recalibrate');
+    expect(shortcutFor({ key: 'a' })).toBe('check-accuracy');
+    expect(shortcutFor({ key: 'A', shiftKey: true })).toBe('check-accuracy');
     expect(shortcutFor({ key: 'd' })).toBe('toggle-debug');
     expect(shortcutFor({ key: 'g' })).toBe('toggle-gaze-dot');
     expect(shortcutFor({ key: 's' })).toBe('open-settings');
@@ -469,7 +471,7 @@ describe('keyboard mapping', () => {
 
   it('every shortcut in the help table is reachable', () => {
     const reachable = new Set(
-      [' ', 'PageDown', 'PageUp', 'u', 'p', 'c', 'd', 'g', 's', 'l', '?', 'Escape']
+      [' ', 'PageDown', 'PageUp', 'u', 'p', 'c', 'a', 'd', 'g', 's', 'l', '?', 'Escape']
         .flatMap((key) => [shortcutFor({ key }), shortcutFor({ key, shiftKey: true })]),
     );
     for (const s of SHORTCUTS) expect(reachable.has(s.action)).toBe(true);

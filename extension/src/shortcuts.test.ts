@@ -17,6 +17,8 @@ describe('matchShortcut', () => {
     expect(matchShortcut(key('ArrowDown'))).toBe('page-forward');
     expect(matchShortcut(key('PageUp'))).toBe('page-back');
     expect(matchShortcut(key('Slash'))).toBe('toggle-help');
+    expect(matchShortcut(key('KeyA'))).toBe('check-accuracy');
+    expect(matchShortcut(key('KeyA', { repeat: true }))).toBeNull(); // held down: one check, not a queue
   });
 
   it('ignores keys without exactly Alt+Shift, while composing, or unknown', () => {

@@ -59,6 +59,7 @@
           </fieldset>
         </div>
         <p class="calibration" id="calibration" hidden></p>
+        <p class="calibration light" id="light" role="status" hidden></p>
 
         <div class="row row--stack">
           <span class="row-text">
@@ -106,11 +107,15 @@
       </section>
 
       <div class="actions">
+        <button class="btn" id="check" type="button" title="Five dots show how far off the tracking is, and can correct it (Alt+Shift+A)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M8.2 12.4l2.6 2.6 5-5.2" /></svg>
+          Check accuracy
+        </button>
         <button class="btn" id="recalibrate" type="button">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7" /><circle cx="12" cy="12" r="2.5" /><path d="M12 2v3M12 19v3M2 12h3M19 12h3" /></svg>
           Recalibrate
         </button>
-        <button class="btn" id="setup" type="button">
+        <button class="btn btn--wide" id="setup" type="button">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="7" width="13" height="10" rx="2" /><path d="M16 11l5-3v8l-5-3z" /></svg>
           Camera setup
         </button>

@@ -11,29 +11,48 @@
 import { CSS_PREFIX } from '../core/constants';
 import { createEventBus } from '../core/events';
 import { createSettingsStore, type SettingsStore } from '../core/settings';
+import { readJSON, writeJSON } from '../core/storage';
 import { FULL_APP_URL, IS_ARTIFACT } from '../core/target';
 import type {
+  AppEvents,
   AppSettings,
   Book,
+  BuddyMood,
+  CalibrationReport,
   CommandName,
   EventBus,
+  FeatureFrame,
   GazeModel,
   GazeSample,
   GazeSource,
   GazeSourceKind,
   LayoutChangeReason,
+  LightingFlag,
+  LineEstimate,
   LineLayout,
   PageEndDecision,
   ReadingPosition,
+  SpeechPriority,
   Unsubscribe,
 } from '../types';
-import { Buddy } from '../buddy/buddy';
+import { Buddy, chattinessAllows } from '../buddy/buddy';
+import { QuipPicker, type QuipKey } from '../buddy/quips';
 import { BUDDY_CLASS } from '../buddy/styles';
-import { clearCalibration, currentChromeTop, loadCalibration, modelChromeTop, saveCalibration } from '../gaze/calibrationModel';
+import { AppearanceMonitor } from '../gaze/appearance';
+import {
+  clearCalibration,
+  currentChromeTop,
+  loadCalibration,
+  modelChromeTop,
+  saveCalibration,
+  savedCalibrationNeedsUpgrade,
+} from '../gaze/calibrationModel';
 import { CameraFeatureSource, preloadFaceLandmarker } from '../gaze/faceTracker';
 import { FEATURE_NAMES } from '../gaze/features';
+import { LightingWatch, parseLightingSignature } from '../gaze/lighting';
 import { MouseGazeSource } from '../gaze/mouseGazeSource';
 import { WebcamGazeSource } from '../gaze/webcamGazeSource';
+import { isTrackedLineEstimate } from '../reading/lineTracker';
 import { listSampleBooks, loadBookFromFile, loadBookFromText, loadBookFromUrl, loadSampleBook, type SampleBookInfo } from '../reader/bookLoader';
 import { deleteBook, getBook, getProgress, listBooks, saveBook, saveProgress } from '../reader/library';
 import { ReaderView } from '../reader/readerView';
@@ -42,11 +61,11 @@ import { LineTracker } from '../reading/lineTracker';
 import { PageEndDetector } from '../reading/pageEndDetector';
 import { SimulatedReaderSource } from '../reading/simulatedReader';
 import { FixationDetector } from '../signal/fixations';
-import { CalibrationOverlay } from '../ui/calibrationOverlay';
+import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationMode } from '../ui/calibrationOverlay';
 import { CameraPreview } from '../ui/cameraPreview';
 import { DEWEY_FULL_APP_LINE, FULL_APP_LABEL, WEBCAM_UNAVAILABLE_TEXT, WEBCAM_UNAVAILABLE_TITLE } from '../ui/fullApp';
 import { DebugOverlay } from '../ui/debugOverlay';
-import { GazeDot } from '../ui/gazeDot';
+import { DriftCorrection, GazeDot } from '../ui/gazeDot';
 import { HelpDialog } from '../ui/helpDialog';
 import { LibraryScreen } from '../ui/libraryScreen';
 import { Onboarding, hasCompletedOnboarding } from '../ui/onboarding';
@@ -54,18 +73,29 @@ import { SettingsPanel } from '../ui/settingsPanel';
 import { Toaster, type ToastAction } from '../ui/toast';
 import { Topbar } from '../ui/topbar';
 import {
+  AppearanceChangeFilter,
   BreakTimer,
+  DriftWatch,
+  GuidanceGate,
+  PINNED_MAX_DRIFT_SD_LINES,
+  PINNED_MIN_PROBABILITY,
   ProgressMeter,
   ReadingClock,
   SHORTCUTS,
+  SustainedFlags,
   TYPICAL_WPM,
   TrackingStateMachine,
+  accuracyCheckView,
   calibrationFitsViewport,
   calibrationOriginFits,
   cameraErrorInfo,
+  coachFlag,
   computeWpm,
+  correctedGazeBus,
+  driftOwnerKey,
   errorMessage,
   firstFullyVisibleIndex,
+  formatLines,
   formatMinutes,
   formatPercent,
   lastFullyVisibleIndex,
@@ -73,6 +103,7 @@ import {
   previewCorner,
   resolveTheme,
   resumeLineIndex,
+  sameRidgeCore,
   sameStatus,
   shortcutFor,
   shouldIgnoreShortcut,
@@ -81,6 +112,14 @@ import {
   type SourcePhase,
   type TrackingStatus,
 } from './logic';
+import {
+  DiagnosticsRecorder,
+  RECORDED_EVENTS,
+  describeEnvironment,
+  downloadRecording,
+  videoTrackOf,
+  type PipelineControl,
+} from './diagnostics';
 import { HostThemeWatcher } from './hostTheme';
 
 type Screen = 'library' | 'reader';
@@ -112,6 +151,26 @@ const POOR_HINT_AFTER_MS = 8000;
 const PRELOAD_DELAY_MS = 2500;
 /** Artifact build: how long Dewey lets a new reader settle in before mentioning the full app. */
 const FULL_APP_MENTION_DELAY_MS = 20_000;
+/** A touch-up offer that found no quiet moment for this long is dropped (the next trigger may raise it again). */
+const OFFER_TTL_MS = 120_000;
+/** LightingWatch's hold before "back to the calibration's light" is declared (its default). */
+const LIGHTING_HOLD_MS = 5000;
+/** The eyelid monitor's state reaches the debug panel at most this often. */
+const APPEARANCE_DEBUG_MS = 250;
+/** Remembers that the "tracker upgraded, please recalibrate once" explanation was given. */
+const UPGRADE_EXPLAINED_KEY = 'calibrationUpgradeExplained.v1';
+
+/** What a calibration run did to the model. */
+type CalibrationOutcome = 'standard' | 'refresh' | 'unchanged';
+
+/** Why the reader is offered a 5-dot touch-up. */
+interface TouchUpOffer {
+  reason: 'lighting' | 'drift';
+  since: number;
+  /** Drift offers: how far off, and which way (+1 = reads low). */
+  lines?: number;
+  direction?: number;
+}
 
 const TYPOGRAPHY_KEYS: readonly (keyof AppSettings)[] = ['fontSizePx', 'lineHeight', 'fontFamily', 'columnWidthCh'];
 const OVERLAY_KEYS: readonly (keyof AppSettings)[] = ['showGazeDot', 'showDebugOverlay', 'showCameraPreview', 'buddyCorner', 'buddyEnabled'];
@@ -249,6 +308,40 @@ export class AppController {
   private fullAppMentioned = false;
   private lastError = { key: '', at: 0 };
 
+  // Lighting & eyelid appearance (webcam only), and the guidance they lead to
+  private readonly lightingWatch = new LightingWatch();
+  private readonly appearance = new AppearanceMonitor(null);
+  private offCameraFrames: Unsubscribe | null = null;
+  private lightingState: AppEvents['lighting-state'] | null = null;
+  private lastAppearanceDebugAt = Number.NEGATIVE_INFINITY;
+  private readonly changeFilter = new AppearanceChangeFilter();
+  private readonly sustainedFlags = new SustainedFlags();
+  private readonly driftWatch = new DriftWatch();
+  private readonly guidance = new GuidanceGate();
+  private pendingOffer: TouchUpOffer | null = null;
+  /**
+   * The quick refresh was offered for the current "light changed since calibration" episode.
+   * Until then the changed light is a standing reason to offer it, re-requested every lighting
+   * tick, so a gate that was closed when the light changed (a book still settling in, a recent
+   * calibration) only delays the offer. Cleared when the light is back, the reference changes or
+   * the camera stops.
+   */
+  private lightingEpisodeOffered = false;
+  private pendingCoach: LightingFlag | null = null;
+  /** The saved calibration was made by an older tracker: explained once, then calibrate. */
+  private upgradePending = false;
+  private readonly quips = new QuipPicker();
+  /** What the line tracker's learned drift belongs to (driftOwnerKey). */
+  private driftOwner: string | null = null;
+  /** The drift-corrected gaze Dewey's eyes follow (the gaze dot corrects itself). */
+  private readonly driftCorrection = new DriftCorrection();
+  /** Latest phase announced by the calibration overlay (tells "Done" from a cancel). */
+  private lastCalibrationPhase: AppEvents['calibration']['phase'] | null = null;
+  private lastReport: CalibrationReport | null = null;
+
+  // Diagnostics
+  private readonly recorder: DiagnosticsRecorder;
+
   constructor(root: HTMLElement) {
     this.root = root;
     this.bus = createEventBus();
@@ -296,11 +389,14 @@ export class AppController {
     this.reader.applySettings(settings);
     this.pageEnd = new PageEndDetector({ sensitivity: settings.sensitivity, glanceDownToTurn: settings.glanceDownToTurn });
 
+    this.recorder = new DiagnosticsRecorder({ onLimit: () => this.onRecordingLimit() });
+
     // Floating layers, bottom to top.
     this.preview = new CameraPreview({ onHide: () => this.hidePreview() });
     this.debug = new DebugOverlay({ bus: this.bus, getSettings });
     this.gazeDot = this.createGazeDot();
-    this.buddy = new Buddy({ bus: this.bus, getSettings });
+    // Dewey's eyes follow the gaze where the reading layer believes it is (drift-corrected).
+    this.buddy = new Buddy({ bus: correctedGazeBus(this.bus, (s) => this.driftCorrection.correct(s)), getSettings });
     this.toasts = new Toaster();
     this.onboarding = new Onboarding({ bus: this.bus, onClose: () => this.syncModalState() });
     this.settingsPanel = new SettingsPanel({
@@ -312,12 +408,29 @@ export class AppController {
       },
       onForgetCalibration: () => this.forgetCalibration(),
       onRecalibrate: () => this.recalibrate(),
+      onCheckAccuracy: () => this.runCommand('check-accuracy'),
       onShowHelp: () => this.runCommand('show-help'),
       onReplayIntro: () => {
         this.closePanels();
         void this.runOnboarding();
       },
       onClose: () => this.syncModalState(),
+      // Downloads don't exist in the Artifact frame.
+      ...(IS_ARTIFACT
+        ? {}
+        : {
+            diagnostics: {
+              status: () => ({
+                recording: this.recorder.recording,
+                elapsedMs: this.recorder.elapsedMs,
+                limitMs: this.recorder.limitMs,
+                hasData: this.recorder.hasData,
+              }),
+              start: () => this.startRecording(),
+              stop: () => this.stopRecording(true),
+              download: () => this.downloadRecording(),
+            },
+          }),
     });
     this.help = new HelpDialog({ onClose: () => this.syncModalState() });
     for (const layer of [this.preview, this.debug, this.gazeDot, this.buddy, this.toasts, this.onboarding, this.settingsPanel, this.help]) {
@@ -359,6 +472,7 @@ export class AppController {
     this.destroyed = true;
     this.sourceGen++;
     this.teardownSource();
+    this.recorder.discard();
     this.camera = null;
     this.stopHeartbeat();
     this.timers.clearAll();
@@ -696,7 +810,12 @@ export class AppController {
       undos: 0,
     };
     this.layout = null;
-    this.resetPipeline(true);
+    // Same source and calibration as the last book: keep the vertical offset already learned.
+    this.resetPipeline('auto');
+    this.guidance.startSession(performance.now());
+    this.driftWatch.reset();
+    this.pendingOffer = null;
+    this.pendingCoach = null;
     this.topbar.setBook(book);
     document.title = `${book.title} · Gaze Reader`;
     this.focusReader();
@@ -736,7 +855,10 @@ export class AppController {
     this.scrollSettling = false;
     this.reader.close();
     this.layout = null;
-    this.resetPipeline(true);
+    // The line tracker keeps its drift for the next book (startSession decides whether it fits).
+    this.resetPipeline('none');
+    this.pendingOffer = null;
+    this.toasts.dismiss('touch-up');
   }
 
   private focusReader(): void {
@@ -759,8 +881,13 @@ export class AppController {
     // Background tabs throttle camera frames to about 1 Hz, which would read as
     // "face lost" (and worry Dewey). Hold the state until the tab is visible again.
     if (!document.hidden) this.refreshTracking(now);
+    this.recorder.tick(); // stops a recording at its time limit (onRecordingLimit)
     const session = this.session;
     if (!session) return;
+    if (!document.hidden) {
+      this.tickLighting(now);
+      this.pollGuidance(now);
+    }
     const s = this.store.get();
     const active = this.isActivelyReading(now);
     const dt = session.clock.tick(now, active);
@@ -869,10 +996,13 @@ export class AppController {
 
     if (this.pipelineBlocked()) {
       this.pipelineWasBlocked = true;
+      this.recorder.gaze(s, false);
       return;
     }
+    this.recorder.gaze(s, true);
     if (this.pipelineWasBlocked) {
       // Don't let a fixation straddle a pause (dialog, scroll, calibration).
+      // (A recording replays this from the samples' "fed" flags.)
       this.pipelineWasBlocked = false;
       this.fixations.reset();
     }
@@ -880,18 +1010,35 @@ export class AppController {
     const { completed } = this.fixations.push(s);
     if (completed) {
       this.bus.emit('fixation', completed);
-      this.bus.emit('line-estimate', this.lineTracker.onFixation(completed));
+      const estimate = this.lineTracker.onFixation(completed);
+      this.bus.emit('line-estimate', estimate);
+      this.recorder.estimate(estimate, true);
       this.lastEstimateEmitAt = s.t;
+      this.onReadingEstimate(estimate);
     }
     const live = this.lineTracker.onSample(s);
     if (live && s.t - this.lastEstimateEmitAt >= ESTIMATE_EMIT_MS) {
       this.bus.emit('line-estimate', live);
+      this.recorder.estimate(live, false);
       this.lastEstimateEmitAt = s.t;
     }
     const decision = this.pageEnd.update({ t: s.t, gaze: s, estimate: this.lineTracker.estimate, layout: this.layout });
     if (this.debug.visible) this.debug.showDecision(decision);
     if (decision.trigger) this.onPageEnd(decision);
   };
+
+  /** A fixation was placed on a line: note reading (guidance waits for pauses) and watch the drift. */
+  private onReadingEstimate(e: LineEstimate): void {
+    if (e.lineIndex < 0) return;
+    this.guidance.noteReading(e.t);
+    if (this.sourceKind !== 'webcam') return;
+    const pitch = this.layout?.linePitch ?? NaN;
+    const sd = isTrackedLineEstimate(e) ? (e.driftSdY ?? NaN) : NaN;
+    const pinned = e.probability >= PINNED_MIN_PROBABILITY && !(sd > PINNED_MAX_DRIFT_SD_LINES * pitch);
+    if (this.driftWatch.push(e.t, e.driftY, pitch, pinned)) {
+      this.requestOffer({ reason: 'drift', since: e.t, lines: this.driftWatch.peakLines, direction: this.driftWatch.direction });
+    }
+  }
 
   /** The reading model only sees samples while the text is still and the reader is looking at it. */
   private pipelineBlocked(): boolean {
@@ -908,12 +1055,63 @@ export class AppController {
     );
   }
 
-  private resetPipeline(full: boolean): void {
+  /**
+   * Resets fixations and the page-end detector, and the line tracker as asked:
+   *  - 'none' keeps it (and its learned drift);
+   *  - 'auto' starts it over but keeps the drift when it was learned with the same gaze source
+   *    and calibration (reopening a book), otherwise starts from "calibration is about right";
+   *  - 'fresh' always starts over (a new calibration): the light is the calibration's, so the
+   *    drift prior drops its "the light may differ" uniform share (reset({ calibrated: true })).
+   */
+  private resetPipeline(tracker: 'none' | 'auto' | 'fresh'): void {
     this.fixations.reset();
     this.pageEnd.reset();
-    if (full) this.lineTracker.reset();
+    let keepDrift = false;
+    const calibrated = tracker === 'fresh';
+    if (tracker !== 'none') {
+      const owner = this.currentDriftOwner();
+      keepDrift = tracker === 'auto' && owner !== null && owner === this.driftOwner;
+      this.lineTracker.reset(keepDrift ? { keepDrift: true } : calibrated ? { calibrated: true } : {});
+      this.driftOwner = owner;
+      this.driftWatch.reset();
+    }
+    this.recordInput({ k: 'pipeline-reset', t: performance.now(), full: tracker !== 'none', keepDrift, ...(calibrated ? { calibrated } : {}) });
     this.pipelineWasBlocked = false;
     this.lastEstimateEmitAt = Number.NEGATIVE_INFINITY;
+  }
+
+  /** Who the drift learned from here on belongs to: the source that is (or will be) running, and its calibration. */
+  private currentDriftOwner(): string | null {
+    const kind = this.sourceKind ?? this.store.get().gazeSource;
+    return driftOwnerKey(kind, kind === 'webcam' ? this.currentModel()?.trainedAt : null);
+  }
+
+  /** A different gaze source (or calibration) took over mid-book: keep the line, re-learn the offset. */
+  private adoptDriftOwner(): void {
+    const owner = this.currentDriftOwner();
+    if (owner === this.driftOwner) return;
+    this.driftOwner = owner;
+    this.driftWatch.reset();
+    const t = performance.now();
+    this.lineTracker.appearanceChangedAt(t);
+    this.recordInput({ k: 'appearance', t, at: t });
+  }
+
+  private resetFixations(unblock: boolean): void {
+    this.fixations.reset();
+    if (unblock) this.pipelineWasBlocked = false;
+    this.recordInput({ k: 'fixations-reset', t: performance.now(), unblock });
+  }
+
+  /** Starts the page-end detector's cooldown (every scroll, automatic or not). */
+  private notifyScrolled(): void {
+    const t = performance.now();
+    this.pageEnd.notifyScrolled(t);
+    this.recordInput({ k: 'scrolled', t });
+  }
+
+  private recordInput(entry: PipelineControl): void {
+    if (this.recorder.recording) this.recorder.input(entry);
   }
 
   // ────────────────────────────── Page turning ──────────────────────────────
@@ -928,7 +1126,7 @@ export class AppController {
     // through by hand still finished the book.
     if (scroll.atEnd() || this.onLastPage(this.layout)) {
       this.finishBook();
-      this.pageEnd.notifyScrolled(performance.now());
+      this.notifyScrolled();
       return;
     }
     if (!this.store.get().autoScroll) return;
@@ -983,7 +1181,7 @@ export class AppController {
     if (this.scroll !== scroll || !this.session) return;
     if (Math.abs(this.reader.scroller.scrollTop - startTop) < 1) {
       // Nothing moved, so the reading model is still right; just start the cooldown.
-      this.pageEnd.notifyScrolled(performance.now());
+      this.notifyScrolled();
     } else {
       this.afterJump('turn', oldDocTop);
     }
@@ -1068,10 +1266,13 @@ export class AppController {
     const layout = this.measure(kind === 'undo' ? 'scroll' : 'page-turn');
     if (layout && kind !== 'undo') {
       const resume = kind === 'turn' ? resumeLineIndex(layout.lines, oldDocTop, layout.linePitch) : firstFullyVisibleIndex(layout.lines);
-      if (resume >= 0) this.lineTracker.afterPageTurn(resume);
+      if (resume >= 0) {
+        this.lineTracker.afterPageTurn(resume);
+        this.recordInput({ k: 'resume', t: performance.now(), line: resume });
+      }
     }
-    this.pageEnd.notifyScrolled(performance.now());
-    this.fixations.reset();
+    this.notifyScrolled();
+    this.resetFixations(false);
     this.updateProgressUi();
     this.scheduleSavePosition();
   }
@@ -1089,6 +1290,7 @@ export class AppController {
     }
     this.layout = layout;
     this.lineTracker.setLayout(layout, reason);
+    if (this.recorder.recording) this.recorder.layout(layout, reason, performance.now());
     this.bus.emit('layout', layout);
     return layout;
   }
@@ -1143,14 +1345,14 @@ export class AppController {
     // The trailing scroll event of a jump we have already measured.
     if (!this.scrollSettling && this.layout && Math.abs(this.reader.scroller.scrollTop - this.layout.scrollTop) < 1) return;
     this.scrollSettling = true;
-    this.pageEnd.notifyScrolled(performance.now());
+    this.notifyScrolled();
     this.timers.set(
       'scroll-settle',
       () => {
         this.scrollSettling = false;
         if (!this.session) return;
         this.measure('scroll');
-        this.fixations.reset();
+        this.resetFixations(false);
         this.scheduleSavePosition();
       },
       SCROLL_SETTLE_MS,
@@ -1240,6 +1442,8 @@ export class AppController {
       }
       this.source = source;
       this.offSample = off;
+      // A drift learned with another source (or calibration) doesn't apply to this one.
+      if (this.session) this.adoptDriftOwner();
       this.setPhase('running');
       this.introduceSource(kind);
     } catch (err) {
@@ -1269,9 +1473,11 @@ export class AppController {
     this.calibration?.cancel();
     this.offCameraError?.();
     this.offCameraError = null;
+    this.offCameraFrames?.();
+    this.offCameraFrames = null;
     this.camera?.stop();
-    this.fixations.reset();
-    this.pipelineWasBlocked = false;
+    this.stopConditionWatch();
+    this.resetFixations(true);
     this.updateOverlays();
   }
 
@@ -1284,6 +1490,14 @@ export class AppController {
     // Unreachable in the Artifact build (the webcam can't be selected there); the early
     // return also keeps the camera and face-tracker code out of that bundle.
     if (IS_ARTIFACT) return null;
+    if (!this.forceCalibration && !this.currentModel() && this.explainUpgradeIfNeeded()) {
+      // Say why before a minute of dots, and let the reader choose when (as the extension does):
+      // the overlay would cover a toast, the page is inert under it, and Dewey may be hidden.
+      // The camera isn't switched on for nothing. "Calibrate" (recalibrate()) clears the hold.
+      this.webcamHold = { reason: 'uncalibrated' };
+      this.showNotCalibrated();
+      return null;
+    }
     const stale = (): boolean => gen !== this.sourceGen || this.destroyed;
     this.setPhase('starting');
     this.camera ??= new CameraFeatureSource();
@@ -1301,11 +1515,17 @@ export class AppController {
     }
     this.offCameraError?.();
     this.offCameraError = camera.onError((err) => this.onCameraRuntimeError(err));
+    // Lighting and eyelid watch, diagnostics (subscribed before any calibration, so a recording has its frames).
+    this.offCameraFrames?.();
+    this.offCameraFrames = camera.onFrame(this.onCameraFrame);
     this.updateOverlays();
 
     const model = this.currentModel();
     if (!model || this.forceCalibration) {
-      return (await this.calibrate('standard', gen)) ? camera : null;
+      const outcome = await this.calibrate('standard', gen);
+      if (!outcome) return null;
+      this.afterCalibration(outcome, 'bring-up');
+      return camera;
     }
     const fit = this.calibrationFit(model);
     if (fit !== 'fits') {
@@ -1314,7 +1534,10 @@ export class AppController {
           ? 'Your window changed size, so let’s do a quick 5-dot refresh.'
           : 'Your window layout changed (fullscreen or toolbar), so let’s do a quick 5-dot refresh.';
       this.bus.emit('buddy-say', { text, priority: 'high', mood: 'thinking' });
-      return (await this.calibrate('quick', gen)) ? camera : null;
+      const outcome = await this.calibrate('quick', gen);
+      if (!outcome) return null;
+      this.afterCalibration(outcome, 'bring-up');
+      return camera;
     }
     return camera;
   }
@@ -1424,19 +1647,21 @@ export class AppController {
     if (this.model === undefined) {
       this.model = loadCalibration({ featureLength: FEATURE_NAMES.length, featureNames: FEATURE_NAMES });
       this.savedCalibration = this.model !== null;
+      this.applyEnvironment(this.model);
     }
     return this.model;
   }
 
   /**
-   * Runs the calibration overlay on the running camera. Resolves true when
-   * there is a usable model afterwards (new, or the previous one when a
-   * refresh was cancelled).
+   * Runs the calibration overlay on the running camera. Resolves with what happened to the
+   * model: a new calibration ('standard'), a quick refresh or an applied accuracy-check
+   * correction of the same calibration ('refresh'), or no change ('unchanged': a cancelled
+   * refresh, or a check closed with "Done"). Null when there is no usable model afterwards.
    */
-  private async calibrate(mode: 'quick' | 'standard', gen: number): Promise<boolean> {
+  private async calibrate(mode: CalibrationMode, gen: number): Promise<CalibrationOutcome | null> {
     const stale = (): boolean => gen !== this.sourceGen || this.destroyed;
     const camera = this.camera;
-    if (!camera?.running || this.calibration) return false;
+    if (!camera?.running || this.calibration) return null;
     const base = this.currentModel();
     this.closePanels();
     this.setPhase('calibrating');
@@ -1444,18 +1669,21 @@ export class AppController {
       features: camera,
       bus: this.bus,
       video: camera.video,
-      mode: mode === 'quick' && base ? 'quick' : 'standard',
+      mode: mode !== 'standard' && base ? mode : 'standard',
       baseModel: base,
       // Accuracy is reported as "≈ N lines" at the reader's actual text size.
       linePitchPx: () => this.layout?.linePitch ?? null,
       featureNames: FEATURE_NAMES,
     });
     this.calibration = overlay;
+    this.lastCalibrationPhase = null;
     this.syncModalState();
     overlay.mount(this.root);
-    let result: { model: GazeModel } | null = null;
+    let result: { model: GazeModel; report: CalibrationReport } | null = null;
+    let check: AccuracyCheckResult | null = null;
     try {
       result = await overlay.run();
+      check = overlay.lastAccuracyCheck;
     } finally {
       if (this.calibration === overlay) this.calibration = null;
       this.forceCalibration = false;
@@ -1464,22 +1692,38 @@ export class AppController {
       overlay.destroy();
       if (this.session && (!document.activeElement || document.activeElement === document.body)) this.focusReader();
     }
-    if (stale()) return false;
+    if (stale()) return null;
+    const finished = this.lastCalibrationPhase === 'done';
     if (result) {
-      this.model = result.model;
-      saveCalibration(result.model);
-      this.savedCalibration = true;
-      this.webcamHold = null;
-      return true;
+      const outcome: CalibrationOutcome = base && sameRidgeCore(result.model.toJSON(), base.toJSON()) ? 'refresh' : 'standard';
+      this.adoptModel(result.model, result.report);
+      if (mode === 'check' && outcome === 'refresh') this.reportAccuracyCheck(check);
+      return outcome;
     }
-    if (base) return true;
+    if (base) {
+      if (mode === 'check' && finished) {
+        // "Done": the model stays as it is; the reader has just seen how it does.
+        this.guidance.noteFixed(performance.now());
+        this.reportAccuracyCheck(check);
+      }
+      return 'unchanged';
+    }
     this.webcamHold = { reason: 'uncalibrated' };
     this.bus.emit('buddy-say', { text: 'No rush! We can calibrate whenever you like, or try the mouse.', priority: 'high', mood: 'thinking' });
+    this.showNotCalibrated();
+    return null;
+  }
+
+  /** There is no usable calibration and none is running: say why, and offer the ways forward. */
+  private showNotCalibrated(): void {
+    const upgrade = this.upgradePending;
     this.toasts.show({
       id: 'camera',
       tone: 'warn',
-      title: 'Not calibrated yet',
-      message: 'A one-minute calibration lets Dewey follow your eyes. You can also read with your mouse, or watch the demo.',
+      title: upgrade ? 'Please recalibrate once' : 'Not calibrated yet',
+      message: upgrade
+        ? 'Gaze Reader now copes better with changing light, so calibrations from the previous version can’t be used. It takes about a minute. You can also read with your mouse, or watch the demo.'
+        : 'A one-minute calibration lets Dewey follow your eyes. You can also read with your mouse, or watch the demo.',
       actions: [
         { label: 'Calibrate', primary: true, run: () => this.recalibrate() },
         { label: 'Use my mouse', run: () => this.selectSource('mouse') },
@@ -1487,7 +1731,58 @@ export class AppController {
       ],
       durationMs: 20_000,
     });
-    return false;
+  }
+
+  /** A calibration run produced a model: save it and make it the reference for light and eyelids. */
+  private adoptModel(model: GazeModel, report: CalibrationReport): void {
+    this.model = model;
+    saveCalibration(model);
+    this.savedCalibration = true;
+    this.webcamHold = null;
+    this.upgradePending = false;
+    this.lastReport = report;
+    this.applyEnvironment(model);
+    const now = performance.now();
+    this.recorder.model(model, report, now);
+    // The tracking was just corrected: no touch-up offers for a while.
+    this.guidance.noteFixed(now);
+    this.pendingOffer = null;
+    this.toasts.dismiss('touch-up');
+  }
+
+  /**
+   * Brings the reading layer in line with a calibration run. A new calibration starts the line
+   * tracker over; a refresh keeps the line the reader is on and re-learns the offset (the refresh
+   * absorbed it into the model, so the drift learned so far is now wrong).
+   */
+  private afterCalibration(outcome: CalibrationOutcome, context: 'bring-up' | 'in-place'): void {
+    if (outcome === 'standard') {
+      this.resetPipeline('fresh');
+      if (context === 'in-place' && this.layout) {
+        this.lineTracker.setLayout(this.layout, 'initial');
+        if (this.recorder.recording) this.recorder.layout(this.layout, 'initial', performance.now());
+      }
+      return;
+    }
+    if (context === 'in-place') this.resetPipeline('none');
+    if (outcome === 'refresh') {
+      this.driftOwner = this.currentDriftOwner();
+      this.driftWatch.reset();
+      this.bus.emit('appearance-changed', { t: performance.now(), reason: 'refresh', detail: 'calibration refreshed' });
+    }
+  }
+
+  /** The lighting signature and eyelid baseline stored with the model become the references. */
+  private applyEnvironment(model: GazeModel | null): void {
+    const env = model?.environment ?? null;
+    const lighting = parseLightingSignature(env?.lighting ?? null);
+    this.lightingWatch.setReference(lighting);
+    this.appearance.setBaseline(env?.appearance ?? null, lighting?.pitch ?? null);
+    this.changeFilter.reset();
+    this.sustainedFlags.reset();
+    this.driftWatch.reset();
+    // A new reference light: whatever was offered for the old one doesn't count.
+    this.lightingEpisodeOffered = false;
   }
 
   private recalibrate(): void {
@@ -1509,8 +1804,44 @@ export class AppController {
     }
   }
 
-  /** Recalibrates without restarting the camera; gaze processing pauses meanwhile. */
-  private async recalibrateInPlace(mode: 'quick' | 'standard'): Promise<void> {
+  /** The 5-dot touch-up (a quick refresh of the calibration in use). */
+  private touchUp(): void {
+    this.toasts.dismiss('touch-up');
+    if (this.sourceKind === 'webcam' && this.phase === 'running' && this.currentModel()) void this.recalibrateInPlace('quick');
+  }
+
+  /** The 'check-accuracy' command: a few dots measured against the calibration in use. */
+  private checkAccuracy(): void {
+    if (IS_ARTIFACT) {
+      this.webcamUnavailable();
+      return;
+    }
+    if (!this.session) {
+      this.toasts.show({ id: 'check', message: 'Open a book, then press A to check how well your eyes are followed.' });
+      return;
+    }
+    if (this.store.get().gazeSource !== 'webcam') {
+      this.toasts.show({
+        id: 'check',
+        message: 'The accuracy check is for eye tracking. Switch to your eyes first.',
+        actions: [{ label: 'Use my eyes', primary: true, run: () => this.selectSource('webcam') }],
+      });
+      return;
+    }
+    if (this.phase === 'calibrating' || this.calibration) return;
+    if (!this.currentModel()) {
+      this.recalibrate();
+      return;
+    }
+    if (this.sourceKind !== 'webcam' || this.phase !== 'running' || !this.source) {
+      this.toasts.show({ id: 'check', message: 'The camera is still getting ready. Try again in a moment.' });
+      return;
+    }
+    void this.recalibrateInPlace('check');
+  }
+
+  /** Recalibrates (or refreshes, or checks) without restarting the camera; gaze processing pauses meanwhile. */
+  private async recalibrateInPlace(mode: CalibrationMode): Promise<void> {
     const gen = this.sourceGen;
     const source = this.source;
     // Only a live webcam session can be recalibrated in place: a stale 'Refresh now' toast
@@ -1519,14 +1850,14 @@ export class AppController {
     this.offSample?.();
     this.offSample = null;
     source.stop();
-    let ok = false;
+    let outcome: CalibrationOutcome | null = null;
     try {
-      ok = await this.calibrate(mode, gen);
+      outcome = await this.calibrate(mode, gen);
     } catch (err) {
       console.error('[app] calibration failed', err);
     }
     if (gen !== this.sourceGen || this.destroyed) return;
-    if (!ok) {
+    if (!outcome) {
       this.teardownSource();
       this.setIdlePhase();
       return;
@@ -1534,20 +1865,68 @@ export class AppController {
     this.offSample = source.onSample(this.onSample);
     await source.start();
     if (gen !== this.sourceGen || this.destroyed) return;
-    // A new model means a new drift estimate: start the reading model fresh.
-    this.resetPipeline(true);
-    if (this.layout) this.lineTracker.setLayout(this.layout, 'initial');
+    this.afterCalibration(outcome, 'in-place');
     this.setPhase('running');
+  }
+
+  /** Tells the reader how the accuracy check went, in a line (the overlay showed the details). */
+  private reportAccuracyCheck(check: AccuracyCheckResult | null): void {
+    if (!check) return;
+    const b = check.before;
+    // The same measurement the overlay judged (offsetVerdict), so the toast agrees with its badge.
+    const xFrac = b.offsetXFrac ?? (window.innerWidth > 0 ? b.offsetXPx / window.innerWidth : 0);
+    const view = accuracyCheckView({
+      meanErrorPx: b.meanErrorPx,
+      offsetXPx: b.offsetXPx,
+      offsetYPx: b.offsetYPx,
+      offsetYLines: b.offsetYLines,
+      ...(Number.isFinite(xFrac) ? { offsetXFrac: xFrac } : {}),
+      ...(b.maxDotYLines !== undefined && Number.isFinite(b.maxDotYLines) ? { maxDotYLines: b.maxDotYLines } : {}),
+      applied: check.applied,
+    });
+    const change = check.lightingChange;
+    const light = change?.changed && change.text ? ` The light has changed since calibration: ${change.text}.` : '';
+    // The reader chose "Done" on an offset worth correcting: the fix stays one click away.
+    const actions: ToastAction[] = view.offerTouchUp
+      ? [{ label: 'Refresh now', primary: true, run: () => this.touchUp() }]
+      : view.offerRecalibrate
+        ? [{ label: 'Recalibrate', primary: true, run: () => this.recalibrate() }]
+        : [];
+    this.toasts.show({
+      id: 'check',
+      tone: view.tone,
+      title: view.title,
+      message: `${view.message}${light}`,
+      actions,
+      durationMs: actions.length > 0 ? 15_000 : 9000,
+    });
+    this.deweySay(view.quip, 'normal', view.tone === 'success' ? 'happy' : 'thinking');
   }
 
   private forgetCalibration(): void {
     clearCalibration();
     this.model = null;
     this.savedCalibration = false;
+    this.applyEnvironment(null);
     if (this.sourceKind === 'webcam') {
       this.webcamHold = { reason: 'uncalibrated' };
       this.syncSource();
     }
+  }
+
+  /**
+   * The saved calibration was made by an earlier tracker (1.0 read vertical gaze from the lids,
+   * which light moves). Notes that (the "not calibrated" toast then says "Please recalibrate
+   * once"), and says so the first time. True only on that first, explaining visit: the caller then
+   * asks before calibrating (showNotCalibrated) instead of starting a minute of dots unannounced.
+   */
+  private explainUpgradeIfNeeded(): boolean {
+    if (!savedCalibrationNeedsUpgrade()) return false;
+    this.upgradePending = true;
+    if (readJSON<unknown>(UPGRADE_EXPLAINED_KEY, null) !== null) return false;
+    writeJSON(UPGRADE_EXPLAINED_KEY, { at: Date.now() });
+    this.deweySay('trackerUpgraded', 'high', 'happy');
+    return true;
   }
 
   private schedulePreload(): void {
@@ -1580,6 +1959,222 @@ export class AppController {
           ? 'A quick 5-dot refresh keeps page turns accurate.'
           : 'Fullscreen or a toolbar moved the page. A quick 5-dot refresh keeps page turns accurate.',
       actions: [{ label: 'Refresh now', primary: true, run: () => void this.recalibrateInPlace('quick') }],
+    });
+  }
+
+  // ─────────────────────────── Lighting & guidance ───────────────────────────
+  // Light changes how open the eyes are (a squint in bright light or glare, wide eyes in dim
+  // light), and that moves webcam gaze by lines. Two watchers look for it on the camera frames:
+  // LightingWatch compares the light with the calibration's, AppearanceMonitor watches the
+  // eyelids. Either one reports an 'appearance-changed', which makes the line tracker re-learn
+  // its vertical offset; a changed light (or a large offset held for a while) also earns a
+  // rate-limited offer of the 5-dot touch-up, shown only when the reader pauses.
+
+  private readonly onCameraFrame = (frame: FeatureFrame): void => {
+    this.recorder.frame(frame);
+    if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !this.session || document.hidden) return;
+    this.lightingWatch.onFrame(frame);
+    const model = this.model ?? null;
+    const f = frame.faceFound ? frame.features : null;
+    let gazeYNorm: number | null = null;
+    if (model && f && model.viewport.height > 0) {
+      let p: { x: number; y: number } | null = null;
+      try {
+        p = model.predict(f);
+      } catch {
+        p = null;
+      }
+      // The model reads no lid features, so its y is a fair "where the eyes look" for the lid baseline.
+      if (p && Number.isFinite(p.y)) gazeYNorm = p.y / model.viewport.height;
+    }
+    const change = this.appearance.update({ t: frame.t, features: f, quality: frame.quality, gazeYNorm });
+    if (change) this.cameraChange(change.t, 'lids', `${change.direction} eyes (${change.channel}, z ${change.z.toFixed(1)})`, frame.t);
+    if (this.debug.visible && frame.t - this.lastAppearanceDebugAt >= APPEARANCE_DEBUG_MS) {
+      this.lastAppearanceDebugAt = frame.t;
+      this.debug.showAppearance({
+        state: this.appearance.state,
+        residualZ: this.appearance.residualZ,
+        squintZ: this.appearance.squintZ,
+        levelVsCalibration: this.appearance.levelVsCalibration,
+      });
+    }
+  };
+
+  /** The camera stopped: forget this session's lighting window and eyelid history. */
+  private stopConditionWatch(): void {
+    this.lightingWatch.reset();
+    this.appearance.reset();
+    this.sustainedFlags.reset();
+    this.pendingCoach = null;
+    this.lightingEpisodeOffered = false; // the watch starts over
+    if (this.pendingOffer?.reason === 'lighting') this.pendingOffer = null;
+    if (this.lightingState) {
+      this.lightingState = null;
+      this.bus.emit('lighting-state', { flags: [], distance: null, changedSinceCalibration: false, dominant: null });
+    }
+    this.debug.showAppearance(null);
+  }
+
+  /** About once a second while the webcam runs: the 'lighting-state' event, changes, coaching. */
+  private tickLighting(now: number): void {
+    if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration) return;
+    const u = this.lightingWatch.tick(now);
+    if (!u) return;
+    this.lightingState = u.state;
+    this.bus.emit('lighting-state', u.state);
+    if (u.transition === 'changed' || u.transition === 'changed-again') {
+      // 'changed-again': already changed, and now as much again (a lamp, then the overhead light
+      // off). The bias moved again, so the reading layer re-learns it; still one offer per episode.
+      const d = u.comparison ? ` D ${u.comparison.distance.toFixed(2)}` : '';
+      const what = u.transition === 'changed' ? 'light changed since calibration' : 'light changed again';
+      this.cameraChange(u.changedAt ?? now, 'lighting', `${what} (${u.state.dominant ?? 'unknown'}${d})`, now);
+    } else if (u.transition === 'restored') {
+      // Back to the calibration's light: the gaze bias goes back too.
+      this.cameraChange(now - LIGHTING_HOLD_MS, 'lighting', 'light back to the calibration’s', now);
+      if (this.pendingOffer?.reason === 'lighting') this.pendingOffer = null;
+      this.lightingEpisodeOffered = false;
+    }
+    // A changed light stays a reason for the quick refresh until it has been offered once: the
+    // gate may be closed right now (settling in, just calibrated, snoozed), so ask again each tick.
+    // requestOffer does nothing while an offer is pending or the gate is closed.
+    if (u.state.changedSinceCalibration && !this.lightingEpisodeOffered) this.requestOffer({ reason: 'lighting', since: now });
+    const flag = coachFlag(this.sustainedFlags.update(now, u.state.flags));
+    if (flag && !this.guidance.hasCoached && this.pendingCoach === null) this.pendingCoach = flag;
+  }
+
+  /**
+   * A change the camera saw (eyelids, lighting). One physical change is often seen by both
+   * watchers seconds apart; it is reported (and re-learned) once.
+   */
+  private cameraChange(onset: number, reason: 'lids' | 'lighting', detail: string, now: number): void {
+    if (!this.changeFilter.accept(reason, onset, now)) return;
+    this.bus.emit('appearance-changed', { t: onset, reason, detail });
+  }
+
+  /** Any 'appearance-changed' (camera, refresh): the line tracker keeps the line and re-learns the offset. */
+  private onAppearanceChanged(c: AppEvents['appearance-changed']): void {
+    if (!Number.isFinite(c.t)) return;
+    this.lineTracker.appearanceChangedAt(c.t);
+    this.recordInput({ k: 'appearance', t: performance.now(), at: c.t });
+    this.driftWatch.reset();
+  }
+
+  private requestOffer(offer: TouchUpOffer): void {
+    if (this.sourceKind !== 'webcam' || !this.session || this.pendingOffer) return;
+    if (!this.guidance.mayOffer(offer.since)) return;
+    this.pendingOffer = offer;
+  }
+
+  /**
+   * Delivers pending guidance when the reader isn't reading a line: right after a page turn, or
+   * during a pause of a few seconds. Called from the heartbeat and on every page turn.
+   */
+  private pollGuidance(now: number): void {
+    if (!this.session || this.screen !== 'reader' || this.modalOpen() || this.calibration || document.hidden) return;
+    const offer = this.pendingOffer;
+    if (offer) {
+      if (now - offer.since > OFFER_TTL_MS || this.sourceKind !== 'webcam' || this.phase !== 'running' || !this.guidance.mayOffer(now)) {
+        this.pendingOffer = null;
+      } else if (this.guidance.isPause(now)) {
+        this.pendingOffer = null;
+        this.showTouchUpOffer(offer, now);
+        return; // one thing at a time
+      }
+    }
+    const coach = this.pendingCoach;
+    if (coach && this.guidance.isPause(now)) {
+      this.pendingCoach = null;
+      if (this.guidance.hasCoached || this.sourceKind !== 'webcam') return;
+      this.guidance.noteCoached();
+      const key: QuipKey = coach === 'backlit' ? 'lightBacklit' : coach === 'glare' ? 'lightGlare' : 'lightDark';
+      // Through Dewey only when he will say a normal-priority line ('quiet' drops it): the
+      // once-per-book budget above must buy something the reader sees.
+      const s = this.store.get();
+      if (s.buddyEnabled && chattinessAllows(s.buddyChattiness, 'normal')) this.deweySay(key, 'normal', 'thinking');
+      else {
+        const text = this.quips.pick(key);
+        if (text) this.toasts.show({ id: 'light-coach', message: text });
+      }
+    }
+  }
+
+  private showTouchUpOffer(offer: TouchUpOffer, now: number): void {
+    this.guidance.noteOffered(now);
+    const lighting = offer.reason === 'lighting';
+    // One offer per lighting episode; set when shown, so an offer dropped unshown can come back.
+    if (lighting) this.lightingEpisodeOffered = true;
+    const dir = (offer.direction ?? 0) > 0 ? 'low' : 'high';
+    this.deweySay(lighting ? 'lightChanged' : 'driftOffer', 'normal', 'thinking');
+    this.toasts.show({
+      id: 'touch-up',
+      title: lighting ? 'The light changed' : 'Tracking has drifted',
+      message: lighting
+        ? 'A quick 5-dot refresh keeps page turns accurate.'
+        : `Your gaze has been reading about ${formatLines(offer.lines ?? 1.5)} too ${dir}. A quick 5-dot refresh keeps page turns accurate.`,
+      actions: [
+        { label: 'Refresh now', primary: true, run: () => this.touchUp() },
+        { label: 'Not now', run: () => this.guidance.snooze(performance.now()) },
+      ],
+      durationMs: 15_000,
+    });
+  }
+
+  /** Dewey says a line from his repertoire (QUIPS); returns it, or null when there was none. */
+  private deweySay(key: QuipKey, priority: SpeechPriority, mood?: BuddyMood): string | null {
+    const text = this.quips.pick(key);
+    if (text) this.bus.emit('buddy-say', { text, priority, ...(mood ? { mood } : {}) });
+    return text;
+  }
+
+  // ─────────────────────────────── Diagnostics ───────────────────────────────
+
+  private startRecording(): void {
+    if (IS_ARTIFACT || this.recorder.recording) return;
+    const now = performance.now();
+    const s = this.store.get();
+    this.recorder.start({
+      settings: s,
+      environment: describeEnvironment({ track: videoTrackOf(this.camera?.video), lightingBackend: this.camera?.lightingBackend ?? null }),
+      featureNames: FEATURE_NAMES,
+      model: this.model ?? null,
+      report: this.lastReport,
+    });
+    // The replay starts from what the pipeline is configured with now.
+    this.recorder.input({ k: 'configure', t: now, sensitivity: s.sensitivity, glanceDownToTurn: s.glanceDownToTurn });
+    if (this.layout) this.recorder.layout(this.layout, 'initial', now);
+    this.topbar.setRecording(true);
+    this.settingsPanel.refreshDiagnostics();
+  }
+
+  private stopRecording(download: boolean): void {
+    if (!this.recorder.recording) {
+      if (download) this.downloadRecording();
+      return;
+    }
+    this.recorder.stop('user');
+    this.topbar.setRecording(false);
+    if (download) this.downloadRecording();
+    this.settingsPanel.refreshDiagnostics();
+  }
+
+  private downloadRecording(): void {
+    if (IS_ARTIFACT) return; // no downloads in the Artifact frame (and no recorder UI)
+    const rec = this.recorder.toJSON();
+    if (!rec) return;
+    if (downloadRecording(rec)) this.toasts.show({ id: 'diagnostics', tone: 'success', message: 'Diagnostics saved as a JSON file (numbers only, no video).' });
+    else this.toasts.show({ id: 'diagnostics', tone: 'error', message: 'The diagnostics file couldn’t be saved.' });
+  }
+
+  /** The 10-minute limit stopped the recording. */
+  private onRecordingLimit(): void {
+    this.topbar.setRecording(false);
+    this.settingsPanel.refreshDiagnostics();
+    this.toasts.show({
+      id: 'diagnostics',
+      title: 'Diagnostics recorded',
+      message: 'Ten minutes of tracking numbers (no video) are ready to save.',
+      actions: [{ label: 'Download', primary: true, run: () => this.downloadRecording() }],
+      durationMs: 0,
     });
   }
 
@@ -1644,8 +2239,27 @@ export class AppController {
       // Emitted synchronously by ScrollController.turnPage, while `turning` is set.
       this.bus.on('page-turn', ({ to }) => {
         if (this.turning) this.turnTarget = to;
+        // The eyes travel back up the page anyway: a moment guidance may use.
+        const now = performance.now();
+        this.guidance.notePageTurn(now);
+        this.pollGuidance(now);
       }),
+      this.bus.on('line-estimate', (e) => this.driftCorrection.noteEstimate(e)),
+      this.bus.on('calibration', ({ phase }) => {
+        this.lastCalibrationPhase = phase;
+        // A new calibration starts the drift over; Dewey's eyes shouldn't keep correcting for the old one.
+        if (phase === 'start') this.driftCorrection.reset();
+      }),
+      this.bus.on('appearance-changed', (c) => this.onAppearanceChanged(c)),
     );
+    // Diagnostics: the events a recording keeps (no-ops unless recording).
+    for (const type of RECORDED_EVENTS) {
+      this.unsubs.push(
+        this.bus.on(type, (data) => {
+          if (this.recorder.recording) this.recorder.event(type, data, performance.now());
+        }),
+      );
+    }
   }
 
   private runCommand(name: CommandName): void {
@@ -1696,6 +2310,9 @@ export class AppController {
         this.help.toggle();
         this.syncModalState();
         break;
+      case 'check-accuracy':
+        this.checkAccuracy();
+        break;
     }
   }
 
@@ -1708,6 +2325,11 @@ export class AppController {
 
   private onSettingsChanged(s: AppSettings, changed: readonly (keyof AppSettings)[]): void {
     const any = (keys: readonly (keyof AppSettings)[]): boolean => keys.some((k) => changed.includes(k));
+    if (this.recorder.recording) {
+      const patch: Partial<AppSettings> = {};
+      for (const k of changed) Object.assign(patch, { [k]: s[k] });
+      this.recorder.settingsChanged(patch, performance.now());
+    }
     if (any(['theme', 'fontFamily'])) this.applyTheme();
     if (any(TYPOGRAPHY_KEYS)) {
       // The text reflows: stored undo offsets would point at unrelated text.
@@ -1717,10 +2339,14 @@ export class AppController {
     }
     if (any(['sensitivity', 'glanceDownToTurn'])) {
       this.pageEnd.configure({ sensitivity: s.sensitivity, glanceDownToTurn: s.glanceDownToTurn });
+      this.recordInput({ k: 'configure', t: performance.now(), sensitivity: s.sensitivity, glanceDownToTurn: s.glanceDownToTurn });
     }
     if (changed.includes('autoScroll')) {
       // Resuming shouldn't fire on a dwell that built up while paused.
-      if (s.autoScroll) this.pageEnd.reset();
+      if (s.autoScroll) {
+        this.pageEnd.reset();
+        this.recordInput({ k: 'page-end-reset', t: performance.now() });
+      }
       this.refreshTracking(performance.now());
     }
     if (changed.includes('gazeSource')) {

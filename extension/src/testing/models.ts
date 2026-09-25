@@ -2,11 +2,13 @@
  * A tiny, exactly predictable gaze model for tests: x = 500 + 100·f[0],
  * y = 400 + 100·f[1] (viewport px at the calibration zoom).
  */
-import type { EyeFeatures } from '../../../src/types';
+import type { CalibrationEnvironment, EyeFeatures } from '../../../src/types';
 import { RidgeGazeModel, featureSignature } from '../../../src/gaze/calibrationModel';
 import { FEATURE_NAMES } from '../../../src/gaze/features';
 
-export function linearGazeModel(opts: { trainedAt?: number; viewport?: { width: number; height: number } } = {}): RidgeGazeModel {
+export function linearGazeModel(
+  opts: { trainedAt?: number; viewport?: { width: number; height: number }; environment?: CalibrationEnvironment | null } = {},
+): RidgeGazeModel {
   const n = FEATURE_NAMES.length;
   const zeros = () => new Float64Array(n);
   const ones = () => new Float64Array(n).fill(1);
@@ -31,6 +33,7 @@ export function linearGazeModel(opts: { trainedAt?: number; viewport?: { width: 
     origin: { x: 0, y: 0 },
     adjust: { sx: 1, ox: 0, sy: 1, oy: 0 },
     trainedAt: opts.trainedAt ?? 1_700_000_000_000,
+    environment: opts.environment ?? null,
   });
 }
 

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import type { FaceLandmarkerOptions } from '@mediapipe/tasks-vision';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { FeatureFrame } from '../types';
+import type { EyeFeatures, FeatureFrame, LightingStats } from '../types';
 import type { CameraHandle, OpenCameraOptions } from './camera';
 import {
   CameraFeatureSource,
@@ -15,10 +15,14 @@ import {
   type VisionModuleLike,
 } from './faceTracker';
 import type { LandmarkLike } from './features';
+import { LightingProbe, type LightingBackend, type LightingProbeLike, type LightingSource } from './lighting';
+import { FakeCanvas, FakeVideoFrame, renderScene, type FrameRegistry } from './lightingTestScene';
 
 // ─────────────────────────────── helpers ───────────────────────────────
 
 const FRAME_MS = 1000 / 30;
+/** The real clock, captured before the fake timers replace performance.now (for cost measurements). */
+const realNow: () => number = performance.now.bind(performance);
 const INPUT = {} as TexImageSource;
 
 interface Deferred<T> {
@@ -109,7 +113,14 @@ function fakeCamera(video: HTMLVideoElement) {
   return { handle, track, stop };
 }
 
-function harness(opts: { camera?: Deferred<CameraHandle>; model?: Deferred<LandmarkerHandle>; backgroundProcessing?: boolean } = {}) {
+function harness(
+  opts: {
+    camera?: Deferred<CameraHandle>;
+    model?: Deferred<LandmarkerHandle>;
+    backgroundProcessing?: boolean;
+    createLightingProbe?: () => LightingProbeLike | null;
+  } = {},
+) {
   const { video, state } = fakeVideo();
   const cam = fakeCamera(video);
   const lm = new FakeHandle();
@@ -117,7 +128,7 @@ function harness(opts: { camera?: Deferred<CameraHandle>; model?: Deferred<Landm
   const loadLandmarker = vi.fn(() => opts.model?.promise ?? Promise.resolve<LandmarkerHandle>(lm));
   const src = new CameraFeatureSource(
     { wasmBaseUrl: 'https://app.test/mediapipe/wasm', backgroundProcessing: opts.backgroundProcessing ?? false },
-    { openCamera, loadLandmarker },
+    { openCamera, loadLandmarker, ...(opts.createLightingProbe ? { createLightingProbe: opts.createLightingProbe } : {}) },
   );
   const frames: FeatureFrame[] = [];
   src.onFrame((f) => frames.push(f));
@@ -729,5 +740,217 @@ describe('CameraFeatureSource', () => {
     expect(h.src.running).toBe(true);
     h.src.stop();
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+// ─────────────────────────────── lighting ───────────────────────────────
+
+const STATS: LightingStats = {
+  faceLuma: 0.5,
+  faceLin: 0.2,
+  faceRange: 1.5,
+  faceClip: 0,
+  frameLin: 0.18,
+  bgLin: 0.18,
+  bgClip: 0,
+  scleraR: 0.3,
+  scleraL: 0.3,
+  backlight: 1.2,
+  side: 0.1,
+  shade: -0.8,
+  glareR: 0.001,
+  glareL: 0.001,
+  irisGlintR: 0,
+  irisGlintL: 0,
+  facePx: 5000,
+};
+
+/** A probe that hands out stats on every `every`-th frame and records what it was given. */
+class FakeProbe implements LightingProbeLike {
+  backend: LightingBackend = 'copy';
+  readonly calls: { source: LightingSource; closedAtCall: boolean | null; features: EyeFeatures | null; quality: number; t: number }[] = [];
+  resets = 0;
+  disposed = 0;
+  throwing = false;
+  constructor(private readonly every = 5) {}
+  maybeMeasure(source: LightingSource, _landmarks: readonly LandmarkLike[], features: EyeFeatures | null, quality: number, t: number): void {
+    if (this.throwing) throw new Error('probe bug');
+    const closed = (source as { closed?: unknown }).closed;
+    this.calls.push({ source, closedAtCall: typeof closed === 'boolean' ? closed : null, features, quality, t });
+  }
+  take(): LightingStats | undefined {
+    return this.calls.length % this.every === 0 ? { ...STATS } : undefined;
+  }
+  reset(): void {
+    this.resets++;
+  }
+  dispose(): void {
+    this.disposed++;
+  }
+}
+
+function trackProcessor(): { enqueue: (f: object) => void } {
+  let controller!: ReadableStreamDefaultController<VideoFrame>;
+  class FakeProcessor {
+    readonly readable = new ReadableStream<VideoFrame>({
+      start(c) {
+        controller = c;
+      },
+    });
+  }
+  Object.assign(globalThis, { MediaStreamTrackProcessor: FakeProcessor });
+  return { enqueue: (f) => controller.enqueue(f as VideoFrame) };
+}
+
+/** A closable frame stand-in that records when the tracker closes it. */
+function closableFrame(): { displayWidth: number; displayHeight: number; closed: boolean; close: () => void } {
+  const f = {
+    displayWidth: 640,
+    displayHeight: 480,
+    closed: false,
+    close: () => {
+      f.closed = true;
+    },
+  };
+  return f;
+}
+
+describe('CameraFeatureSource lighting', () => {
+  it('attaches lighting only to frames with a fresh measurement (video path)', async () => {
+    const probe = new FakeProbe(5);
+    const h = harness({ createLightingProbe: () => probe });
+    await h.src.start();
+    vi.advanceTimersByTime(1000);
+    h.src.stop();
+    const withLighting = h.frames.filter((f) => f.lighting);
+    expect(h.frames.length).toBeGreaterThan(25);
+    expect(withLighting.length).toBe(Math.floor(probe.calls.length / 5));
+    expect(withLighting[0].lighting).toEqual(STATS);
+    expect(probe.calls.every((c) => c.source === h.video)).toBe(true);
+    expect(probe.calls[0].quality).toBe(h.frames[0].quality);
+    expect(probe.calls[0].features).toBe(h.frames[0].features);
+    expect(h.src.lightingBackend).toBe('copy');
+    expect(probe.resets).toBe(1); // stop() drops pending work
+  });
+
+  it('hands the probe the VideoFrame before the driver closes it', async () => {
+    const probe = new FakeProbe(1);
+    const tp = trackProcessor();
+    const h = harness({ backgroundProcessing: true, createLightingProbe: () => probe });
+    await h.src.start();
+    const frames = Array.from({ length: 4 }, closableFrame);
+    for (const f of frames) {
+      tp.enqueue(f);
+      await flush();
+    }
+    expect(probe.calls.map((c) => c.source)).toEqual(frames);
+    expect(probe.calls.every((c) => c.closedAtCall === false)).toBe(true);
+    expect(frames.every((f) => f.closed)).toBe(true);
+    expect(h.frames.every((f) => f.lighting)).toBe(true);
+    h.src.stop();
+  });
+
+  it('keeps tracking when the probe throws, and drops the probe for good', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const probe = new FakeProbe(1);
+    probe.throwing = true;
+    const h = harness({ createLightingProbe: () => probe });
+    await h.src.start();
+    vi.advanceTimersByTime(500);
+    expect(h.frames.length).toBeGreaterThan(10);
+    expect(h.frames.every((f) => f.faceFound && f.features && !f.lighting)).toBe(true);
+    expect(probe.disposed).toBe(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(h.src.lightingBackend).toBe('off');
+    h.src.stop();
+    await h.src.start();
+    vi.advanceTimersByTime(200);
+    expect(warn).toHaveBeenCalledTimes(1); // not re-created
+    h.src.stop();
+  });
+
+  it('runs without lighting when the probe is turned off or cannot be built', async () => {
+    const makers: (() => LightingProbeLike | null)[] = [
+      () => null,
+      () => {
+        throw new Error('no probe');
+      },
+    ];
+    for (const make of makers) {
+      const h = harness({ createLightingProbe: make });
+      await h.src.start();
+      vi.advanceTimersByTime(300);
+      expect(h.frames.length).toBeGreaterThan(5);
+      expect(h.frames.some((f) => f.lighting)).toBe(false);
+      expect(h.src.lightingBackend).toBe('off');
+      h.src.stop();
+    }
+  });
+
+  it('measures real frames end to end in the extension path, closing every clone', async () => {
+    const scene = renderScene();
+    const registry: FrameRegistry = { clones: 0, closes: 0, copies: 0, open: new Set() };
+    const tp = trackProcessor();
+    const h = harness({
+      backgroundProcessing: true,
+      createLightingProbe: () => new LightingProbe({ backend: 'copy', createCanvas: (w, hh) => new FakeCanvas(w, hh, { created: [], draws: 0, reads: 0 }) }),
+    });
+    h.lm.result = { ...FACE_RESULT, faceLandmarks: [scene.landmarks] };
+    await h.src.start();
+    for (let i = 0; i < 60; i++) {
+      vi.advanceTimersByTime(FRAME_MS);
+      tp.enqueue(new FakeVideoFrame(scene, { format: 'NV12', fullRange: false, copy: 'resolve', rowPadding: 0 }, registry));
+      await flush();
+    }
+    const lit = h.frames.filter((f) => f.lighting);
+    expect(lit.length).toBeGreaterThanOrEqual(10); // 2 s at ≈ 6.7 Hz
+    expect(lit.length).toBeLessThanOrEqual(14);
+    expect(lit[0].lighting!.scleraR).toBeGreaterThan(0.5);
+    expect(registry.open.size).toBe(0); // originals closed by the driver, clones by the probe
+    expect(registry.clones).toBe(lit.length);
+    h.src.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('adds little synchronous work per frame (measured with fakes)', async () => {
+    const scene = renderScene();
+    const run = async (withProbe: boolean): Promise<{ perFrameUs: number; lit: number }> => {
+      const tp = trackProcessor();
+      const h = harness({
+        backgroundProcessing: true,
+        createLightingProbe: () => (withProbe ? new LightingProbe({ backend: 'copy', createCanvas: null }) : null),
+      });
+      h.lm.result = { ...FACE_RESULT, faceLandmarks: [scene.landmarks] };
+      // From the end of detection to the frame reaching listeners: features + lighting + emit.
+      let detectDone = 0;
+      const inner = h.lm.detect.bind(h.lm);
+      h.lm.detect = (input: TexImageSource, t: number): FaceResultLike => {
+        const r = inner(input, t);
+        detectDone = realNow();
+        return r;
+      };
+      let total = 0;
+      h.src.onFrame(() => {
+        total += realNow() - detectDone;
+      });
+      await h.src.start();
+      const N = 600;
+      for (let i = 0; i < N; i++) {
+        vi.advanceTimersByTime(FRAME_MS);
+        tp.enqueue(new FakeVideoFrame(scene, { format: 'NV12', fullRange: false, copy: 'resolve', rowPadding: 0 }));
+        await flush();
+      }
+      h.src.stop();
+      return { perFrameUs: (total / N) * 1000, lit: h.frames.filter((f) => f.lighting).length };
+    };
+    await run(true); // warm up
+    const off = await run(false);
+    const on = await run(true);
+    const added = on.perFrameUs - off.perFrameUs;
+    console.info(
+      `[faceTracker lighting cost] per frame: ${off.perFrameUs.toFixed(1)} µs without, ${on.perFrameUs.toFixed(1)} µs with the probe (+${added.toFixed(1)} µs; ${on.lit} measurements in 600 frames)`,
+    );
+    expect(on.lit).toBeGreaterThan(100);
+    expect(added).toBeLessThan(100); // µs per frame on average; a frame at 30 fps lasts 33 000 µs
   });
 });

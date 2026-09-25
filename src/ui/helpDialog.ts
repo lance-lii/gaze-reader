@@ -197,6 +197,8 @@ function pick(state: Parameters<typeof statusPill>[0], kind: Parameters<typeof s
 const TIPS: readonly string[] = [
   'Sit about an arm’s length from the screen, facing the camera.',
   'Light your face from the front; a bright window behind you makes tracking harder.',
+  'Calibrate in the light you read in. When the light changes (a lamp on, the sun going down), the reader adjusts by itself, and offers a quick 5-dot refresh if it needs one.',
+  'Press A for an accuracy check: a few dots show how far off the tracking is, and you can correct it on the spot.',
   'Keep your head fairly still and let your eyes do the moving.',
   'Page turned too soon? Press U to undo it, or try the Relaxed sensitivity.',
   'If Dewey seems to look in the wrong place, recalibrate with C.',

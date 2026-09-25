@@ -16,6 +16,8 @@ export const KEYS = {
   cameraGrantedAt: 'gr.cameraGrantedAt',
   /** Extension-only settings (not part of the app's AppSettings): see ExtSettings. */
   extSettings: 'gr.ext.v1',
+  /** When the quick-refresh offer was last shown or snoozed, shared by every tab: see TouchUpRecord. */
+  touchUp: 'gr.touchUp.v1',
 } as const;
 
 export interface StorageAreaLike {
@@ -219,6 +221,42 @@ export async function clearCalibrationJSON(area: StorageAreaLike): Promise<void>
     await area.remove([KEYS.calibration]);
   } catch {
     /* nothing stored */
+  }
+}
+
+// ──────────────────────────── Quick-refresh offers ───────────────────────────
+
+/**
+ * Rate limit of the "lighting changed: quick 5-dot refresh?" offer (see
+ * touchUp.ts). Shared by every tab and page load, so reading one article after
+ * another doesn't bring the same question back on each. Date.now() ms; 0 = never.
+ */
+export interface TouchUpRecord {
+  offeredAt: number;
+  snoozedUntil: number;
+}
+
+export function parseTouchUpRecord(x: unknown): TouchUpRecord | null {
+  if (typeof x !== 'object' || x === null || Array.isArray(x)) return null;
+  const r = x as Record<string, unknown>;
+  const time = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
+  return { offeredAt: time(r.offeredAt), snoozedUntil: time(r.snoozedUntil) };
+}
+
+export async function loadTouchUpRecord(area: StorageAreaLike): Promise<TouchUpRecord | null> {
+  try {
+    return parseTouchUpRecord((await area.get([KEYS.touchUp]))[KEYS.touchUp]);
+  } catch {
+    return null;
+  }
+}
+
+export async function saveTouchUpRecord(area: StorageAreaLike, record: TouchUpRecord): Promise<boolean> {
+  try {
+    await area.set({ [KEYS.touchUp]: { offeredAt: record.offeredAt, snoozedUntil: record.snoozedUntil } });
+    return true;
+  } catch {
+    return false;
   }
 }
 

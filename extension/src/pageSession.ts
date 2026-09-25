@@ -7,13 +7,23 @@
  * gaze source (webcam frames relayed from the offscreen document, or the
  * mouse). `destroy()` releases the camera and removes every listener, timer
  * and element it created.
+ *
+ * Lighting: the frames carry lighting numbers from the offscreen document.
+ * ConditionsWatch compares them, and the eyelids, with calibration; a change
+ * becomes 'appearance-changed' (the line tracker re-learns its vertical
+ * offset) and, rate-limited across tabs, an offer of the quick 5-dot refresh.
+ * A large offset the tracker has learned leads to the same offer. The
+ * accuracy check (popup, Alt+Shift+A) measures the offset on 5 dots and can
+ * correct it.
  */
 import type {
   AppSettings,
   CommandName,
+  FeatureFrame,
   GazeSample,
   GazeSource,
   LayoutChangeReason,
+  LineEstimate,
   LineLayout,
   Mountable,
   SpeechPriority,
@@ -27,7 +37,7 @@ import { IGNORE_ATTR } from '../../src/core/constants';
 import { WebcamGazeSource } from '../../src/gaze/webcamGazeSource';
 import { MouseGazeSource } from '../../src/gaze/mouseGazeSource';
 import { FEATURE_NAMES } from '../../src/gaze/features';
-import { CalibrationOverlay } from '../../src/ui/calibrationOverlay';
+import { CalibrationOverlay, type CalibrationMode } from '../../src/ui/calibrationOverlay';
 import { FixationDetector } from '../../src/signal/fixations';
 import { LineTracker } from '../../src/reading/lineTracker';
 import { PageEndDetector, lastFullyVisibleLine } from '../../src/reading/pageEndDetector';
@@ -43,16 +53,24 @@ import {
   loadCalibrationJSON,
   loadExtSettings,
   loadSettings,
+  loadTouchUpRecord,
   makeOrigin,
   parseExtSettings,
+  parseTouchUpRecord,
   saveCalibrationJSON,
+  saveTouchUpRecord,
   syncSettings,
   watchKey,
   type ExtSettings,
   type ExtStorage,
+  type TouchUpRecord,
 } from './extStorage';
+import { MODEL_COMPAT, OUTDATED_CALIBRATION_TEXT, calibrationStatus, type CalibrationStatus } from './calibrationStatus';
+import { ConditionsWatch, type ConditionsUpdate, type LightingChange, type LightingState } from './conditions';
+import { lightingTip } from './lightingTips';
 import { findMainContent } from './findMainContent';
 import type { PageCommand, PageState } from './messages';
+import type { PageExtraCommand, PageExtraState } from './pageExtras';
 import { findScroller, isWindow, readingViewport, scrollMetrics, type Scroller } from './pageGeometry';
 import {
   PageModeMonitor,
@@ -69,6 +87,7 @@ import { PagePill } from './pagePill';
 import type { PortLike } from './ports';
 import { RemoteFeatureSource, RemoteTrackerError, type RemoteSourceStatus } from './remoteFeatureSource';
 import { isTypingContext, matchShortcut, type ShortcutAction } from './shortcuts';
+import { TouchUpAdvisor, type TouchUpOffer } from './touchUp';
 import { zoomAware, zoomAwareFromJSON, type ZoomAwareGazeModel } from './zoomModel';
 
 export const HOST_TAG = 'gaze-reader-root';
@@ -76,10 +95,19 @@ export const HOST_TAG = 'gaze-reader-root';
 const HOST_Z_INDEX = '2147483647';
 /** Grace beyond scrollDurationMs before a stalled page-turn animation is finished instantly. */
 const SCROLL_RESCUE_MS = 1_500;
-/** A calibration saved by a build with different features is useless; reject it on load. */
-const MODEL_COMPAT = { featureNames: FEATURE_NAMES } as const;
 /** Tracking-state detail while the webcam waits for a first calibration. */
 const NOT_CALIBRATED = 'Not calibrated yet';
+/** …or for a new one, because the stored calibration came from an older Gaze Reader. */
+const CALIBRATION_OUTDATED = 'Recalibrate once (upgraded)';
+/**
+ * The line tracker's learned gaze offset is carried over (softened) when the
+ * camera restarts or Gaze Reader is turned on again on this page, with the
+ * same calibration, if it last learned within this long. Longer breaks are
+ * likely to come with different light or posture.
+ */
+const KEEP_DRIFT_MS = 30 * 60_000;
+/** How long a quick-refresh offer stays up if the reader ignores it. */
+const TOUCH_UP_NOTICE_MS = 30_000;
 /** How often Dewey hears how far through the page the reader is. */
 const PROGRESS_EVERY_MS = 5_000;
 /**
@@ -97,6 +125,31 @@ let pageModeExplained = false;
 /** Tests: forget that Dewey already explained page mode on this "page load". */
 export function resetPageModeNotice(): void {
   pageModeExplained = false;
+}
+
+/** Which calibration a line tracker's learned drift belongs to, and when it last learned (performance.now()). */
+interface DriftOwner {
+  trainedAt: number;
+  at: number;
+}
+
+/**
+ * The line tracker of the last webcam session on this page. Turning Gaze
+ * Reader off and on again (same page, same calibration, within KEEP_DRIFT_MS)
+ * then starts from the gaze offset it had learned instead of from zero.
+ */
+let keptTracker: { tracker: LineTracker; owner: DriftOwner } | null = null;
+
+/** Tests: forget the tracker kept from an earlier session on this "page load". */
+export function resetKeptTracker(): void {
+  keptTracker = null;
+}
+
+function takeKeptTracker(model: ZoomAwareGazeModel | null): { tracker: LineTracker; owner: DriftOwner } | null {
+  const kept = keptTracker;
+  keptTracker = null;
+  if (!kept || !model || kept.owner.trainedAt !== model.trainedAt) return null;
+  return performance.now() - kept.owner.at < KEEP_DRIFT_MS ? kept : null;
 }
 
 export interface PageSessionDeps {
@@ -138,12 +191,14 @@ const CAMERA_ERROR_TEXT: Record<string, string> = {
 
 export class PageSession {
   static async start(deps: PageSessionDeps): Promise<PageSession> {
-    const [settings, calibration, ext] = await Promise.all([
+    const [settings, calibration, ext, touchUp] = await Promise.all([
       loadSettings(deps.storage.area),
       loadCalibrationJSON(deps.storage.area),
       loadExtSettings(deps.storage.area),
+      loadTouchUpRecord(deps.storage.area),
     ]);
-    const session = new PageSession(deps, settings, ext, calibration ? zoomAwareFromJSON(calibration, MODEL_COMPAT) : null);
+    const model = calibration ? zoomAwareFromJSON(calibration, MODEL_COMPAT) : null;
+    const session = new PageSession(deps, settings, ext, model, calibrationStatus(calibration), touchUp);
     try {
       session.boot();
     } catch (err) {
@@ -165,7 +220,9 @@ export class PageSession {
   private debugOverlay: DebugOverlay | null = null;
 
   private readonly fixations = new FixationDetector();
-  private readonly tracker = new LineTracker();
+  private readonly tracker: LineTracker;
+  /** Which calibration the tracker's learned drift belongs to (null: none learned under the webcam). */
+  private driftOwner: DriftOwner | null = null;
   private readonly pageEnd: PageEndDetector;
   private scroll: ScrollController | null = null;
   private scroller: Scroller | null = null;
@@ -188,11 +245,21 @@ export class PageSession {
   private sourceKind: SourceKind | null = null;
   private sourceGen = 0;
   private cameraRunning = false;
+  /** What the stored calibration was when this session started (or changed): 'outdated' gets explained. */
+  private calibrationState: CalibrationStatus;
   private calibration: CalibrationOverlay | null = null;
   private calibrationInterrupted = false;
   private calibrationDeclined = false;
-  private recalibrateWhenReady = false;
+  /** What to run once the camera is running: a (re)calibration, or the accuracy check / quick refresh. */
+  private runWhenReady: CalibrationMode | null = null;
   private awaitingPermission = false;
+
+  /** Lighting and eyelids compared with calibration (webcam only). */
+  private readonly conditions: ConditionsWatch;
+  private lighting: LightingState | null = null;
+  /** What moved when the light last changed since calibration (for the offer's wording); null while it hasn't. */
+  private lightingChange: LightingChange | null = null;
+  private readonly touchUp: TouchUpAdvisor;
 
   /** Tracking state before the reader's pause is applied. */
   private base: TrackingState = 'starting';
@@ -218,13 +285,27 @@ export class PageSession {
   private disposed = false;
   private buddyView: { from: AppSettings; view: AppSettings } | null = null;
 
-  private constructor(deps: PageSessionDeps, settings: AppSettings, ext: ExtSettings, model: ZoomAwareGazeModel | null) {
+  private constructor(
+    deps: PageSessionDeps,
+    settings: AppSettings,
+    ext: ExtSettings,
+    model: ZoomAwareGazeModel | null,
+    calibrationState: CalibrationStatus,
+    touchUp: TouchUpRecord | null,
+  ) {
     this.deps = deps;
     this.ext = ext;
     this.model = model;
+    this.calibrationState = model ? 'current' : calibrationState;
     // Never the page's localStorage: this store lives in memory and syncs with chrome.storage.local.
     this.store = createSettingsStore(this.bus, { persist: false, initial: settings });
     this.pageEnd = new PageEndDetector({ sensitivity: settings.sensitivity, glanceDownToTurn: settings.glanceDownToTurn });
+    const kept = takeKeptTracker(model);
+    this.tracker = kept?.tracker ?? new LineTracker();
+    this.driftOwner = kept?.owner ?? null;
+    this.conditions = new ConditionsWatch(model?.environment ?? null);
+    // A calibration made moments ago (in another tab, before following a link) is fresh here too.
+    this.touchUp = new TouchUpAdvisor({ record: touchUp, calibratedAt: model?.trainedAt ?? null });
   }
 
   // ─────────────────────────────── lifecycle ────────────────────────────────
@@ -258,6 +339,9 @@ export class PageSession {
 
     d.add(this.bus.on('settings-changed', ({ settings: s, changed }) => this.onSettingsChanged(s, changed)));
     d.add(this.bus.on('command', ({ name }) => this.command(name)));
+    // Whoever reports it (the lighting and eyelid watchers here, a quick refresh or accuracy check),
+    // the gaze bias may have jumped: the line tracker keeps the line and re-learns the offset.
+    d.add(this.bus.on('appearance-changed', ({ t }) => this.tracker.appearanceChangedAt(t)));
 
     let lastWidth = window.innerWidth;
     const onResize = debounce(d, () => {
@@ -278,6 +362,8 @@ export class PageSession {
     d.add(watchKey(this.deps.storage, KEYS.calibration, (value) => this.onStoredCalibration(value)));
     d.add(watchKey(this.deps.storage, KEYS.cameraGrantedAt, () => this.onPermissionGranted()));
     d.add(watchKey(this.deps.storage, KEYS.extSettings, (value) => (this.ext = parseExtSettings(value))));
+    // Another tab offered the quick refresh, or the reader said "Not now" there.
+    d.add(watchKey(this.deps.storage, KEYS.touchUp, (value) => this.touchUp.setRecord(parseTouchUpRecord(value))));
     d.interval(() => this.tick(), 1_000);
 
     d.add(() => {
@@ -317,6 +403,9 @@ export class PageSession {
     if (this.disposed) return;
     this.disposed = true;
     this.d.dispose();
+    // Turned off (not orphaned): a session started again on this page with the same calibration
+    // resumes from the gaze offset learned here.
+    if (this.driftOwner && this.deps.isContextValid()) keptTracker = { tracker: this.tracker, owner: this.driftOwner };
   }
 
   state(): PageState {
@@ -332,9 +421,23 @@ export class PageSession {
     };
   }
 
-  command(name: PageCommand | CommandName | ShortcutAction): void {
+  /** What the popup shows about the light, and whether the accuracy check can run here. */
+  extraState(): PageExtraState {
+    const webcamLive = !this.disposed && this.sourceKind === 'webcam' && this.cameraRunning;
+    const l = webcamLive ? this.lighting : null;
+    return {
+      lighting: l ? { flags: [...l.flags], changedSinceCalibration: l.changedSinceCalibration, dominant: l.dominant } : null,
+      canCheck: !this.disposed && this.getSettings().gazeSource === 'webcam' && this.model !== null && !this.calibration,
+    };
+  }
+
+  command(name: PageCommand | CommandName | ShortcutAction | PageExtraCommand): void {
     if (this.disposed) return;
     switch (name) {
+      case 'check-accuracy':
+        return this.runCheck('check');
+      case 'touch-up':
+        return this.runCheck('quick');
       case 'pause':
         return this.setPaused(true);
       case 'resume':
@@ -587,6 +690,9 @@ export class PageSession {
 
     const remote = this.ensureRemote();
     this.setBase('starting');
+    // A new camera session: the lighting and eyelid history starts over (the references stay).
+    this.conditions.reset();
+    this.lighting = null;
     try {
       await remote.start();
     } catch (err) {
@@ -602,10 +708,15 @@ export class PageSession {
     await webcam.start();
     if (gen !== this.sourceGen) return;
 
-    if (!this.model || this.recalibrateWhenReady) {
-      this.recalibrateWhenReady = false;
-      if (!this.model && this.calibrationDeclined) this.needCalibration();
-      else void this.calibrate();
+    const pending = this.runWhenReady;
+    this.runWhenReady = null;
+    if (!this.model) {
+      if (pending === 'standard') void this.calibrate('standard'); // the reader asked for it
+      else if (this.calibrationDeclined) this.needCalibration();
+      else if (this.calibrationState === 'outdated') this.explainOutdatedCalibration();
+      else void this.calibrate('standard');
+    } else if (pending) {
+      void this.calibrate(pending);
     } else {
       this.setBase('tracking');
       this.checkCalibrationViewport();
@@ -616,8 +727,43 @@ export class PageSession {
     if (this.remote) return this.remote;
     const remote = new RemoteFeatureSource({ connect: this.deps.connectPort, isContextValid: this.deps.isContextValid });
     this.d.add(remote.onStatus((s) => this.onRemoteStatus(s)));
+    this.d.add(remote.onFrame((frame) => this.onFrame(frame)));
     this.remote = remote;
     return remote;
+  }
+
+  /**
+   * Every camera frame (the gaze itself comes through WebcamGazeSource): the
+   * light and the eyelids, compared with calibration. Not while calibrating
+   * (the dots move the eyes to the screen's edges, and the overlay measures the
+   * light itself) and not without a model to compare with.
+   */
+  private onFrame(frame: FeatureFrame): void {
+    const model = this.model;
+    if (this.disposed || this.sourceKind !== 'webcam' || !this.cameraRunning || this.calibration || !model) return;
+    const gazeYNorm = frame.features ? model.gazeYNorm(frame.features) : null;
+    this.applyConditions(this.conditions.onFrame(frame, gazeYNorm));
+  }
+
+  private applyConditions(u: ConditionsUpdate): void {
+    if (u.lighting) {
+      this.lighting = u.lighting;
+      this.bus.emit('lighting-state', u.lighting);
+      if (this.base === 'poor') this.setBase('poor', this.poorDetail());
+    }
+    // The bus listener passes it on to the line tracker.
+    if (u.appearance) this.bus.emit('appearance-changed', u.appearance);
+    if (u.lightingChanged) this.lightingChange = u.lightingChanged;
+    // A changed light stays a reason for the quick refresh until it has been offered once: the
+    // advisor's gate may be closed right now (just calibrated, another tab's offer, snoozed), so
+    // ask again on every lighting update. The advisor makes one offer per episode.
+    if (u.lighting?.changedSinceCalibration && this.lightingChange) {
+      const offer = this.touchUp.lightingChanged(this.lightingChange.dominant, this.lightingChange.z);
+      if (offer) this.offerTouchUp(offer);
+    } else if (u.lighting && !u.lighting.changedSinceCalibration) {
+      this.lightingChange = null;
+      this.touchUp.noteLightingRestored();
+    }
   }
 
   private attachGaze(source: GazeSource): void {
@@ -671,7 +817,7 @@ export class PageSession {
   /** The camera is back (after a reconnect or restart): return to whatever the webcam path was doing. */
   private settleWebcamState(): void {
     if (this.calibration) this.setBase('calibrating');
-    else if (!this.model) this.setBase('paused', NOT_CALIBRATED);
+    else if (!this.model) this.setBase('paused', this.calibrationState === 'outdated' ? CALIBRATION_OUTDATED : NOT_CALIBRATED);
     else this.setBase('tracking');
   }
 
@@ -715,22 +861,47 @@ export class PageSession {
       return;
     }
     this.calibrationDeclined = false;
-    if (this.remote?.running && this.gaze) void this.calibrate();
+    this.whenCameraReady('standard');
+  }
+
+  /**
+   * The accuracy check ('check': 5 dots measure the offset; the reader may
+   * correct it) or the quick refresh ('quick': 5 dots re-centre the model).
+   * Both need a calibration to work on: without one, this is a calibration.
+   */
+  private runCheck(mode: 'check' | 'quick'): void {
+    if (this.disposed || this.calibration) return;
+    if (this.getSettings().gazeSource !== 'webcam') {
+      this.say('The accuracy check is for reading with the webcam.', 'high', 'thinking');
+      return;
+    }
+    if (!this.model) {
+      this.recalibrate();
+      return;
+    }
+    this.whenCameraReady(mode);
+  }
+
+  private whenCameraReady(mode: CalibrationMode): void {
+    if (this.remote?.running && this.gaze) void this.calibrate(mode);
     else {
-      this.recalibrateWhenReady = true;
+      this.runWhenReady = mode;
       void this.startSource();
     }
   }
 
-  private async calibrate(): Promise<void> {
+  private async calibrate(requested: CalibrationMode = 'standard'): Promise<void> {
     const remote = this.remote;
     if (this.calibration || this.disposed || !remote?.running) return;
+    const current = this.model;
+    const mode: CalibrationMode = current ? requested : 'standard';
     const overlay = new CalibrationOverlay({
       features: remote,
       bus: this.bus,
       video: null, // the camera lives in the offscreen document; positioning feedback comes from the features
-      mode: 'standard',
-      baseModel: this.model?.inner ?? null,
+      mode,
+      // The check measures the model as it is used here (zoom included); a correction is fitted on its core.
+      baseModel: mode === 'standard' ? (current?.inner ?? null) : current,
       featureNames: FEATURE_NAMES,
       // "≈ N lines" in the results uses this page's real line spacing.
       linePitchPx: () => this.layout?.linePitch,
@@ -755,13 +926,21 @@ export class PageSession {
     const sourceChanged = gen !== this.sourceGen; // tab hidden, or the reader switched source
 
     if (result) {
-      // Trained at this page's zoom; the wrapper records it so other sites map correctly.
-      this.model = zoomAware(result.model);
-      this.viewportWarned = false;
-      this.calibrationDeclined = false;
-      void saveCalibrationJSON(this.deps.storage.area, this.model.toJSON());
+      // Trained (or corrected) at this page's zoom; the wrapper records it so other sites map correctly.
+      this.adoptModel(zoomAware(result.model));
       if (sourceChanged) return;
-      this.resetPipeline();
+      // A tune-up or the check's "Correct it" re-centres the model in use and says so in `check`;
+      // without it this was a full calibration (asked for, or where a tune-up couldn't help).
+      if (mode === 'standard' || result.check === undefined) {
+        this.resetPipeline({ calibrated: true });
+      } else {
+        // The same reader, mid-page, with the offset just corrected: keep the line, re-learn the
+        // drift (the old one belongs to the uncorrected model).
+        const what = mode === 'check' ? 'accuracy check' : 'quick refresh';
+        this.bus.emit('appearance-changed', { t: performance.now(), reason: 'refresh', detail: `${what} corrected the offset` });
+        this.fixations.reset();
+        this.pageEnd.notifyScrolled(performance.now());
+      }
       this.setBase('tracking');
     } else if (sourceChanged || this.calibrationInterrupted) {
       // Whoever interrupted owns the state now: the new source, the camera-error
@@ -770,8 +949,22 @@ export class PageSession {
       this.calibrationDeclined = true;
       this.needCalibration();
     } else {
+      // Cancelled, or an accuracy check that left the model as it was.
+      this.fixations.reset();
+      this.pageEnd.notifyScrolled(performance.now());
       this.setBase('tracking');
     }
+  }
+
+  /** A new or corrected model: saved for every tab, and the new reference for the light and the eyelids. */
+  private adoptModel(model: ZoomAwareGazeModel): void {
+    this.model = model;
+    this.calibrationState = 'current';
+    this.viewportWarned = false;
+    this.calibrationDeclined = false;
+    this.conditions.setEnvironment(model.environment);
+    this.touchUp.noteCalibrated();
+    void saveCalibrationJSON(this.deps.storage.area, model.toJSON());
   }
 
   /** Cancel a running calibration for a reason other than the reader pressing Esc. */
@@ -782,6 +975,10 @@ export class PageSession {
   }
 
   private needCalibration(): void {
+    if (this.calibrationState === 'outdated') {
+      this.explainOutdatedCalibration();
+      return;
+    }
     this.setBase('paused', NOT_CALIBRATED);
     this.pill.notify({
       text: 'Webcam reading needs a one-minute calibration first.',
@@ -793,11 +990,40 @@ export class PageSession {
     });
   }
 
+  /**
+   * The stored calibration came from an older Gaze Reader, whose tracking read
+   * the eyelids (which light moves). Starting a calibration without a word
+   * would look like the extension forgot it, so say why and let the reader start it.
+   */
+  private explainOutdatedCalibration(): void {
+    this.setBase('paused', CALIBRATION_OUTDATED);
+    this.pill.notify({
+      text: OUTDATED_CALIBRATION_TEXT,
+      tone: 'info',
+      actions: [
+        { label: 'Calibrate', run: () => this.recalibrate() },
+        { label: 'Use the mouse', run: () => this.bus.emit('settings-patch', { gazeSource: 'mouse' }) },
+      ],
+    });
+    this.say('My eye tracking got an upgrade for changing light! One new calibration and we’re set.', 'high', 'excited');
+  }
+
+  /** Paused only because there is no usable calibration yet. */
+  private awaitingCalibration(): boolean {
+    return this.base === 'paused' && (this.detail === NOT_CALIBRATED || this.detail === CALIBRATION_OUTDATED);
+  }
+
   private onStoredCalibration(value: unknown): void {
     // Another tab calibrated, or the reader chose "Forget calibration" in the popup: pick it up.
     if (value === undefined) {
-      if (!this.model) return;
+      this.calibrationState = 'none';
+      if (!this.model) {
+        if (this.detail === CALIBRATION_OUTDATED && this.base === 'paused') this.needCalibration();
+        return;
+      }
       this.model = null;
+      this.conditions.setEnvironment(null);
+      this.lighting = null;
       // Reading on without a model would just look like "can't see your eyes".
       if (this.sourceKind === 'webcam' && this.cameraRunning && !this.calibration) {
         this.resetPipeline();
@@ -809,8 +1035,11 @@ export class PageSession {
     const model = zoomAwareFromJSON(value, MODEL_COMPAT);
     if (model && model.trainedAt !== this.model?.trainedAt) {
       this.model = model;
+      this.calibrationState = 'current';
       this.viewportWarned = false;
-      if (this.base === 'paused' && this.detail === NOT_CALIBRATED) {
+      this.conditions.setEnvironment(model.environment);
+      this.touchUp.noteCalibrated(Math.min(Date.now(), model.trainedAt));
+      if (this.awaitingCalibration()) {
         this.pill.notify(null);
         this.setBase('tracking');
       }
@@ -840,13 +1069,20 @@ export class PageSession {
     this.updateQuality(s);
     if (this.calibration) return;
 
+    // Page mode's pseudo-lines are never read line by line: the line tracker would learn a
+    // meaningless gaze offset there (±5 lines of it), which the gaze dot would then subtract. It
+    // sits out page mode and keeps what it learned on real text.
+    const text = this.readingMode === 'text';
     const { completed } = this.fixations.push(s);
     if (completed) {
-      const estimate = this.tracker.onFixation(completed);
+      const estimate = text ? this.tracker.onFixation(completed) : null;
       this.bus.emit('fixation', completed);
-      this.bus.emit('line-estimate', estimate);
+      if (estimate) {
+        this.bus.emit('line-estimate', estimate);
+        this.noteEstimate(estimate);
+      }
     }
-    this.tracker.onSample(s);
+    if (text) this.tracker.onSample(s);
 
     const scroll = this.scroll;
     if (!scroll || this.turning || scroll.animating || this.paused || !this.getSettings().autoScroll) return;
@@ -978,9 +1214,57 @@ export class PageSession {
     this.pageEnd.notifyScrolled(performance.now());
   }
 
-  private resetPipeline(): void {
+  /**
+   * After each fixation under the webcam: whose drift the tracker is learning,
+   * and whether that drift is large enough to offer the quick refresh. Page
+   * mode's pseudo-lines were never read, so their "drift" says nothing.
+   */
+  private noteEstimate(estimate: LineEstimate): void {
+    const model = this.model;
+    if (this.sourceKind !== 'webcam' || !model || this.readingMode !== 'text') return;
+    this.driftOwner = { trainedAt: model.trainedAt, at: performance.now() };
+    const pitch = this.layout?.linePitch ?? 0;
+    const offer = this.paused ? null : this.touchUp.onEstimate(estimate, pitch);
+    if (offer) this.offerTouchUp(offer);
+  }
+
+  /** Suggests the quick 5-dot refresh (already rate-limited by the advisor). */
+  private offerTouchUp(offer: TouchUpOffer): void {
+    if (this.disposed || this.calibration || this.hidden || !this.model || this.sourceKind !== 'webcam') return;
+    const area = this.deps.storage.area;
+    void saveTouchUpRecord(area, this.touchUp.current);
+    this.pill.notify({
+      text: offer.text,
+      tone: 'info',
+      actions: [
+        { label: 'Refresh now', run: () => this.runCheck('quick') },
+        { label: 'Not now', run: () => void saveTouchUpRecord(area, this.touchUp.snooze()) },
+      ],
+      timeoutMs: TOUCH_UP_NOTICE_MS,
+    });
+  }
+
+  /**
+   * Starts the reading pipeline over (new source, new calibration, camera
+   * back). The line tracker keeps the gaze offset it learned (softened) when it
+   * was learned under the webcam with this same calibration, recently: the
+   * camera coming back after a hidden tab or a reconnect, or Gaze Reader turned
+   * on again on this page. The tracker's prior copes with an unknown offset,
+   * but a known one avoids relearning it on every page. `calibrated`: a full
+   * calibration just ran, under this light (reset({ calibrated: true })).
+   */
+  private resetPipeline(opts: { calibrated?: boolean } = {}): void {
+    const model = this.model;
+    const owner = this.driftOwner;
+    const keepDrift =
+      this.sourceKind === 'webcam' &&
+      model !== null &&
+      owner !== null &&
+      owner.trainedAt === model.trainedAt &&
+      performance.now() - owner.at < KEEP_DRIFT_MS;
+    if (!keepDrift) this.driftOwner = null;
     this.fixations.reset();
-    this.tracker.reset();
+    this.tracker.reset(!keepDrift && opts.calibrated === true ? { keepDrift, calibrated: true } : { keepDrift });
     this.pageEnd.reset();
     if (this.layout) this.tracker.setLayout(this.layout, 'initial');
     // Fresh baselines, so the watchdogs don't report "no face" before the first frame.
@@ -1002,10 +1286,17 @@ export class PageSession {
       // Hysteresis so the pill doesn't flicker between "shaky" and "reading".
       const poor =
         this.base === 'poor' ? this.confidence < 0.4 : this.lowSince !== null && now - this.lowSince >= POOR_AFTER_MS;
-      this.setBase(poor ? 'poor' : 'tracking');
+      if (poor) this.setBase('poor', this.poorDetail());
+      else this.setBase('tracking');
     } else if (now - this.lastValidAt > 1_000) {
       this.setBase('no-face');
     }
+  }
+
+  /** "Shaky" plus what the lighting measurements say is wrong, when they say something. */
+  private poorDetail(): string | null {
+    const tip = this.lighting ? lightingTip(this.lighting.flags) : null;
+    return tip ? `Shaky: ${tip}` : null;
   }
 
   private setBase(state: TrackingState, detail: string | null = null): void {
@@ -1052,6 +1343,18 @@ export class PageSession {
 
     // Frames stopped arriving altogether (e.g. the service worker is restarting).
     if (this.sourceKind === 'webcam' && isLiveState(this.base) && now - this.lastSampleAt > 1_500) this.setBase('no-face');
+    // Frames carry the lighting comparison; this lets its flags go stale when they stop.
+    if (this.sourceKind === 'webcam' && this.cameraRunning && this.model && !this.calibration) {
+      this.applyConditions(this.conditions.tick(now));
+    }
+    if (this.debugOverlay?.visible) {
+      const lids = this.sourceKind === 'webcam' && this.model ? this.conditions.lidMonitor : null;
+      this.debugOverlay.showAppearance(
+        lids
+          ? { state: lids.state, residualZ: lids.residualZ, squintZ: lids.squintZ, levelVsCalibration: lids.levelVsCalibration }
+          : null,
+      );
+    }
 
     const s = this.getSettings();
     if (this.shown === 'tracking' && dt < 5_000) {

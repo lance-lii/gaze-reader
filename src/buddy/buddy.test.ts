@@ -673,6 +673,99 @@ describe('Buddy', () => {
       expect(s.mood()).toBe('excited');
     });
 
+    describe('accuracy checks (regression: coached as if they were calibrations)', () => {
+      const report = (quality: 'good' | 'fair' | 'poor') => ({
+        meanErrorPx: 40,
+        meanErrorXPx: 30,
+        meanErrorYPx: 30,
+        perPoint: [],
+        lambda: 1,
+        sampleCount: 300,
+        quality,
+      });
+      const calibrationLines = [
+        ...QUIPS.calibrationStart!,
+        ...QUIPS.calibrationValidating!,
+        ...QUIPS.calibrationGood!,
+        ...QUIPS.calibrationFair!,
+        ...QUIPS.calibrationPoor!,
+        ...QUIPS.calibrationCancelled!,
+      ];
+      /** Everything Dewey showed, sampled after every event. */
+      const collect = (s: Setup) => {
+        const seen: string[] = [];
+        const note = (): void => {
+          const t = s.said();
+          if (t && seen.at(-1) !== t) seen.push(t);
+        };
+        return {
+          seen,
+          emit: <K extends 'calibration' | 'accuracy-check'>(type: K, payload: AppEvents[K]): void => {
+            s.bus.emit(type, payload);
+            note();
+            vi.advanceTimersByTime(300);
+            note();
+          },
+        };
+      };
+
+      it('a check that ends with "Done" gets no calibration coaching or grade', () => {
+        for (const quality of ['good', 'poor'] as const) {
+          const s = make();
+          const c = collect(s);
+          c.emit('calibration', { phase: 'start', message: 'check' });
+          expect(QUIPS.accuracyCheckStart).toContain(s.said());
+          c.emit('calibration', { phase: 'positioning' });
+          for (let i = 0; i < 5; i++) c.emit('calibration', { phase: 'validating', index: i, total: 5 });
+          c.emit('accuracy-check', { meanErrorPx: 110, offsetXPx: 4, offsetYPx: 105, offsetYLines: 3.5, applied: false });
+          c.emit('calibration', { phase: 'done', report: report(quality) });
+          vi.advanceTimersByTime(8_000);
+          expect(c.seen.filter((t) => calibrationLines.includes(t)), quality).toEqual([]);
+          s.buddy.destroy();
+        }
+      });
+
+      it('Esc during a check: "nothing changed", not "calibration cancelled"', () => {
+        const s = make();
+        s.bus.emit('calibration', { phase: 'start', message: 'check' });
+        s.bus.emit('calibration', { phase: 'validating', index: 0, total: 5 });
+        s.bus.emit('calibration', { phase: 'cancelled' });
+        expect(QUIPS.accuracyCheckCancelled).toContain(s.said());
+      });
+
+      it('a check handed over to a full calibration is coached and graded as one', () => {
+        const s = make();
+        s.bus.emit('calibration', { phase: 'start', message: 'check' });
+        s.bus.emit('calibration', { phase: 'validating', index: 0, total: 5 });
+        s.bus.emit('calibration', { phase: 'point', index: 0, total: 13 }); // "Full calibration"
+        s.bus.emit('calibration', { phase: 'training' });
+        s.bus.emit('calibration', { phase: 'validating', index: 0, total: 4 });
+        expect(QUIPS.calibrationValidating).toContain(s.said());
+        s.bus.emit('calibration', { phase: 'done', report: report('good') });
+        expect(QUIPS.calibrationGood).toContain(s.said());
+      });
+
+      it('a quick refresh (no check message) is still graded like a calibration', () => {
+        const s = make();
+        s.bus.emit('calibration', { phase: 'start' });
+        expect(QUIPS.calibrationStart).toContain(s.said());
+        s.bus.emit('calibration', { phase: 'point', index: 0, total: 5 });
+        s.bus.emit('calibration', { phase: 'training' });
+        s.bus.emit('accuracy-check', { meanErrorPx: 50, offsetXPx: 4, offsetYPx: 40, offsetYLines: 1, applied: true });
+        s.bus.emit('calibration', { phase: 'done', report: report('good') });
+        expect(QUIPS.calibrationGood).toContain(s.said());
+      });
+
+      it('a check never leaks into the next run', () => {
+        const s = make();
+        s.bus.emit('calibration', { phase: 'start', message: 'check' });
+        s.bus.emit('tracking-state', { state: 'tracking' }); // ended without its closing event
+        s.bus.emit('calibration', { phase: 'start' });
+        s.bus.emit('calibration', { phase: 'validating', index: 0, total: 4 });
+        expect(QUIPS.calibrationValidating).toContain(s.said());
+      });
+    });
+
     it('does not hold calibration coaching as if the reader were mid-line (regression)', () => {
       const s = make();
       // A recalibration: the old model still yields valid gaze on the text column.

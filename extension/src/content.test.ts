@@ -13,6 +13,7 @@ vi.mock('./pageSession', () => ({
       return {
         state: (): PageState => ({ enabled: true, tracking: 'tracking', source: 'mouse', calibrated: false, paused: false, fps: null, detail: null }),
         command: (c: string) => s.commands.push(c),
+        extraState: () => ({ lighting: { flags: ['backlit'], changedSinceCalibration: true, dominant: 'backlight' }, canCheck: true }),
         destroy: () => {
           s.destroyed = true;
         },
@@ -84,6 +85,20 @@ describe('content script entry', () => {
     expect(await chrome.send({ type: 'page-set-enabled', enabled: false })).toMatchObject({ enabled: false });
     expect(sessions[0]!.destroyed).toBe(true);
     expect(chrome.runtime.sendMessage).toHaveBeenCalledWith({ type: 'page-status', enabled: false });
+  });
+
+  it("answers the popup's accuracy-check, quick-refresh and lighting requests", async () => {
+    const chrome = installChrome();
+    await inject();
+    // Off: nothing to report, nothing to run.
+    expect(await chrome.send({ type: 'page-extra-query' })).toEqual({ lighting: null, canCheck: false });
+    await chrome.send({ type: 'page-set-enabled', enabled: true });
+    expect(await chrome.send({ type: 'page-extra-query' })).toMatchObject({ canCheck: true, lighting: { flags: ['backlit'] } });
+    await chrome.send({ type: 'page-extra-command', command: 'check-accuracy' });
+    await chrome.send({ type: 'page-extra-command', command: 'touch-up' });
+    expect(sessions[0]!.commands).toEqual(['check-accuracy', 'touch-up']);
+    expect(await chrome.send({ type: 'page-extra-command', command: 'turn-off' })).toBe('no response');
+    expect(await chrome.send({ type: 'page-extra-query' }, 'someone-else')).toBe('no response');
   });
 
   it('serializes rapid on/off/on into a single live session', async () => {

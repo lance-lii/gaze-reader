@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createEventBus } from '../core/events';
 import { DEFAULT_SETTINGS } from '../core/settings';
 import type { AppSettings } from '../types';
-import { SettingsPanel } from './settingsPanel';
+import { SettingsPanel, formatClock } from './settingsPanel';
 
 function setup(saved = true) {
   const bus = createEventBus();
@@ -90,5 +90,95 @@ describe('SettingsPanel', () => {
     expect(patches[0]!.gazeSource).toBe(DEFAULT_SETTINGS.gazeSource);
     panel.destroy();
     expect(vi.getTimerCount()).toBe(0);
+  });
+  it('offers the accuracy check next to calibration, only with a saved calibration', () => {
+    const bus = createEventBus();
+    const saved = { v: false };
+    let checks = 0;
+    const panel = new SettingsPanel({
+      bus,
+      getSettings: () => DEFAULT_SETTINGS,
+      hasSavedCalibration: () => saved.v,
+      onForgetCalibration: () => undefined,
+      onRecalibrate: () => undefined,
+      onCheckAccuracy: () => checks++,
+      onShowHelp: () => undefined,
+      onReplayIntro: () => undefined,
+    });
+    panel.mount(document.body);
+    panel.open();
+    const check = document.querySelector<HTMLButtonElement>('.gr-settings__check')!;
+    expect(check.textContent).toBe('Check accuracy');
+    expect(check.disabled).toBe(true);
+    saved.v = true;
+    panel.close();
+    panel.open();
+    expect(check.disabled).toBe(false);
+    check.click();
+    expect(checks).toBe(1);
+    expect(panel.isOpen).toBe(false); // the dots need the screen
+    panel.destroy();
+    // Hosts without a check (the extension) get no button.
+    const { panel: plain } = setup();
+    expect(document.querySelector('.gr-settings__check')).toBeNull();
+    plain.destroy();
+  });
+
+  it('records tracking diagnostics from Advanced, with a clock, and offers the last recording', () => {
+    vi.useFakeTimers();
+    const bus = createEventBus();
+    const rec = { recording: false, elapsedMs: 0, hasData: false, started: 0, stopped: 0, downloads: 0 };
+    const panel = new SettingsPanel({
+      bus,
+      getSettings: () => DEFAULT_SETTINGS,
+      hasSavedCalibration: () => true,
+      onForgetCalibration: () => undefined,
+      onRecalibrate: () => undefined,
+      onShowHelp: () => undefined,
+      onReplayIntro: () => undefined,
+      diagnostics: {
+        status: () => ({ recording: rec.recording, elapsedMs: rec.elapsedMs, limitMs: 600_000, hasData: rec.hasData }),
+        start: () => {
+          rec.started++;
+          rec.recording = true;
+          rec.hasData = true;
+        },
+        stop: () => {
+          rec.stopped++;
+          rec.recording = false;
+        },
+        download: () => rec.downloads++,
+      },
+    });
+    panel.mount(document.body);
+    const section = document.querySelector('.gr-set-diag')!;
+    expect(section.textContent).toMatch(/No video, no images, no book text/);
+    const record = section.querySelector<HTMLButtonElement>('.gr-settings__record')!;
+    const download = section.querySelector<HTMLButtonElement>('.gr-settings__diag-download')!;
+    expect(record.textContent).toBe('Record tracking diagnostics (no video)');
+    expect(download.hidden).toBe(true);
+    panel.open();
+    record.click();
+    expect(rec.started).toBe(1);
+    expect(record.getAttribute('aria-pressed')).toBe('true');
+    rec.elapsedMs = 65_000;
+    vi.advanceTimersByTime(1000); // the clock ticks while the drawer is open
+    expect(record.textContent).toBe('Stop and download (1:05 of 10:00)');
+    record.click();
+    expect(rec.stopped).toBe(1);
+    expect(record.textContent).toBe('Record tracking diagnostics (no video)');
+    expect(download.hidden).toBe(false);
+    download.click();
+    expect(rec.downloads).toBe(1);
+    panel.close();
+    panel.destroy();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('formatClock', () => {
+    expect(formatClock(0)).toBe('0:00');
+    expect(formatClock(65_400)).toBe('1:05');
+    expect(formatClock(600_000)).toBe('10:00');
+    expect(formatClock(Number.NaN)).toBe('0:00');
   });
 });
