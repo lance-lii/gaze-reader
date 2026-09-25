@@ -1,0 +1,32 @@
+{
+  "name": "gaze-reader",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Webcam eye-tracking book reader that turns the page when your eyes reach the bottom — with Dewey, a tiny nerd reading buddy.",
+  "type": "module",
+  "scripts": {
+    "copy-wasm": "node scripts/copy-mediapipe-wasm.mjs public/mediapipe/wasm",
+    "predev": "npm run copy-wasm",
+    "dev": "vite",
+    "prebuild": "npm run copy-wasm",
+    "build": "vite build",
+    "preview": "vite preview",
+    "build:ext": "node scripts/build-extension.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p extension/tsconfig.json",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run build && npm run build:ext"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^1.0.1",
+    "jszip": "^3.10.2",
+    "pdfjs-dist": "^6.3.289"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.0",
+    "jsdom": "^29.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1",
+    "vitest": "^5.0.1"
+  }
+}
