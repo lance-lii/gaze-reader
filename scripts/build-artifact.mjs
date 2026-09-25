@@ -10,7 +10,7 @@
 // no MediaPipe, no webcam, no "Open from URL", and the theme follows the host.
 // The build fails if the page breaks one of the frame's rules (document tags,
 // external scripts or styles, network URLs in fetch(), leftover chunks,
-// MediaPipe code, size) or if the inlined script doesn't parse.
+// MediaPipe code, size) or if the inlined script or the pdf worker doesn't parse.
 //
 // Usage: node scripts/build-artifact.mjs   (npm run build:artifact)
 import { build } from 'vite';
@@ -19,7 +19,7 @@ import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, stat
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildArtifactHtml, checkArtifactHtml, escapeInlineScript, formatBytes } from './artifact-html.mjs';
+import { buildArtifactHtml, checkArtifactHtml, CONTROL_CHARS, escapeControlChars, escapeInlineScript, formatBytes } from './artifact-html.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const out = join(root, 'dist-artifact');
@@ -94,7 +94,9 @@ const html = buildArtifactHtml({ title: 'Gaze Reader', css: `${css}\n${artifactC
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 writeFileSync(join(out, PAGE), html);
-cpSync(join(root, 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs'), join(out, PDF_WORKER));
+// pdf.js's minified worker has raw control characters in its literals; the host refuses those.
+const worker = escapeControlChars(readFileSync(join(root, 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs'), 'utf8'));
+writeFileSync(join(out, PDF_WORKER), worker);
 cpSync(join(root, 'public/samples'), join(out, 'samples'), { recursive: true });
 
 // ───────────────────────────────── verify ────────────────────────────────────
@@ -115,12 +117,18 @@ if (!/["'`]samples\/["'`]/.test(html)) problems.push('the page doesn\'t fetch sa
 const scratch = mkdtempSync(join(tmpdir(), 'gr-artifact-'));
 try {
   const probe = join(scratch, 'inline.mjs');
-  writeFileSync(probe, escapeInlineScript(js));
+  writeFileSync(probe, escapeInlineScript(escapeControlChars(js)));
   execFileSync(process.execPath, ['--check', probe], { stdio: 'pipe' });
+  execFileSync(process.execPath, ['--check', join(out, PDF_WORKER)], { stdio: 'pipe' });
 } catch (err) {
-  problems.push(`the inlined script doesn't parse: ${String(err.stderr ?? err.message).trim().split('\n').slice(0, 4).join(' ')}`);
+  problems.push(`the inlined script or the pdf worker doesn't parse: ${String(err.stderr ?? err.message).trim().split('\n').slice(0, 4).join(' ')}`);
 } finally {
   rmSync(scratch, { recursive: true, force: true });
+}
+
+// The host refuses text files with raw control characters.
+for (const [name, text] of [[PAGE, html], [PDF_WORKER, worker]]) {
+  if (CONTROL_CHARS.test(text)) problems.push(`${name} still contains a raw control character`);
 }
 
 // Every sample the index lists must be published.

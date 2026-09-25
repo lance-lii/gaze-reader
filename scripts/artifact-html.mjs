@@ -32,6 +32,23 @@ export function escapeInlineScript(js) {
     .replace(/<!(--|doctype\b)/gi, '\\x3C!$1');
 }
 
+/** C0 controls except tab, LF and CR, plus DEL. The Artifact host refuses text files containing them. */
+export const CONTROL_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/;
+
+/**
+ * Rewrites raw control characters as `\xNN` escapes. Minifiers emit them raw
+ * inside string, template and regular-expression literals, where the escape
+ * denotes the same character. A control character preceded by an odd run of
+ * backslashes was itself escaped (`\<ESC>` means ESC), so that backslash is
+ * consumed rather than left to escape the new `\`.
+ */
+export function escapeControlChars(js) {
+  return js.replace(/(\\*)([\x00-\x08\x0B\x0C\x0E-\x1F\x7F])/g, (_, slashes, ch) => {
+    const escape = `\\x${ch.charCodeAt(0).toString(16).padStart(2, '0')}`;
+    return (slashes.length % 2 === 1 ? slashes.slice(1) : slashes) + escape;
+  });
+}
+
 /** Throws when CSS can't be inlined as-is (it would end the <style> element early). */
 export function assertInlineableCss(css) {
   if (/<\/style/i.test(css)) throw new Error('The CSS contains "</style" and cannot be inlined.');
@@ -50,7 +67,7 @@ export function buildArtifactHtml({ title, css, js, markup }) {
     `<title>${escapeText(title)}</title>`,
     `<style>\n${assertInlineableCss(css).trim()}\n</style>`,
     markup.trim(),
-    `<script type="module">\n${escapeInlineScript(js).trim()}\n</script>`,
+    `<script type="module">\n${escapeInlineScript(escapeControlChars(js)).trim()}\n</script>`,
     '',
   ].join('\n');
 }
