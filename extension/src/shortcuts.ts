@@ -8,6 +8,7 @@
 export type ShortcutAction =
   | 'toggle-pause'
   | 'recalibrate'
+  | 'check-accuracy'
   | 'page-forward'
   | 'page-back'
   | 'undo-turn'
@@ -29,6 +30,7 @@ export const SHORTCUTS: readonly ShortcutInfo[] = [
   { action: 'page-back', codes: ['ArrowUp', 'PageUp'], keys: 'Alt+Shift+↑', label: 'Previous page' },
   { action: 'undo-turn', codes: ['KeyU'], keys: 'Alt+Shift+U', label: 'Undo the last page turn' },
   { action: 'recalibrate', codes: ['KeyC'], keys: 'Alt+Shift+C', label: 'Recalibrate' },
+  { action: 'check-accuracy', codes: ['KeyA'], keys: 'Alt+Shift+A', label: 'Check accuracy (5 dots, fixes an offset)' },
   { action: 'toggle-gaze-dot', codes: ['KeyO'], keys: 'Alt+Shift+O', label: 'Show / hide the gaze dot' },
   { action: 'toggle-debug', codes: ['KeyD'], keys: 'Alt+Shift+D', label: 'Debug overlay' },
   { action: 'toggle-help', codes: ['Slash', 'KeyH'], keys: 'Alt+Shift+H', label: 'Show these shortcuts' },

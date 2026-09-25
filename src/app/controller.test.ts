@@ -4,8 +4,14 @@
  * jsdom can't do stubbed (layout measurement, the network, canvas, the camera).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AppEvents, FeatureFrame, GazeModel, LineLayout, PageEndDecision, TextLine } from '../types';
+import type { AppEvents, AppSettings, EventBus, FeatureFrame, GazeModel, LightingSignature, LineLayout, PageEndDecision, TextLine } from '../types';
+import type { AccuracyCheckResult, CalibrationResult } from '../ui/calibrationOverlay';
+import { AppearanceMonitor } from '../gaze/appearance';
 import { CameraFeatureSource } from '../gaze/faceTracker';
+import { LightingWatch, type LightingWatchUpdate } from '../gaze/lighting';
+import { LineTracker } from '../reading/lineTracker';
+import { parseRecording } from './diagnostics';
+import { GuidanceGate, SustainedFlags } from './logic';
 import { FEATURE_NAMES } from '../gaze/features';
 import { MouseGazeSource } from '../gaze/mouseGazeSource';
 import { ReaderView } from '../reader/readerView';
@@ -24,6 +30,31 @@ vi.mock('../gaze/faceTracker', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../gaze/faceTracker')>()),
   preloadFaceLandmarker: () => Promise.resolve(false),
 }));
+// The real calibration overlay, except that a test can see which mode it was opened in and
+// script its outcome (the dots themselves are the overlay's own tests).
+const overlays = vi.hoisted(() => ({
+  modes: [] as (string | undefined)[],
+  run: null as ((bus: EventBus) => Promise<CalibrationResult | null>) | null,
+  check: null as AccuracyCheckResult | null,
+}));
+vi.mock('../ui/calibrationOverlay', async (importOriginal) => {
+  const m = await importOriginal<typeof import('../ui/calibrationOverlay')>();
+  class ScriptedOverlay extends m.CalibrationOverlay {
+    private readonly testBus: EventBus;
+    constructor(opts: ConstructorParameters<typeof m.CalibrationOverlay>[0]) {
+      super(opts);
+      overlays.modes.push(opts.mode);
+      this.testBus = opts.bus;
+    }
+    override run(): Promise<CalibrationResult | null> {
+      return overlays.run ? overlays.run(this.testBus) : super.run();
+    }
+    override get lastAccuracyCheck(): AccuracyCheckResult | null {
+      return overlays.check ?? super.lastAccuracyCheck;
+    }
+  }
+  return { ...m, CalibrationOverlay: ScriptedOverlay };
+});
 
 const PITCH = 40;
 
@@ -83,6 +114,37 @@ async function openPastedText(text = 'The eyes jump along the line. '.repeat(120
   await until(() => document.documentElement.dataset.screen === 'reader', 'the reader to open');
 }
 
+/**
+ * A stand-in camera. Several listeners, like the real one: the gaze source, and the
+ * controller's lighting/eyelid watch and diagnostics.
+ */
+function stubCamera() {
+  let running = false;
+  const listeners = new Set<(f: FeatureFrame) => void>();
+  vi.spyOn(CameraFeatureSource.prototype, 'start').mockImplementation(async () => {
+    running = true;
+  });
+  vi.spyOn(CameraFeatureSource.prototype, 'stop').mockImplementation(() => {
+    running = false;
+  });
+  vi.spyOn(CameraFeatureSource.prototype, 'running', 'get').mockImplementation(() => running);
+  vi.spyOn(CameraFeatureSource.prototype, 'video', 'get').mockReturnValue(null);
+  vi.spyOn(CameraFeatureSource.prototype, 'lastLandmarks', 'get').mockReturnValue(null);
+  vi.spyOn(CameraFeatureSource.prototype, 'onError').mockImplementation(() => () => undefined);
+  vi.spyOn(CameraFeatureSource.prototype, 'onFrame').mockImplementation((cb) => {
+    listeners.add(cb);
+    return () => {
+      listeners.delete(cb);
+    };
+  });
+  return {
+    emit: (f: FeatureFrame) => {
+      for (const cb of [...listeners]) cb(f);
+    },
+    subscribers: () => listeners.size,
+  };
+}
+
 const toastText = () => [...document.querySelectorAll('.gr-toast:not([data-leaving])')].map((t) => t.textContent).join(' | ');
 
 function moveMouse(x: number, y: number): void {
@@ -112,6 +174,9 @@ describe('AppController', () => {
     root.remove();
     Reflect.deleteProperty(document, 'hidden');
     saved.model = null;
+    overlays.modes = [];
+    overlays.run = null;
+    overlays.check = null;
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -281,24 +346,7 @@ describe('AppController', () => {
       trainedAt: Date.now(),
       toJSON: () => ({ version: 1 }),
     };
-    let running = false;
-    let emitFrame: ((f: FeatureFrame) => void) | null = null;
-    vi.spyOn(CameraFeatureSource.prototype, 'start').mockImplementation(async () => {
-      running = true;
-    });
-    vi.spyOn(CameraFeatureSource.prototype, 'stop').mockImplementation(() => {
-      running = false;
-    });
-    vi.spyOn(CameraFeatureSource.prototype, 'running', 'get').mockImplementation(() => running);
-    vi.spyOn(CameraFeatureSource.prototype, 'video', 'get').mockReturnValue(null);
-    vi.spyOn(CameraFeatureSource.prototype, 'lastLandmarks', 'get').mockReturnValue(null);
-    vi.spyOn(CameraFeatureSource.prototype, 'onError').mockImplementation(() => () => undefined);
-    vi.spyOn(CameraFeatureSource.prototype, 'onFrame').mockImplementation((cb) => {
-      emitFrame = cb;
-      return () => {
-        emitFrame = null;
-      };
-    });
+    const camera = stubCamera();
     const frame = (): FeatureFrame => ({
       t: performance.now(),
       faceFound: true,
@@ -320,9 +368,9 @@ describe('AppController', () => {
     await app.start();
     const states = record(app, 'tracking-state');
     await openPastedText();
-    await until(() => emitFrame !== null, 'the webcam source to subscribe');
+    await until(() => camera.subscribers() >= 2, 'the webcam source to subscribe');
     for (let i = 0; i < 10; i++) {
-      emitFrame!(frame());
+      camera.emit(frame());
       await sleep(20);
     }
     expect(states.at(-1)?.state).toBe('tracking');
@@ -451,24 +499,7 @@ describe('AppController', () => {
       trainedAt: Date.now(),
       toJSON: () => ({ version: 1 }),
     };
-    let running = false;
-    let emitFrame: ((f: FeatureFrame) => void) | null = null;
-    vi.spyOn(CameraFeatureSource.prototype, 'start').mockImplementation(async () => {
-      running = true;
-    });
-    vi.spyOn(CameraFeatureSource.prototype, 'stop').mockImplementation(() => {
-      running = false;
-    });
-    vi.spyOn(CameraFeatureSource.prototype, 'running', 'get').mockImplementation(() => running);
-    vi.spyOn(CameraFeatureSource.prototype, 'video', 'get').mockReturnValue(null);
-    vi.spyOn(CameraFeatureSource.prototype, 'lastLandmarks', 'get').mockReturnValue(null);
-    vi.spyOn(CameraFeatureSource.prototype, 'onError').mockImplementation(() => () => undefined);
-    vi.spyOn(CameraFeatureSource.prototype, 'onFrame').mockImplementation((cb) => {
-      emitFrame = cb;
-      return () => {
-        emitFrame = null;
-      };
-    });
+    const camera = stubCamera();
     localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false }));
     root = document.createElement('div');
     document.body.appendChild(root);
@@ -476,7 +507,7 @@ describe('AppController', () => {
     await app.start();
     const states = record(app, 'tracking-state');
     await openPastedText();
-    await until(() => emitFrame !== null, 'the webcam source to subscribe');
+    await until(() => camera.subscribers() >= 2, 'the webcam source to subscribe');
     await until(() => states.at(-1)?.state !== undefined && states.at(-1)?.state !== 'off', 'the webcam to run');
     try {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: Math.round(width * 0.6) });
@@ -498,5 +529,397 @@ describe('AppController', () => {
     } finally {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
     }
+  });
+  // ───────────────────────── Lighting, guidance, accuracy check, diagnostics ─────────────────────────
+
+  const SIGNATURE: LightingSignature = {
+    v: 1,
+    n: 30,
+    yaw: 0,
+    pitch: 0.05,
+    c: { sclera: -1.3, backlight: 0.2, side: 0, shade: -0.3, glare: 0.1, range: 1.2 },
+    sd: { sclera: 0.05, backlight: 0.05, side: 0.05, shade: 0.05, glare: 0.05, range: 0.05 },
+  };
+  const REPORT = { meanErrorPx: 40, meanErrorXPx: 20, meanErrorYPx: 30, perPoint: [], lambda: 1, sampleCount: 100, quality: 'good' as const };
+
+  /** A saved calibration that predicts (500, 400); its JSON has a ridge core, so a refresh of it can be recognised. */
+  function calibratedModel(opts: { trainedAt?: number; adjustOy?: number } = {}): GazeModel {
+    const core = { version: 1, kind: 'gr-ridge-poly2-iris5', featureLength: FEATURE_NAMES.length, mean: [0], std: [1], quad: [], expMean: [0], expStd: [1], wx: [1], bx: 0, wy: [1], by: 0, lambda: 1 };
+    return {
+      predict: () => ({ x: 500, y: 400 }),
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      trainedAt: opts.trainedAt ?? 1000,
+      environment: { lighting: SIGNATURE, appearance: null, capturedAt: 1000 },
+      toJSON: () => ({ ...core, adjust: { sx: 1, ox: 0, sy: 1, oy: opts.adjustOy ?? 0 } }),
+    };
+  }
+
+  const webcamFrame = (): FeatureFrame => ({
+    t: performance.now(),
+    faceFound: true,
+    quality: 0.9,
+    features: {
+      vector: new Array<number>(FEATURE_NAMES.length).fill(0),
+      headPose: { yaw: 0, pitch: 0, roll: 0, tx: 0, ty: 0, tz: -50 },
+      blink: 0,
+      openness: 0.3,
+      squint: 0.1,
+      faceScale: 0.12,
+      faceCenter: { x: 0.5, y: 0.5 },
+    },
+  });
+
+  /** Rebuilds the app on the webcam with `model` saved, opens a book and waits for tracking to run. */
+  async function readWithWebcam(model: GazeModel | null, opts: { open?: boolean; settings?: Partial<AppSettings> } = {}) {
+    app.destroy();
+    saved.model = model;
+    const camera = stubCamera();
+    localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false, ...opts.settings }));
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    await app.start();
+    const states = record(app, 'tracking-state');
+    if (opts.open !== false) {
+      await openPastedText();
+      if (model) {
+        await until(() => camera.subscribers() >= 2, 'the webcam source to subscribe');
+        await until(() => states.some((s) => s.state === 'tracking' || s.state === 'no-face'), 'tracking to run');
+      }
+    }
+    return { camera, states };
+  }
+
+  const pressKey = (key: string): KeyboardEvent => {
+    const e = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+    document.querySelector<HTMLElement>('.gr-reader')!.dispatchEvent(e);
+    return e;
+  };
+
+  const toastButton = (label: string) => [...document.querySelectorAll<HTMLButtonElement>('.gr-toast__actions button')].find((b) => b.textContent === label);
+
+  it('webcam: reports the light every second; a changed light re-learns the reading offset and offers a touch-up at a pause', async () => {
+    let next: LightingWatchUpdate | null = null;
+    const tick = vi.spyOn(LightingWatch.prototype, 'tick').mockImplementation(() => {
+      const u = next;
+      next = null;
+      return u;
+    });
+    const reference = vi.spyOn(LightingWatch.prototype, 'setReference');
+    vi.spyOn(GuidanceGate.prototype, 'mayOffer').mockReturnValue(true);
+    vi.spyOn(GuidanceGate.prototype, 'isPause').mockReturnValue(true);
+    const relearn = vi.spyOn(LineTracker.prototype, 'appearanceChangedAt');
+    const { camera } = await readWithWebcam(calibratedModel());
+    expect(reference).toHaveBeenCalledWith(SIGNATURE); // the calibration's light is the reference
+    const states = record(app, 'lighting-state');
+    const changes = record(app, 'appearance-changed');
+    const says = record(app, 'buddy-say');
+    await until(() => tick.mock.calls.length > 0, 'the lighting watch to tick');
+    for (let i = 0; i < 3; i++) camera.emit(webcamFrame());
+
+    const changedAt = performance.now() - 4000;
+    const z = { sclera: 1.3, backlight: 0, side: 0, shade: 0, glare: 0.5, range: 0 };
+    next = {
+      state: { flags: ['glare'], distance: 1.4, changedSinceCalibration: true, dominant: 'sclera' },
+      comparison: { distance: 1.4, dominant: 'sclera', z },
+      transition: 'changed',
+      changedAt,
+    };
+    await until(() => changes.length > 0, 'the appearance change');
+    expect(changes[0]).toMatchObject({ t: changedAt, reason: 'lighting' });
+    expect(relearn).toHaveBeenCalledWith(changedAt);
+    expect(states.at(-1)).toMatchObject({ flags: ['glare'], changedSinceCalibration: true, dominant: 'sclera' });
+    await until(() => /The light changed/.test(toastText()), 'the touch-up offer');
+    expect(toastText()).toMatch(/A quick 5-dot refresh keeps page turns accurate/);
+    expect(says.some((s) => /light/i.test(s.text))).toBe(true);
+
+    // The same change seen again (the eyelids, a moment later) is not re-learned twice.
+    next = { state: states.at(-1)!, comparison: null, transition: 'changed', changedAt: changedAt + 1000 };
+    await until(() => next === null, 'another tick');
+    await sleep(50);
+    expect(changes).toHaveLength(1);
+
+    // Changed again while already changed (a lamp, then the overhead light off): the bias moved
+    // again, so the offset is re-learned once more.
+    const againAt = changedAt + 20_000;
+    next = { state: states.at(-1)!, comparison: null, transition: 'changed-again', changedAt: againAt };
+    await until(() => changes.length > 1, 'the second appearance change');
+    expect(changes[1]).toMatchObject({ t: againAt, reason: 'lighting' });
+    expect(changes[1]!.detail).toMatch(/again/);
+    expect(relearn).toHaveBeenCalledWith(againAt);
+
+    // "Refresh now" runs the quick 5-dot refresh.
+    overlays.run = async (bus) => {
+      bus.emit('calibration', { phase: 'start' });
+      bus.emit('calibration', { phase: 'cancelled' });
+      return null;
+    };
+    toastButton('Refresh now')!.click();
+    await until(() => overlays.modes.length > 0, 'the touch-up');
+    expect(overlays.modes).toEqual(['quick']);
+  });
+
+  it('webcam: the eyelid monitor sees the lid-free gaze height, and a lid change re-learns the offset once', async () => {
+    const update = vi.spyOn(AppearanceMonitor.prototype, 'update');
+    const baseline = vi.spyOn(AppearanceMonitor.prototype, 'setBaseline');
+    const { camera } = await readWithWebcam(calibratedModel());
+    expect(baseline).toHaveBeenCalledWith(null, SIGNATURE.pitch);
+    const changes = record(app, 'appearance-changed');
+    camera.emit(webcamFrame());
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ gazeYNorm: 400 / window.innerHeight, quality: 0.9 }));
+    update.mockImplementationOnce((input) => ({
+      t: input.t - 2000,
+      reason: 'lids',
+      detail: 'narrower',
+      detectedAt: input.t,
+      direction: 'narrower',
+      channel: 'openness',
+      z: -4.2,
+      squintZ: null,
+      relativeShift: -0.1,
+    }));
+    camera.emit(webcamFrame());
+    expect(changes).toHaveLength(1);
+    expect(changes[0]!.reason).toBe('lids');
+    expect(changes[0]!.detail).toMatch(/narrower/);
+  });
+
+  it('keeps the learned drift when a book is reopened with the same source, and re-learns it for another', async () => {
+    const reset = vi.spyOn(LineTracker.prototype, 'reset');
+    const relearn = vi.spyOn(LineTracker.prototype, 'appearanceChangedAt');
+    await openPastedText();
+    expect(reset.mock.calls.at(-1)).toEqual([{}]); // first book: start from "calibration is about right"
+    app.bus.emit('command', { name: 'open-library' });
+    await until(() => document.documentElement.dataset.screen === 'library', 'the library');
+    await openPastedText();
+    expect(reset.mock.calls.at(-1)).toEqual([{ keepDrift: true }]);
+    // Switching to the demo mid-book: the mouse's offset doesn't apply to it.
+    const before = relearn.mock.calls.length;
+    app.bus.emit('settings-patch', { gazeSource: 'simulated' });
+    await until(() => relearn.mock.calls.length > before, 'the offset to be re-learned');
+  });
+
+  it('A runs the accuracy check on the webcam and sums up the result; elsewhere it explains', async () => {
+    await openPastedText();
+    expect(pressKey('a').defaultPrevented).toBe(true);
+    expect(toastText()).toMatch(/accuracy check is for eye tracking/);
+    expect(overlays.modes).toEqual([]);
+
+    await readWithWebcam(calibratedModel());
+    const says = record(app, 'buddy-say');
+    overlays.check = {
+      mode: 'check',
+      before: { meanErrorPx: 104, offsetXPx: 4, offsetYPx: 2.5 * 42, offsetYLines: 2.5, targets: 5 },
+      after: { meanErrorPx: 30, offsetXPx: 0, offsetYPx: 2, offsetYLines: 0.05, targets: 5 },
+      applied: false,
+      lighting: SIGNATURE,
+      lightingChange: { distance: 1.6, changed: true, dominant: 'sclera', text: 'your eyes are more brightly lit' },
+    };
+    overlays.run = async (bus) => {
+      bus.emit('calibration', { phase: 'start' });
+      bus.emit('calibration', { phase: 'done' });
+      return null; // "Done": the model is unchanged
+    };
+    pressKey('a');
+    await until(() => /Tracking has drifted/.test(toastText()), 'the check result');
+    expect(overlays.modes).toEqual(['check']);
+    // The overlay's words and rounding ("about 3 lines low" for 2.5), not a second opinion.
+    expect(toastText()).toMatch(
+      /Tracking reads about 3 lines low\. A quick 5-dot refresh re-centres it\. The light has changed since calibration: your eyes are more brightly lit\./,
+    );
+    expect(toastButton('Refresh now')).toBeDefined();
+    expect(says.some((s) => /lines off|5-dot refresh/.test(s.text))).toBe(true);
+    // Tracking goes on with the same model.
+    await until(() => document.querySelector('.gr-pill')!.getAttribute('aria-label')!.includes('Camera on'), 'tracking again');
+  });
+
+  it('an applied accuracy-check correction keeps the line and re-learns the offset (no fresh start)', async () => {
+    await readWithWebcam(calibratedModel());
+    const reset = vi.spyOn(LineTracker.prototype, 'reset');
+    const changes = record(app, 'appearance-changed');
+    const refined = calibratedModel({ trainedAt: 2000, adjustOy: -105 });
+    overlays.check = {
+      mode: 'check',
+      before: { meanErrorPx: 110, offsetXPx: 4, offsetYPx: 105, offsetYLines: 2.5, targets: 5 },
+      after: null,
+      applied: true,
+      lighting: SIGNATURE,
+      lightingChange: null,
+    };
+    overlays.run = async (bus) => {
+      bus.emit('calibration', { phase: 'start' });
+      bus.emit('calibration', { phase: 'done', report: REPORT });
+      return { model: refined, report: REPORT, check: overlays.check! };
+    };
+    pressKey('a');
+    await until(() => changes.some((c) => c.reason === 'refresh'), 'the refresh to reach the reading layer');
+    await until(() => /Tracking corrected/.test(toastText()), 'the result');
+    expect(toastText()).toMatch(/Tracking read about 3 lines low\. That’s fixed now\./);
+    expect(reset).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem('gazeReader.calibration.v1')!)).toMatchObject({ adjust: { oy: -105 } });
+    // A full calibration, by contrast, starts the line tracker over.
+    overlays.check = null;
+    overlays.run = async (bus) => {
+      bus.emit('calibration', { phase: 'start' });
+      bus.emit('calibration', { phase: 'done', report: REPORT });
+      return { model: { ...calibratedModel({ trainedAt: 3000 }), toJSON: () => ({ version: 1, kind: 'gr-ridge-poly2-iris5', wx: [2], wy: [3] }) }, report: REPORT };
+    };
+    app.bus.emit('command', { name: 'recalibrate' });
+    await until(() => reset.mock.calls.length > 0, 'a fresh start');
+    // Under the light it was just calibrated in: no uniform share in the drift prior.
+    expect(reset.mock.calls.at(-1)).toEqual([{ calibrated: true }]);
+  });
+
+  it('asks before redoing a previous tracker’s calibration, and explains it once (regression: a minute of dots, unannounced, over the toast)', async () => {
+    localStorage.setItem('gazeReader.calibration.v1', JSON.stringify({ version: 1, kind: 'gr-ridge-poly2', featureLength: 27 }));
+    overlays.run = async (bus) => {
+      bus.emit('calibration', { phase: 'start' });
+      bus.emit('calibration', { phase: 'cancelled' });
+      return null;
+    };
+    await readWithWebcam(null, { open: false }); // Dewey hidden: the toast is all the reader sees
+    const cameraStart = vi.mocked(CameraFeatureSource.prototype.start);
+    const says = record(app, 'buddy-say');
+    await openPastedText();
+    await until(() => /Please recalibrate once/.test(toastText()), 'the explanation');
+    expect(toastText()).toMatch(/copes better with changing light/);
+    await sleep(100);
+    expect(overlays.modes).toEqual([]); // no calibration behind the reader's back…
+    expect(cameraStart).not.toHaveBeenCalled(); // …and no camera switched on for nothing
+    expect(says.filter((s) => /handle changing light better/.test(s.text))).toHaveLength(1);
+
+    // "Calibrate" starts the full calibration at once, without explaining again.
+    toastButton('Calibrate')!.click();
+    await until(() => overlays.modes.length > 0, 'the calibration');
+    expect(overlays.modes).toEqual(['standard']);
+    expect(says.filter((s) => /handle changing light better/.test(s.text))).toHaveLength(1);
+    // Cancelled: the reason is still given.
+    await until(() => /Please recalibrate once/.test(toastText()), 'the not-calibrated toast');
+
+    // Next visit: calibrating is still needed and starts right away; the explanation isn't repeated.
+    await readWithWebcam(null, { open: false });
+    const again = record(app, 'buddy-say');
+    await openPastedText();
+    await until(() => overlays.modes.length > 1, 'the second calibration');
+    await sleep(50);
+    expect(again.filter((s) => /handle changing light better/.test(s.text))).toHaveLength(0);
+  });
+
+  it('webcam: a light change while the book is settling in is offered once the gate opens, once per change (regression: dropped for the session)', async () => {
+    const realNow = performance.now.bind(performance);
+    let offset = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + offset);
+    let changed = false;
+    let transition: LightingWatchUpdate['transition'] = null;
+    vi.spyOn(LightingWatch.prototype, 'tick').mockImplementation(() => {
+      const t = transition;
+      transition = null;
+      return {
+        state: { flags: [], distance: changed ? 1.4 : 0.2, changedSinceCalibration: changed, dominant: changed ? 'sclera' : null },
+        comparison: null,
+        transition: t,
+        changedAt: t === 'changed' ? performance.now() - 4000 : null,
+      };
+    });
+    const mayOffer = vi.spyOn(GuidanceGate.prototype, 'mayOffer'); // the real gate, watched
+    await readWithWebcam(calibratedModel());
+    const offers = (): number => (/The light changed/.test(toastText()) ? 1 : 0);
+
+    // +10 s after opening the book the light is judged changed: too early (the book settles for 20 s).
+    offset += 10_000;
+    changed = true;
+    transition = 'changed';
+    await until(() => mayOffer.mock.results.some((r) => r.value === false), 'the gate to hold the offer back');
+    await sleep(600);
+    expect(offers()).toBe(0);
+
+    // +21 s: the first pause (there's no reading at all here) brings the offer.
+    offset += 11_000;
+    await until(() => offers() === 1, 'the offer');
+    expect(toastText()).toMatch(/A quick 5-dot refresh keeps page turns accurate/);
+    toastButton('Not now')!.click();
+    await until(() => offers() === 0, 'the offer to go');
+
+    // Snooze and interval over, same light: that change has had its offer.
+    offset += 31 * 60_000;
+    const asked = mayOffer.mock.calls.length;
+    await sleep(800);
+    expect(offers()).toBe(0);
+    expect(mayOffer.mock.calls.length).toBe(asked); // not even requested
+
+    // The light goes back, then changes again: a new change, a new offer.
+    changed = false;
+    transition = 'restored';
+    await sleep(400);
+    changed = true;
+    transition = 'changed';
+    await until(() => offers() === 1, 'the second offer');
+  });
+
+  it('webcam: light coaching reaches a reader who set Dewey to quiet, as a message (regression: silently lost)', async () => {
+    vi.spyOn(LightingWatch.prototype, 'tick').mockImplementation(() => ({
+      state: { flags: ['backlit'], distance: 0.2, changedSinceCalibration: false, dominant: null },
+      comparison: null,
+      transition: null,
+      changedAt: null,
+    }));
+    vi.spyOn(SustainedFlags.prototype, 'update').mockImplementation((_t, flags) => [...flags]);
+    vi.spyOn(GuidanceGate.prototype, 'isPause').mockReturnValue(true);
+    const backlit = /bright light behind you/;
+    for (const [buddyChattiness, viaDewey] of [
+      ['quiet', false],
+      ['normal', true],
+    ] as const) {
+      await readWithWebcam(calibratedModel(), { settings: { buddyEnabled: true, buddyChattiness } });
+      const says = record(app, 'buddy-say');
+      if (viaDewey) {
+        await until(() => says.some((s) => backlit.test(s.text)), 'Dewey’s line');
+        expect(toastText()).not.toMatch(backlit);
+      } else {
+        await until(() => backlit.test(toastText()), 'the message');
+        expect(says.some((s) => backlit.test(s.text))).toBe(false);
+      }
+    }
+  });
+
+  it('records tracking diagnostics from Settings and saves them as a JSON file (numbers only)', async () => {
+    let blob: Blob | null = null;
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: (b: Blob) => {
+        blob = b;
+        return 'blob:test';
+      },
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: () => undefined });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    await openPastedText();
+    const gaze = record(app, 'gaze');
+    app.bus.emit('command', { name: 'open-settings' });
+    const recordBtn = document.querySelector<HTMLButtonElement>('.gr-settings__record')!;
+    recordBtn.click();
+    expect(document.querySelector<HTMLElement>('.gr-rec-chip')!.hidden).toBe(false);
+    app.bus.emit('command', { name: 'close-settings' });
+    for (let i = 0; i < 6; i++) {
+      moveMouse(300 + 20 * i, 200);
+      await sleep(40);
+    }
+    await until(() => gaze.length > 3, 'gaze samples');
+    app.bus.emit('command', { name: 'open-settings' });
+    recordBtn.click(); // stop and download
+    expect(click).toHaveBeenCalledTimes(1);
+    expect(blob).not.toBeNull();
+    const rec = parseRecording(JSON.parse(await blob!.text()) as unknown)!;
+    expect(rec).not.toBeNull();
+    expect(rec.stoppedBy).toBe('user');
+    expect(rec.settings.gazeSource).toBe('mouse');
+    expect(rec.inputs.some((e) => e.k === 'gaze' && e.src === 'mouse' && e.fed === 1)).toBe(true);
+    expect(rec.inputs.some((e) => e.k === 'gaze' && e.fed === 0)).toBe(true); // while Settings was open
+    expect(rec.inputs.some((e) => e.k === 'layout')).toBe(true);
+    expect(rec.environment.userAgent.length).toBeGreaterThan(0);
+    expect(document.querySelector<HTMLElement>('.gr-rec-chip')!.hidden).toBe(true);
+    expect(toastText()).toMatch(/Diagnostics saved/);
+    Reflect.deleteProperty(URL, 'createObjectURL');
+    Reflect.deleteProperty(URL, 'revokeObjectURL');
   });
 });

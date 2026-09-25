@@ -154,6 +154,18 @@ label.row {
   gap: 8px;
 }
 
+.actions .btn--wide {
+  grid-column: 1 / -1;
+}
+
+.calibration.light {
+  margin: 0;
+}
+
+.calibration.light[data-tone="warn"] {
+  color: var(--fg);
+}
+
 .foot {
   display: flex;
   flex-direction: column;

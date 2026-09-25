@@ -8,6 +8,7 @@ import {
   lastFullyVisibleLine,
   pageEndZones,
 } from './pageEndDetector';
+import type { TrackedLineEstimate } from './lineTracker';
 import { mulberry32 } from './simulatedReader';
 import { makeDocument } from './testLayouts';
 
@@ -209,6 +210,69 @@ describe('PageEndDetector', () => {
     const g = { x: xAt(L, 0.85), y: line(L - 1).centerY + 0.4 * pitch };
     for (let fix = 12; fix < 14; fix++) expect(rig.run(250, g, estimate(L, { p: 0.95, fix }))).toBeNull();
     expect(rig.run(1000, g, estimate(L, { p: 0.95, fix: 14 }))?.d.reason).toBe('line-tracker');
+  });
+
+  it('does not take a jump onto the last line as entering it (a peek, or the gaze bias stepping down)', () => {
+    const rig = new Rig();
+    rig.enter(8);
+    // The tracker follows a jump onto L — a peek at the end of the page mid-page, or a light switched
+    // on moving the gaze several lines down — and the gaze goes on along it: not entered, no turn.
+    const g = { x: xAt(L, 0.85), y: line(L - 1).centerY + 0.4 * pitch };
+    expect(rig.run(300, g, estimate(L, { sac: 'jump', p: 0.85, fix: 12 }))).toBeNull();
+    for (let fix = 13; fix < 16; fix++) expect(rig.run(400, g, estimate(L, { p: 0.85, fix }))).toBeNull();
+    expect(rig.last!.detail).toMatch(/not entered/);
+    // A reader who really skipped to the last line reads it: three sure fixations enter it.
+    for (let fix = 16; fix < 18; fix++) expect(rig.run(250, g, estimate(L, { p: 0.95, fix }))).toBeNull();
+    expect(rig.run(1000, g, estimate(L, { p: 0.95, fix: 18 }))?.d.reason).toBe('line-tracker');
+  });
+
+  it('forgets the last line entered when the reader jumps back up to re-read', () => {
+    const rig = new Rig();
+    rig.enter(L);
+    rig.run(300, { x: xAt(5, 0.3), y: line(5).centerY }, estimate(5, { sac: 'jump', fix: 12 }));
+    // Back down, the tracker slides onto L on vertical evidence alone (no sweep into it): no turn.
+    const g = { x: xAt(L, 0.85), y: line(L - 1).centerY + 0.4 * pitch };
+    expect(rig.run(2500, g, estimate(L, { p: 0.8, fix: 13 }))).toBeNull();
+    expect(rig.last!.detail).toMatch(/not entered/);
+  });
+
+  it('takes a jump one line down onto the start of the next line for a return sweep across a scene break', () => {
+    // An hr scene break or a heading's margin puts the last line ≈ 2.8 pitches below the one before:
+    // the sweep into it is classified as a jump. Exactly one line down, landing at the start of the
+    // column, it enters the line like any return sweep (1.0 did; without this: 3 sure fixations).
+    const sweepInto = (from: number, landFrac: number): { d: PageEndDecision; at: number } | null => {
+      const rig = new Rig();
+      rig.enter(from);
+      rig.run(300, { x: xAt(from, 0.9), y: line(from).centerY }, estimate(from, { fix: 12 }));
+      expect(rig.run(250, { x: xAt(L, landFrac), y: line(L).centerY }, estimate(L, { sac: 'jump', p: 0.85, fix: 13 }))).toBeNull();
+      // (Less than bottom-dwell's 1200 ms: only rule 1 can fire.)
+      return rig.run(1000, { x: xAt(L, 0.85), y: line(L).centerY }, estimate(L, { p: 0.85, fix: 14 }));
+    };
+    expect(sweepInto(L - 1, 0.05)?.d.reason).toBe('line-tracker');
+    // Landing mid-line (a peek at the end of the page), or from further up: not an entry.
+    expect(sweepInto(L - 1, 0.45)).toBeNull();
+    expect(sweepInto(L - 2, 0.05)).toBeNull();
+  });
+
+  it('follows a large drift only once the tracker has pinned it (unpinned: at most ±1.5 pitches)', () => {
+    // The gaze 3 pitches below the last line. A tracker that has learned a 3-line offset (sure of its
+    // line, drift SD 0.2 line) says that is the reader on the last line; one that isn't sure (a
+    // spurious "line k − 3, +3" on unstructured text) mustn't hide a look below the page.
+    const below = { x: 500, y: line(L).centerY + 3 * pitch };
+    const tracked = (p: number, sdLines: number): TrackedLineEstimate => ({
+      ...estimate(L - 1, { p, drift: 3 * pitch, fix: 12 }),
+      sigmaYPx: 0.9 * pitch,
+      excursions: 0,
+      driftLowY: 2 * pitch,
+      driftHighY: 4 * pitch,
+      driftSdY: sdLines * pitch,
+    });
+    expect(new Rig().run(2000, below, tracked(0.9, 0.2))).toBeNull();
+    expect(new Rig().run(2000, below, tracked(0.5, 0.2))?.d.reason).toBe('glance-down');
+    expect(new Rig().run(2000, below, tracked(0.9, 0.8))?.d.reason).toBe('glance-down');
+    expect(new Rig().run(2000, below, tracked(0.9, NaN))?.d.reason).toBe('glance-down'); // unknown SD: unpinned
+    // A hand-made estimate (no driftSdY) is taken at its word.
+    expect(new Rig().run(2000, below, estimate(L - 1, { p: 0.5, drift: 3 * pitch, fix: 12 }))).toBeNull();
   });
 
   it('turns right away when the reader sweeps back from the end of the last line', () => {

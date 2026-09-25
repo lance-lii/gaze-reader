@@ -4,12 +4,34 @@
  * mountable into a document or a ShadowRoot, so the extension can use it on
  * any page.
  *
+ * Three modes:
+ *  - standard: 13-point grid, training, 4 validation points.
+ *  - quick: 5 points that re-centre `baseModel` (refineGazeModel). The results
+ *    also say how far off the old model was on those dots, and how far off
+ *    the refresh leaves it.
+ *  - check: the accuracy check. 5 dots and no training: the offset of
+ *    `baseModel` is measured (measureOffset) and put in plain words ("reads
+ *    about 2 lines low"). "Correct it" applies a quick refresh fitted on those
+ *    same dots; "Done" leaves the model alone.
+ *
+ * Positioning coaches distance, centring and light. Light comes from
+ * FeatureFrame.lighting (measured by the camera side, in the web app and the
+ * extension alike) through a LightingMonitor: the sclera for "dark", which
+ * does not depend on skin tone, plus backlight, over-exposure, reflections,
+ * side light and changing light. While the dots are shown, those
+ * measurements are summarised into a LightingSignature stored with the model.
+ *
  * Every phase is announced on the bus as a `calibration` event:
  *   start · positioning · point {index, total} · training ·
  *   validating {index, total} · done {report} · cancelled · failed {message}
  * `index` is 0-based. `point` / `validating` events may also carry
  * `message`: 'retry' (target repeated for lack of samples), 'paused',
- * 'face-lost' (auto-pause) or 'resumed'.
+ * 'face-lost' (auto-pause) or 'resumed'. The accuracy check's dots are
+ * `validating` events (no `point`, no `training`).
+ *
+ * Quick and check runs also emit one `accuracy-check` per results screen,
+ * when the reader decides (or cancels): the old model's offset on the dots,
+ * and whether a correction was applied.
  */
 import type {
   AppEvents,
@@ -21,6 +43,10 @@ import type {
   FeatureFrame,
   FeatureSource,
   GazeModel,
+  LightingComponent,
+  LightingFlag,
+  LightingSignature,
+  LightingStats,
   Mountable,
   Point,
   Unsubscribe,
@@ -29,15 +55,29 @@ import { CSS_PREFIX, IGNORE_ATTR, Z } from '../core/constants';
 import { OneEuroFilter2D } from '../signal/oneEuro';
 import {
   DEFAULT_LINE_PITCH_PX,
+  RidgeGazeModel,
   asRidgeGazeModel,
+  currentScreenOrigin,
   evaluateModel,
   qualityFromError,
   refineGazeModel,
   trainGazeModel,
+  type OffsetMeasurement,
 } from '../gaze/calibrationModel';
+import {
+  LIGHTING_STAT_KEYS,
+  LightingMonitor,
+  buildLightingSignature,
+  compareLightingSignatures,
+  parseLightingSignature,
+  type LightingSample,
+} from '../gaze/lighting';
 import { BlinkGate, DEFAULT_BLINK_GATE } from '../gaze/webcamGazeSource';
+import { DOT_OFF_LINES, offsetVerdict, withinWords, type OffsetWords } from '../app/offsetWords';
 
 // ─────────────────────────────── Public API ──────────────────────────────────
+
+export type CalibrationMode = 'quick' | 'standard' | 'check';
 
 export interface CalibrationOverlayOptions {
   /** Already started by the caller; the overlay only subscribes. */
@@ -45,8 +85,16 @@ export interface CalibrationOverlayOptions {
   bus: EventBus;
   /** The camera's video element; its stream is mirrored into the positioning preview. */
   video?: HTMLVideoElement | null;
-  /** quick = 5 points refining `baseModel`; standard = 13-point grid + 4 validation points. */
-  mode?: 'quick' | 'standard';
+  /**
+   * quick = 5 points refining `baseModel`; standard = 13-point grid + 4 validation points;
+   * check = 5 points measuring `baseModel` without training (see the file comment).
+   * quick and check fall back to standard without a usable `baseModel`.
+   */
+  mode?: CalibrationMode;
+  /**
+   * The model in use. Pass it as it is used for reading (a wrapper is fine): the check measures
+   * it through `predict`, while corrections are fitted on its ridge core (asRidgeGazeModel).
+   */
   baseModel?: GazeModel | null;
   /** Line pitch of the reader's text, for "≈ N lines". Default 22 px × 1.9. */
   linePitchPx?: number | (() => number | null | undefined);
@@ -61,6 +109,55 @@ export interface CalibrationOverlayOptions {
 export interface CalibrationResult {
   model: GazeModel;
   report: CalibrationReport;
+  /** Present after a quick refresh and after an accuracy check whose correction was applied. */
+  check?: AccuracyCheckResult;
+}
+
+/** A systematic offset on a few dots, at the reader's line pitch. */
+export interface OffsetSummary {
+  /** Mean Euclidean error of the per-dot mean prediction, px. */
+  meanErrorPx: number;
+  /** Mean signed error (prediction − target), px; positive y = gaze reads lower than reality. */
+  offsetXPx: number;
+  offsetYPx: number;
+  offsetYLines: number;
+  /** offsetXPx as a fraction of the viewport width (> 0 = right); absent when unknown. */
+  offsetXFrac?: number;
+  /**
+   * Largest vertical error of a single dot (|mean prediction − target|), lines; absent when
+   * unknown. The mean offset hides a scale error on these symmetric dots; this doesn't.
+   */
+  maxDotYLines?: number;
+  /** Dots that contributed. */
+  targets: number;
+}
+
+/** How the reader's light compares with the light at calibration. */
+export interface LightingChange {
+  /** Signature distance (≥ 1 = changed meaningfully). */
+  distance: number;
+  changed: boolean;
+  /** The component that moved most. */
+  dominant: LightingComponent;
+  /** Plain words for a changed light ("your eyes are more brightly lit"), null when unchanged. */
+  text: string | null;
+}
+
+export interface AccuracyCheckResult {
+  mode: 'check' | 'quick';
+  /** The model in use before this run, measured on this run's dots. */
+  before: OffsetSummary;
+  /**
+   * What the correction leaves (leave-one-dot-out when there are ≥ 3 dots), or null when no
+   * correction could be fitted. For 'check' it is computed before the reader chooses.
+   */
+  after: OffsetSummary | null;
+  /** Whether the correction was applied (the model in the result is the corrected one). */
+  applied: boolean;
+  /** Lighting measured while the dots were shown; null with too few lighting measurements. */
+  lighting: LightingSignature | null;
+  /** Compared with the calibration's lighting; null when either signature is unknown. */
+  lightingChange: LightingChange | null;
 }
 
 export interface CalibrationTiming {
@@ -124,6 +221,63 @@ export const QUICK_TARGETS: readonly Point[] = Object.freeze([
   { x: 0.15, y: 0.85 },
   { x: 0.85, y: 0.85 },
 ]);
+/**
+ * The accuracy check's dots: the quick refresh's, so "Correct it" can refine from them with the
+ * geometry refineGazeModel was designed for (centre + four corners spread the scale fit).
+ */
+export const CHECK_TARGETS: readonly Point[] = QUICK_TARGETS;
+
+// ─────────────────────────── Offsets in plain words ──────────────────────────
+// The verdict lives in src/app/offsetWords.ts, so the toast after "Done" says what this screen says.
+
+export {
+  CORRECT_FROM_LINES,
+  DOT_BIG_LINES,
+  DOT_CORRECT_LINES,
+  DOT_OFF_LINES,
+  OFFSET_X_FRAC,
+  ON_TARGET_LINES,
+  describeOffset,
+  offsetVerdict,
+  type OffsetBadge,
+  type OffsetVerdict,
+  type OffsetWords,
+} from '../app/offsetWords';
+
+/**
+ * Compares the lighting now with the lighting at calibration, in words the reader can act on.
+ * All components are ratios (no absolute face brightness), so it does not depend on skin tone.
+ */
+export function describeLightingChange(reference: LightingSignature, current: LightingSignature): LightingChange {
+  const cmp = compareLightingSignatures(reference, current);
+  const changed = cmp.distance >= 1;
+  const up = cmp.z[cmp.dominant] > 0;
+  let text: string | null = null;
+  if (changed) {
+    switch (cmp.dominant) {
+      case 'sclera':
+        text = up ? 'your eyes are more brightly lit now' : 'your eyes are more dimly lit now';
+        break;
+      case 'backlight':
+        // backlight = log2(sclera / background): lower means more light behind the reader.
+        text = up ? 'there’s less light behind you now' : 'there’s more light behind you now';
+        break;
+      case 'side':
+        text = Math.abs(current.c.side) >= Math.abs(reference.c.side) ? 'more of the light comes from one side now' : 'the light is more even across your face now';
+        break;
+      case 'shade':
+        text = up ? 'there are fewer shadows around your eyes now' : 'there are more shadows around your eyes now';
+        break;
+      case 'glare':
+        text = up ? 'there are more reflections on your glasses or eyes now' : 'there are fewer reflections on your glasses or eyes now';
+        break;
+      case 'range':
+        text = up ? 'the light on your face is harsher now' : 'the light on your face is softer now';
+        break;
+    }
+  }
+  return { distance: cmp.distance, changed, dominant: cmp.dominant, text };
+}
 
 // ───────────────────────── Positioning assessment ────────────────────────────
 
@@ -136,8 +290,14 @@ export type PositionIssue =
   | 'move-right'
   | 'move-up'
   | 'move-down'
+  | 'light-changing'
+  | 'backlit'
   | 'too-dark'
+  | 'overexposed'
   | 'unsteady';
+
+/** Lighting advice that doesn't hold up the start: it helps, but calibration works without it. */
+export type LightingTip = 'glare' | 'side-lit';
 
 export interface PositionMetrics {
   faceFound: boolean;
@@ -150,8 +310,11 @@ export interface PositionMetrics {
   pitch: number;
   /** FeatureFrame.quality, 0..1. */
   quality: number;
-  /** Mean luma of the face region 0..1, or null when it can't be measured. */
-  brightness: number | null;
+  /**
+   * LightingMonitor flags from FeatureFrame.lighting, or null when the light isn't being
+   * measured (no measurements, or none for a few seconds).
+   */
+  lighting: readonly LightingFlag[] | null;
 }
 
 export interface PositionThresholds {
@@ -162,7 +325,6 @@ export interface PositionThresholds {
   maxCenterY: number;
   maxYaw: number;
   maxPitch: number;
-  minBrightness: number;
   minQuality: number;
 }
 
@@ -180,13 +342,14 @@ export const DEFAULT_POSITION_THRESHOLDS: Readonly<PositionThresholds> = Object.
   maxCenterY: 0.7,
   maxYaw: 0.35,
   maxPitch: 0.42,
-  minBrightness: 0.2,
   minQuality: 0.4,
 });
 
 export interface PositionAssessment {
   /** The single most important thing to fix, or null when all is well. */
   issue: PositionIssue | null;
+  /** Lighting advice that doesn't block starting (shown when there is no issue), or null. */
+  tip: LightingTip | null;
   checks: { face: boolean; distance: boolean; center: boolean; light: boolean };
 }
 
@@ -194,6 +357,11 @@ export interface PositionAssessment {
  * Pure coaching logic. Directions are from the reader's point of view: the
  * camera image is not mirrored, so a face on the image's right means the
  * reader sits too far to *their* left and should move right.
+ *
+ * Light comes from LightingMonitor flags (never from how bright the face is,
+ * which depends on skin tone). Changing light, backlight, dark eyes and a
+ * washed-out picture are issues; reflections and light from one side are tips.
+ * Without lighting measurements the light check rests on tracking quality.
  */
 export function assessPosition(
   m: PositionMetrics,
@@ -201,7 +369,7 @@ export function assessPosition(
 ): PositionAssessment {
   const finite = [m.faceScale, m.faceCenter.x, m.faceCenter.y, m.yaw, m.pitch].every(Number.isFinite);
   if (!m.faceFound || !finite) {
-    return { issue: 'no-face', checks: { face: false, distance: false, center: false, light: false } };
+    return { issue: 'no-face', tip: null, checks: { face: false, distance: false, center: false, light: false } };
   }
   const tooClose = m.faceScale > t.maxFaceScale;
   const tooFar = m.faceScale < t.minFaceScale;
@@ -210,13 +378,26 @@ export function assessPosition(
   const horizontal: PositionIssue | null = dx > t.maxOffsetX ? 'move-right' : dx < -t.maxOffsetX ? 'move-left' : null;
   const vertical: PositionIssue | null =
     m.faceCenter.y < t.minCenterY ? 'move-down' : m.faceCenter.y > t.maxCenterY ? 'move-up' : null;
-  const dark = m.brightness !== null && m.brightness < t.minBrightness;
+  const flags = m.lighting ?? [];
+  const has = (f: LightingFlag): boolean => flags.includes(f);
+  // Changing light first: the other flags may be the camera still adjusting. Backlight explains
+  // dark eyes better than "add light" does, so it comes before 'too-dark'.
+  const light: PositionIssue | null = has('unstable')
+    ? 'light-changing'
+    : has('backlit')
+      ? 'backlit'
+      : has('dark')
+        ? 'too-dark'
+        : has('overexposed')
+          ? 'overexposed'
+          : null;
+  const tip: LightingTip | null = has('glare') ? 'glare' : has('side-lit') ? 'side-lit' : null;
   const shaky = m.quality < t.minQuality;
   const checks = {
     face: true,
     distance: !tooClose && !tooFar,
     center: !notFacing && !horizontal && !vertical,
-    light: !dark && !shaky,
+    light: !light && !shaky,
   };
   const issue: PositionIssue | null = notFacing
     ? 'not-facing'
@@ -224,8 +405,8 @@ export function assessPosition(
       ? 'too-close'
       : tooFar
         ? 'too-far'
-        : (horizontal ?? vertical ?? (dark ? 'too-dark' : shaky ? 'unsteady' : null));
-  return { issue, checks };
+        : (horizontal ?? vertical ?? light ?? (shaky ? 'unsteady' : null));
+  return { issue, tip, checks };
 }
 
 // ──────────────────────────────── Copy ───────────────────────────────────────
@@ -241,9 +422,24 @@ const COACH: Record<PositionIssue | 'ready' | 'waiting' | 'no-camera', string> =
   'move-right': 'Move a little to your right.',
   'move-down': 'Tilt the screen back a little, or sit a bit lower.',
   'move-up': 'Tilt the screen forward a little, or sit up taller.',
-  'too-dark': 'It’s a bit dark — more light on your face will help.',
+  'light-changing': 'The light is changing — give the camera a moment to settle.',
+  backlit: 'Bright light behind you puts your face in shadow — a lamp in front of you, or closing the blind behind you, will help.',
+  'too-dark': 'Your eyes are a little hard to see — more light on your face will help.',
+  overexposed: 'The picture looks washed out — a little less light on your face, or a dimmer screen, will help.',
   unsteady: 'Hold still for a moment — tracking is a little shaky.',
   ready: 'Perfect — you’re all set.',
+};
+
+const TIP_COPY: Record<LightingTip, string> = {
+  glare: 'You’re all set. One tip: I see bright reflections on your glasses or eyes — tilting the screen a little or moving the lamp helps.',
+  'side-lit': 'You’re all set. One tip: most of the light comes from one side — more even light on your face tracks best.',
+};
+
+const CHECK_STATE_TEXT: Record<'ok' | 'bad' | 'tip' | 'pending', string> = {
+  ok: 'fine',
+  bad: 'needs attention',
+  tip: 'fine, with a tip',
+  pending: 'not checked yet',
 };
 
 const QUALITY_COPY: Record<CalibrationQuality, { badge: string; title: string; advice: string }> = {
@@ -272,16 +468,54 @@ const QUALITY_COPY: Record<CalibrationQuality, { badge: string; title: string; a
 const FAIL_TOO_FEW =
   'I couldn’t get a steady look at your eyes. More light on your face and keeping your head still usually fixes it.';
 const FAIL_QUICK =
-  'Your eyes look quite different from the saved calibration, so a quick tune-up can’t fix it. Let’s do a full calibration instead.';
+  'Your eyes look quite different from the saved calibration, so a quick refresh can’t fix it. Let’s do a full calibration instead.';
+const FAIL_CHECK =
+  'I couldn’t compare your eyes with the saved calibration, so this check can’t tell much. A full calibration will sort it out.';
+
+const NEXT_COPY: Record<CalibrationMode, string> = {
+  standard: `Next: ${STANDARD_TARGETS.length} dots, then ${VALIDATION_TARGETS.length} quick checks. Look right at the center of each dot until it disappears — move your eyes, not your head.`,
+  quick: `Quick refresh: ${QUICK_TARGETS.length} dots, about 10 seconds. Look right at the center of each one until it disappears.`,
+  check: `Accuracy check: ${CHECK_TARGETS.length} dots, about 10 seconds. Look right at the center of each one until it disappears — nothing changes unless you ask.`,
+};
 
 // ─────────────────────────────── Internals ───────────────────────────────────
 
 type Phase = 'idle' | 'positioning' | 'targets' | 'training' | 'validating' | 'results' | 'failed';
-type Choice = 'use' | 'redo' | 'full';
+/** use = "Use it" / "Correct it"; done = keep the model as it is (accuracy check). */
+type Choice = 'use' | 'redo' | 'full' | 'done';
 type PauseReason = 'user' | 'face';
 type TargetKind = 'point' | 'validating';
-type Coach = PositionIssue | 'ready' | 'waiting' | 'no-camera';
+type Coach = PositionIssue | LightingTip | 'ready' | 'waiting' | 'no-camera';
+type CheckState = 'ok' | 'bad' | 'tip' | 'pending';
 type CalibrationEvent = AppEvents['calibration'];
+
+/** What a run ends with: the result run() resolves (null = nothing changed) and the report for 'done'. */
+interface FlowOutcome {
+  result: CalibrationResult | null;
+  report: CalibrationReport;
+}
+
+/** Everything the results screen shows. */
+interface ResultsView {
+  mode: CalibrationMode;
+  /** Drawn on the map and driving the live dot: the new model, or the checked one. */
+  model: GazeModel;
+  report: CalibrationReport;
+  check: AccuracyCheckResult | null;
+  /** Check mode: a correction was fitted and can be applied. */
+  canCorrect: boolean;
+  /** Check mode: offer a full calibration (no correction possible, or it would still be poor). */
+  suggestFull: boolean;
+}
+
+const isTip = (c: Coach): c is LightingTip => c === 'glare' || c === 'side-lit';
+
+/** Lighting flags are dropped when no measurement arrived for this long (the probe skips blinks and junk frames). */
+const LIGHTING_STALE_MS = 3000;
+/** Lighting samples for the signature are kept at most this often (measurements arrive at ~6–7 Hz)… */
+const LIGHT_SAMPLE_GAP_MS = 100;
+/** …and thinned by half whenever this many have piled up (a very long run). */
+const MAX_LIGHT_SAMPLES = 1200;
 
 const P = `${CSS_PREFIX}cal`;
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -330,8 +564,7 @@ interface PositioningState {
   enteredAt: number;
   lastFrameAt: number | null;
   noFaceSince: number | null;
-  metrics: Omit<PositionMetrics, 'brightness' | 'faceFound'> | null;
-  brightness: number | null;
+  metrics: Omit<PositionMetrics, 'lighting' | 'faceFound'> | null;
   checks: PositionAssessment['checks'];
   candidate: Coach;
   candidateSince: number;
@@ -367,13 +600,20 @@ interface Dom {
   badge: HTMLSpanElement;
   resultTitle: HTMLHeadingElement;
   statPx: HTMLSpanElement;
+  statPxLabel: HTMLSpanElement;
   statLines: HTMLSpanElement;
+  statLinesUnit: HTMLSpanElement;
+  statLinesLabel: HTMLSpanElement;
   map: SVGSVGElement;
+  note: HTMLParagraphElement;
   advice: HTMLParagraphElement;
+  tryit: HTMLParagraphElement;
   use: HTMLButtonElement;
+  done: HTMLButtonElement;
   redo: HTMLButtonElement;
   live: HTMLDivElement;
   failed: HTMLDivElement;
+  failTitle: HTMLHeadingElement;
   failText: HTMLParagraphElement;
   retry: HTMLButtonElement;
   sr: HTMLDivElement;
@@ -401,9 +641,20 @@ export class CalibrationOverlay implements Mountable {
 
   private pos: PositioningState | null = null;
   private positionTicker: ReturnType<typeof setInterval> | null = null;
-  private brightnessCanvas: HTMLCanvasElement | null = null;
   private previewActive = false;
   private onStart: (() => void) | null = null;
+  /** The mode of the current pass (quick/check fall back to standard). */
+  private runMode: CalibrationMode = 'standard';
+
+  /** Smoothed lighting flags for the positioning coach (fed from FeatureFrame.lighting). */
+  private readonly lightMonitor = new LightingMonitor();
+  /** performance.now() of the latest lighting measurement. */
+  private lightingAt = -Infinity;
+  /** Lighting measured while this pass's dots are shown, for the calibration's signature. */
+  private lightSamples: LightingSample[] = [];
+  private lightSampleAt = -Infinity;
+  private lightSampleGapMs = LIGHT_SAMPLE_GAP_MS;
+  private lastCheck: AccuracyCheckResult | null = null;
 
   private collector: Collector | null = null;
   private progress: { kind: TargetKind; index: number; total: number } | null = null;
@@ -434,13 +685,26 @@ export class CalibrationOverlay implements Mountable {
     return this.runPromise !== null;
   }
 
+  /**
+   * The latest accuracy measurement of this run (quick or check mode), with `applied` set once
+   * the reader has decided; null before any. Also available after an accuracy check closed with
+   * "Done", when run() resolves null.
+   */
+  get lastAccuracyCheck(): AccuracyCheckResult | null {
+    return this.lastCheck;
+  }
+
   mount(parent: HTMLElement | ShadowRoot): void {
     if (this.destroyed) return;
     if (!this.root) this.build(parent.ownerDocument ?? document);
     if (this.root) parent.appendChild(this.root);
   }
 
-  /** Resolves with the accepted model, or null when cancelled (Esc, cancel(), destroy()). */
+  /**
+   * Resolves with the accepted model, or null when cancelled (Esc, cancel(), destroy()) — and
+   * null when an accuracy check ends with "Done", since the model is unchanged then (the
+   * measurement is in the 'accuracy-check' event and `lastAccuracyCheck`).
+   */
   run(): Promise<CalibrationResult | null> {
     if (this.destroyed) return Promise.resolve(null);
     if (this.runPromise) {
@@ -483,11 +747,13 @@ export class CalibrationOverlay implements Mountable {
     const signal = ctl.signal;
     try {
       this.beginRun();
-      this.emit({ phase: 'start' });
-      const result = await this.flow(signal);
+      // Tells Dewey (and anyone listening) that this is an accuracy check, not a calibration; the
+      // same rule as flow(). A check that turns into a calibration then emits 'point' / 'training'.
+      this.emit({ phase: 'start', ...(this.opts.mode === 'check' && this.opts.baseModel ? { message: 'check' } : {}) });
+      const outcome = await this.flow(signal);
       this.endRun();
-      this.emit({ phase: 'done', report: result.report });
-      return result;
+      this.emit({ phase: 'done', report: outcome.report });
+      return outcome.result;
     } catch (err) {
       this.endRun();
       if (signal.aborted) {
@@ -502,21 +768,39 @@ export class CalibrationOverlay implements Mountable {
     }
   }
 
-  private async flow(signal: AbortSignal): Promise<CalibrationResult> {
-    const base = asRidgeGazeModel(this.opts.baseModel);
-    let mode: 'quick' | 'standard' = this.opts.mode === 'quick' && base ? 'quick' : 'standard';
+  private async flow(signal: AbortSignal): Promise<FlowOutcome> {
+    const current = this.opts.baseModel ?? null;
+    const base = asRidgeGazeModel(current);
+    const requested = this.opts.mode ?? 'standard';
+    let mode: CalibrationMode = requested === 'quick' && base ? 'quick' : requested === 'check' && current ? 'check' : 'standard';
     for (;;) {
+      this.runMode = mode;
       await this.positioning(signal, mode);
-      if (mode === 'quick' && (!base || (this.lastFeatureLength !== null && this.lastFeatureLength !== base.featureLength))) {
+      // The saved model can't read today's features: only a full calibration helps.
+      if (mode !== 'standard' && base && this.lastFeatureLength !== null && this.lastFeatureLength !== base.featureLength) {
         mode = 'standard';
+        this.runMode = mode;
       }
 
-      const plan = mode === 'quick' ? [...QUICK_TARGETS] : shuffle(STANDARD_TARGETS, this.random);
-      const collected = await this.collectTargets(plan, 'point', signal);
-      if (collected.succeeded < (mode === 'quick' ? MIN_TARGETS_QUICK : MIN_TARGETS_STANDARD)) {
+      this.resetLightSamples();
+      const plan = mode === 'standard' ? shuffle(STANDARD_TARGETS, this.random) : [...(mode === 'check' ? CHECK_TARGETS : QUICK_TARGETS)];
+      const collected = await this.collectTargets(plan, mode === 'check' ? 'validating' : 'point', signal);
+      if (collected.succeeded < (mode === 'standard' ? MIN_TARGETS_STANDARD : MIN_TARGETS_QUICK)) {
         await this.failure(FAIL_TOO_FEW, signal);
         continue;
       }
+      // Skin-tone-independent summary of the light while the dots were shown (null when unmeasured).
+      const lighting = buildLightingSignature(this.lightSamples);
+
+      if (mode === 'check' && current) {
+        const outcome = await this.accuracyCheck(current, base, collected.samples, lighting, signal);
+        if (outcome) return outcome;
+        mode = 'standard'; // "Full calibration" (chosen, or the only way forward)
+        continue;
+      }
+
+      // A refresh starts by measuring how far off the model in use was on these same dots.
+      const before = mode === 'quick' && current ? this.measure(current, collected.samples) : null;
 
       this.setPhase('training');
       this.emit({ phase: 'training' });
@@ -524,15 +808,16 @@ export class CalibrationOverlay implements Mountable {
       await this.sleep(60, signal); // let the "learning" screen paint before the synchronous fit
       const viewport = this.measureViewport();
       const maxBlink = SAMPLE_MAX_BLINK;
-      let trained: CalibrationResult;
+      const environment = { lighting };
+      let trained: { model: GazeModel; report: CalibrationReport };
       try {
         trained =
           mode === 'quick' && base
-            ? refineGazeModel(base, collected.samples, { viewport, maxBlink })
-            : trainGazeModel(collected.samples, { viewport, maxBlink, featureNames: this.opts.featureNames });
+            ? refineGazeModel(alignCore(current, base, collected.samples), collected.samples, { viewport, maxBlink, environment })
+            : trainGazeModel(collected.samples, { viewport, maxBlink, featureNames: this.opts.featureNames, environment });
       } catch (err) {
         if (mode === 'quick') {
-          // The saved model can't explain today's eyes; retrying the tune-up would fail the same way.
+          // The saved model can't explain today's eyes; retrying the refresh would fail the same way.
           mode = 'standard';
           await this.failure(FAIL_QUICK, signal, 'Full calibration');
         } else {
@@ -551,16 +836,141 @@ export class CalibrationOverlay implements Mountable {
         }
       }
       // Grade at the reader's own text size, so the badge agrees with the "≈ N lines" stat.
-      const vh = trained.model.viewport.height > 0 ? trained.model.viewport.height : this.measureViewport().height;
-      report = { ...report, quality: qualityFromError(report.meanErrorPx, vh, this.linePitch()) };
+      const pitch = this.linePitch();
+      const vh = modelHeight(trained.model) || this.measureViewport().height;
+      report = { ...report, quality: qualityFromError(report.meanErrorPx, vh, pitch) };
 
-      const choice = await this.results(trained.model, report, mode, signal);
-      if (choice === 'use') return { model: trained.model, report };
-      if (choice === 'full') mode = 'standard';
+      const check: AccuracyCheckResult | null =
+        before && before.targets > 0
+          ? {
+              mode: 'quick',
+              before,
+              after: offsetOfReport(trained.report, pitch, this.measureViewport().width), // leave-one-dot-out
+              applied: false,
+              lighting,
+              lightingChange: this.lightingChange(current, base, lighting),
+            }
+          : null;
+      if (check) this.lastCheck = check;
+      const decided = await this.decide({ mode, model: trained.model, report, check, canCorrect: false, suggestFull: false }, signal);
+      if (decided.choice === 'use') {
+        return { result: { model: trained.model, report, ...(decided.check ? { check: decided.check } : {}) }, report };
+      }
+      if (decided.choice === 'full') mode = 'standard';
     }
   }
 
-  private positioning(signal: AbortSignal, mode: 'quick' | 'standard'): Promise<void> {
+  /**
+   * The accuracy check: measures `current` on the dots, fits (but doesn't apply) the correction,
+   * and lets the reader choose. Null means "go to a full calibration".
+   */
+  private async accuracyCheck(
+    current: GazeModel,
+    base: RidgeGazeModel | null,
+    samples: CalibrationSample[],
+    lighting: LightingSignature | null,
+    signal: AbortSignal,
+  ): Promise<FlowOutcome | null> {
+    const maxBlink = SAMPLE_MAX_BLINK;
+    const pitch = this.linePitch();
+    const viewport = this.measureViewport();
+    const measured = evaluateModel(current, samples, { maxBlink });
+    const before = offsetOfReport(measured, pitch, viewport.width);
+    if (before.targets < MIN_TARGETS_QUICK) {
+      // The model predicts nothing for these eyes (e.g. built for other features).
+      await this.failure(FAIL_CHECK, signal, 'Full calibration');
+      return null;
+    }
+    const report: CalibrationReport = {
+      ...measured,
+      quality: qualityFromError(measured.meanErrorPx, modelHeight(current) || viewport.height, pitch),
+    };
+    // Fitted now so the screen can say what it would leave; applied only on "Correct it".
+    let corrected: { model: RidgeGazeModel; report: CalibrationReport } | null = null;
+    if (base) {
+      try {
+        const r = refineGazeModel(alignCore(current, base, samples), samples, { viewport, maxBlink, environment: { lighting } });
+        const vh = modelHeight(r.model) || viewport.height;
+        corrected = { model: r.model, report: { ...r.report, quality: qualityFromError(r.report.meanErrorPx, vh, pitch) } };
+      } catch {
+        corrected = null;
+      }
+    }
+    const after = corrected ? offsetOfReport(corrected.report, pitch, viewport.width) : null;
+    const check: AccuracyCheckResult = {
+      mode: 'check',
+      before,
+      after,
+      applied: false,
+      lighting,
+      lightingChange: this.lightingChange(current, base, lighting),
+    };
+    this.lastCheck = check;
+    const view: ResultsView = {
+      mode: 'check',
+      model: current,
+      report,
+      check,
+      canCorrect: corrected !== null,
+      // The correction is an offset plus a heavily shrunk scale: it removes only about a third of
+      // a scale error. When a dot would still be a line off afterwards (leave-one-dot-out), a full
+      // calibration is the better fix.
+      suggestFull: corrected === null || corrected.report.quality === 'poor' || (after?.maxDotYLines ?? 0) >= DOT_OFF_LINES,
+    };
+    const decided = await this.decide(view, signal);
+    if (decided.choice === 'use' && corrected) {
+      return { result: { model: corrected.model, report: corrected.report, check: decided.check ?? check }, report: corrected.report };
+    }
+    if (decided.choice === 'full') return null;
+    return { result: null, report };
+  }
+
+  /** Shows the results and waits for the reader; settles (and announces) the measurement either way. */
+  private async decide(view: ResultsView, signal: AbortSignal): Promise<{ choice: Choice; check: AccuracyCheckResult | null }> {
+    let choice: Choice;
+    try {
+      choice = await this.results(view, signal);
+    } catch (err) {
+      if (view.check) this.settleCheck(view.check, false);
+      throw err;
+    }
+    const applied = choice === 'use' && (view.mode !== 'check' || view.canCorrect);
+    return { choice, check: view.check ? this.settleCheck(view.check, applied) : null };
+  }
+
+  /** Records the reader's decision on a measurement and emits 'accuracy-check' (the old model's offset). */
+  private settleCheck(check: AccuracyCheckResult, applied: boolean): AccuracyCheckResult {
+    const settled: AccuracyCheckResult = { ...check, applied };
+    this.lastCheck = settled;
+    const b = check.before;
+    this.opts.bus.emit('accuracy-check', {
+      meanErrorPx: b.meanErrorPx,
+      offsetXPx: b.offsetXPx,
+      offsetYPx: b.offsetYPx,
+      offsetYLines: b.offsetYLines,
+      ...(b.offsetXFrac !== undefined && Number.isFinite(b.offsetXFrac) ? { offsetXFrac: b.offsetXFrac } : {}),
+      ...(b.maxDotYLines !== undefined && Number.isFinite(b.maxDotYLines) ? { maxDotYLines: b.maxDotYLines } : {}),
+      applied,
+    });
+    return settled;
+  }
+
+  /**
+   * Offset of `model` on these samples, at the reader's line pitch: measureOffset's figures
+   * (the same evaluateModel filtering), plus the worst dot.
+   */
+  private measure(model: GazeModel, samples: readonly CalibrationSample[]): OffsetSummary {
+    return offsetOfReport(evaluateModel(model, samples, { maxBlink: SAMPLE_MAX_BLINK }), this.linePitch(), this.measureViewport().width);
+  }
+
+  /** Today's light against the calibration's (the ridge core carries it even when a wrapper doesn't). */
+  private lightingChange(current: GazeModel | null, base: RidgeGazeModel | null, lighting: LightingSignature | null): LightingChange | null {
+    if (!lighting) return null;
+    const ref = parseLightingSignature(base?.environment?.lighting ?? current?.environment?.lighting ?? null);
+    return ref ? describeLightingChange(ref, lighting) : null;
+  }
+
+  private positioning(signal: AbortSignal, mode: CalibrationMode): Promise<void> {
     signal.throwIfAborted();
     const now = performance.now();
     this.pos = {
@@ -568,7 +978,6 @@ export class CalibrationOverlay implements Mountable {
       lastFrameAt: null,
       noFaceSince: null,
       metrics: null,
-      brightness: null,
       checks: { face: false, distance: false, center: false, light: false },
       candidate: 'waiting',
       candidateSince: now,
@@ -578,22 +987,13 @@ export class CalibrationOverlay implements Mountable {
       ready: false,
     };
     const dom = this.dom;
-    if (dom) {
-      dom.next.textContent =
-        mode === 'quick'
-          ? 'Quick tune-up: 5 dots, about 10 seconds. Look right at the center of each one until it disappears.'
-          : `Next: ${STANDARD_TARGETS.length} dots, then ${VALIDATION_TARGETS.length} quick checks. Look right at the center of each dot until it disappears — move your eyes, not your head.`;
-    }
+    if (dom) dom.next.textContent = NEXT_COPY[mode];
     this.setPhase('positioning');
     this.emit({ phase: 'positioning' });
     this.attachPreview();
     this.renderPositioning();
 
-    let tick = 0;
-    this.positionTicker = this.every(200, () => {
-      if (++tick % 3 === 0) this.sampleBrightness();
-      this.evaluatePositioning(performance.now());
-    });
+    this.positionTicker = this.every(200, () => this.evaluatePositioning(performance.now()));
 
     return new Promise<void>((resolve, reject) => {
       const cleanup = (): void => {
@@ -705,16 +1105,15 @@ export class CalibrationOverlay implements Mountable {
     }
   }
 
-  private results(model: GazeModel, report: CalibrationReport, mode: 'quick' | 'standard', signal: AbortSignal): Promise<Choice> {
+  private results(view: ResultsView, signal: AbortSignal): Promise<Choice> {
     signal.throwIfAborted();
-    this.renderResults(model, report, mode);
+    const primary = this.renderResults(view);
     this.setPhase('results');
-    this.liveModel = model;
+    this.liveModel = view.model;
     this.liveFilter.reset();
     this.liveLastValid = -Infinity;
     this.liveViewport = this.measureViewport();
-    const dom = this.dom;
-    if (dom) this.focusButton(report.quality === 'poor' ? dom.redo : dom.use);
+    if (primary) this.focusButton(primary);
     return new Promise<Choice>((resolve, reject) => {
       const cleanup = (): void => {
         signal.removeEventListener('abort', onAbort);
@@ -738,6 +1137,7 @@ export class CalibrationOverlay implements Mountable {
     signal.throwIfAborted();
     const dom = this.dom;
     if (dom) {
+      dom.failTitle.textContent = this.runMode === 'check' ? 'The accuracy check didn’t work' : 'Calibration didn’t work';
       dom.failText.textContent = message;
       dom.retry.textContent = retryLabel;
     }
@@ -770,6 +1170,10 @@ export class CalibrationOverlay implements Mountable {
     this.resolveTone();
     root.hidden = false;
     this.blinkGate.reset();
+    this.lightMonitor.reset();
+    this.lightingAt = -Infinity;
+    this.resetLightSamples();
+    this.lastCheck = null;
     this.unsubscribeFrames = this.opts.features.onFrame(this.handleFrame);
     const win = root.ownerDocument.defaultView;
     if (win && !this.listening) {
@@ -827,6 +1231,7 @@ export class CalibrationOverlay implements Mountable {
     const now = performance.now();
     // Every frame goes through the blink gate, whatever the phase, so blink episodes are timed right.
     const usable = this.usableFeatures(frame, now);
+    if (frame.lighting !== undefined) this.noteLighting(frame, now);
     switch (this.phase) {
       case 'positioning':
         this.updatePositioning(frame, now);
@@ -902,6 +1307,9 @@ export class CalibrationOverlay implements Mountable {
         break;
       case 'use':
         this.onChoice?.('use');
+        break;
+      case 'done':
+        this.onChoice?.('done');
         break;
       case 'redo':
         this.onChoice?.(this.dom?.redo.dataset.choice === 'full' ? 'full' : 'redo');
@@ -985,8 +1393,8 @@ export class CalibrationOverlay implements Mountable {
       raw = 'no-face';
       s.checks = { face: false, distance: false, center: false, light: false };
     } else {
-      const a = assessPosition({ ...s.metrics, faceFound: true, brightness: s.brightness });
-      raw = a.issue ?? 'ready';
+      const a = assessPosition({ ...s.metrics, faceFound: true, lighting: this.currentLightingFlags(now) });
+      raw = a.issue ?? a.tip ?? 'ready';
       s.checks = a.checks;
     }
 
@@ -997,7 +1405,8 @@ export class CalibrationOverlay implements Mountable {
     // Hysteresis: advice only changes once the new situation has held for a moment.
     if (s.shown === 'waiting' || raw === 'waiting' || now - s.candidateSince >= 300) s.shown = raw;
 
-    s.goodSince = raw === 'ready' ? (s.goodSince ?? now) : null;
+    // A tip is advice, not a problem: it doesn't hold up the start.
+    s.goodSince = raw === 'ready' || isTip(raw) ? (s.goodSince ?? now) : null;
     s.ready = s.goodSince !== null && now - s.goodSince >= this.timing.readyHoldMs;
     const faceVisible = s.shown !== 'waiting' && s.shown !== 'no-camera' && s.shown !== 'no-face';
     s.canStart = s.ready || (faceVisible && now - s.enteredAt >= this.timing.startAnywayMs);
@@ -1012,19 +1421,31 @@ export class CalibrationOverlay implements Mountable {
     const s = this.pos;
     const dom = this.dom;
     if (!s || !dom) return;
-    const text = s.shown === 'ready' && !s.ready ? 'Great — hold that for a moment…' : COACH[s.shown];
+    const shown = s.shown;
+    const good = shown === 'ready' || isTip(shown);
+    const text = good && !s.ready ? 'Great — hold that for a moment…' : isTip(shown) ? TIP_COPY[shown] : COACH[shown];
     if (dom.statusText.textContent !== text) dom.statusText.textContent = text;
-    dom.status.dataset.state = s.ready ? 'good' : s.shown === 'waiting' || s.shown === 'no-camera' ? 'wait' : 'fix';
+    dom.status.dataset.state = s.ready ? 'good' : shown === 'waiting' || shown === 'no-camera' ? 'wait' : 'fix';
     dom.preview.dataset.state = s.ready ? 'good' : 'bad';
 
-    const waiting = s.shown === 'waiting' || s.shown === 'no-camera';
+    const waiting = shown === 'waiting' || shown === 'no-camera';
     for (const key of Object.keys(dom.checks) as (keyof PositionAssessment['checks'])[]) {
-      const state = waiting ? 'pending' : s.checks[key] ? 'ok' : key !== 'face' && !s.checks.face ? 'pending' : 'bad';
+      const state: CheckState = waiting
+        ? 'pending'
+        : s.checks[key]
+          ? key === 'light' && isTip(shown)
+            ? 'tip'
+            : 'ok'
+          : key !== 'face' && !s.checks.face
+            ? 'pending'
+            : 'bad';
       const li = dom.checks[key];
       if (li.dataset.state !== state) {
         li.dataset.state = state;
-        const icon = li.firstElementChild;
-        if (icon) icon.textContent = state === 'ok' ? '✓' : state === 'bad' ? '!' : '';
+        const icon = li.querySelector(`.${P}-check-icon`);
+        if (icon) icon.textContent = state === 'ok' ? '✓' : state === 'bad' ? '!' : state === 'tip' ? 'i' : '';
+        const spoken = li.querySelector(`.${P}-check-state`);
+        if (spoken) spoken.textContent = `: ${CHECK_STATE_TEXT[state]}`;
       }
     }
 
@@ -1086,42 +1507,41 @@ export class CalibrationOverlay implements Mountable {
     v.srcObject = null;
   }
 
-  /** Mean luma of the face region (or the whole frame), EMA-smoothed into pos.brightness. */
-  private sampleBrightness(): void {
-    const s = this.pos;
-    const video = this.opts.video ?? (this.previewActive ? this.dom?.video : null);
-    if (!s || !video || video.readyState < 2 || !(video.videoWidth > 0) || !(video.videoHeight > 0)) return;
-    try {
-      const doc = this.root?.ownerDocument;
-      if (!doc) return;
-      const canvas = (this.brightnessCanvas ??= doc.createElement('canvas'));
-      const N = 24;
-      canvas.width = N;
-      canvas.height = N;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) return;
-      const W = video.videoWidth;
-      const H = video.videoHeight;
-      let sx = 0;
-      let sy = 0;
-      let sw = W;
-      let sh = H;
-      if (s.metrics) {
-        const size = clamp(s.metrics.faceScale * 2.2 * W, 16, Math.min(W, H));
-        sx = clamp(s.metrics.faceCenter.x * W - size / 2, 0, W - size);
-        sy = clamp(s.metrics.faceCenter.y * H - size / 2, 0, H - size);
-        sw = size;
-        sh = size;
-      }
-      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, N, N);
-      const px = ctx.getImageData(0, 0, N, N).data;
-      let sum = 0;
-      for (let i = 0; i < px.length; i += 4) sum += 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
-      const luma = sum / (N * N * 255);
-      if (Number.isFinite(luma)) s.brightness = s.brightness === null ? luma : 0.6 * s.brightness + 0.4 * luma;
-    } catch {
-      /* tainted or unsupported canvas: skip the light check */
+  // ──────────────────────────────── Lighting ─────────────────────────────────
+
+  /**
+   * Takes a frame's lighting measurement: into the coaching monitor (every phase, so the advice
+   * is continuous across a retry) and, while this pass's dots are shown, into the samples the
+   * calibration's LightingSignature is built from. The camera side attaches it to ~6 frames a
+   * second, skipping blinks and junk frames; in the extension it crosses the port as numbers.
+   */
+  private noteLighting(frame: FeatureFrame, now: number): void {
+    const stats = frame.lighting;
+    if (!isFiniteStats(stats)) return; // a NaN would poison the monitor's averages
+    this.lightMonitor.update(now, stats);
+    this.lightingAt = now;
+    if ((this.phase !== 'targets' && this.phase !== 'validating') || this.paused) return;
+    const pose = frame.faceFound ? frame.features?.headPose : null;
+    if (!pose || !Number.isFinite(pose.yaw) || !Number.isFinite(pose.pitch)) return;
+    if (now - this.lightSampleAt < this.lightSampleGapMs) return;
+    this.lightSampleAt = now;
+    this.lightSamples.push({ stats: { ...stats }, yaw: pose.yaw, pitch: pose.pitch });
+    if (this.lightSamples.length >= MAX_LIGHT_SAMPLES) {
+      // A very long run: keep an even spread over all of it rather than only its start or end.
+      this.lightSamples = this.lightSamples.filter((_, i) => i % 2 === 0);
+      this.lightSampleGapMs *= 2;
     }
+  }
+
+  private resetLightSamples(): void {
+    this.lightSamples = [];
+    this.lightSampleAt = -Infinity;
+    this.lightSampleGapMs = LIGHT_SAMPLE_GAP_MS;
+  }
+
+  /** The monitor's flags, or null when the light isn't being measured (none recently). */
+  private currentLightingFlags(now: number): readonly LightingFlag[] | null {
+    return now - this.lightingAt <= LIGHTING_STALE_MS ? this.lightMonitor.flags : null;
   }
 
   // ──────────────────────────────── Targets ──────────────────────────────────
@@ -1262,7 +1682,7 @@ export class CalibrationOverlay implements Mountable {
     const dom = this.dom;
     const p = this.progress;
     if (!dom || !p) return;
-    dom.hudLabel.textContent = p.kind === 'point' ? 'Calibrating' : 'Checking accuracy';
+    dom.hudLabel.textContent = p.kind === 'point' ? 'Calibrating' : this.runMode === 'check' ? 'Accuracy check' : 'Checking accuracy';
     dom.hudCount.textContent = `${p.index + 1} / ${p.total}`;
     dom.hudBar.style.setProperty('--p', String(p.index / p.total));
   }
@@ -1297,24 +1717,106 @@ export class CalibrationOverlay implements Mountable {
 
   // ──────────────────────────────── Results ──────────────────────────────────
 
-  private renderResults(model: GazeModel, report: CalibrationReport, mode: 'quick' | 'standard'): void {
+  /** Fills the results card for this view; returns the button that should get focus. */
+  private renderResults(view: ResultsView): HTMLButtonElement | null {
     const dom = this.dom;
-    if (!dom) return;
+    if (!dom) return null;
+    const { report, check } = view;
+    const pitch = this.linePitch();
+    const width = this.measureViewport().width;
+    const verdictOf = (o: OffsetSummary) => offsetVerdict(o.offsetYLines, o.offsetXFrac ?? o.offsetXPx / width, o.maxDotYLines ?? Number.NaN);
+    const words = (o: OffsetSummary): OffsetWords => verdictOf(o).words;
+    const errorPx = Number.isFinite(report.meanErrorPx) ? `±${Math.round(report.meanErrorPx)}` : '—';
+    const setButton = (b: HTMLButtonElement, label: string, visible: boolean, primary: boolean): void => {
+      b.textContent = label;
+      b.hidden = !visible;
+      b.classList.toggle(`${P}-btn-primary`, primary);
+      // The suggested action sits last, as everywhere else in the overlay; moving the element
+      // (not CSS order) keeps the Tab order the same as the visual order.
+      if (primary) b.parentElement?.append(b);
+    };
+    const notes: string[] = [];
+    const light = check?.lightingChange;
+    if (light?.changed && light.text) notes.push(`The light has changed since you calibrated: ${light.text}.`);
+    this.drawMap(view.model, report);
+    dom.statPx.textContent = errorPx;
+    dom.statPxLabel.textContent = 'average error';
+
+    if (view.mode === 'check' && check) {
+      const b = check.before;
+      // One verdict for this screen and the toast after "Done" (src/app/offsetWords.ts).
+      const { words: w, badge, quality: tone } = verdictOf(b);
+      const needs = w.worthCorrecting;
+      dom.badge.textContent = badge;
+      dom.badge.dataset.quality = tone;
+      dom.resultTitle.textContent = w.onTarget ? 'Right on target' : `Tracking reads ${w.text}`;
+      const lines = b.offsetYLines;
+      dom.statLines.textContent = Number.isFinite(lines) ? Math.abs(lines).toFixed(1) : '—';
+      dom.statLinesUnit.textContent = lines >= 0.05 ? 'lines low' : lines <= -0.05 ? 'lines high' : 'lines';
+      dom.statLinesLabel.textContent = 'vertical offset at your text size';
+      const after = check.after && Number.isFinite(check.after.offsetYLines) ? check.after : null;
+      // The correction (leave-one-dot-out) would still leave a dot a line off: a full calibration
+      // is the suggestion then, and "Correct it" isn't promised to fix it.
+      const afterStillOff = (after?.maxDotYLines ?? 0) >= DOT_OFF_LINES;
+      const fullFirst = needs && view.suggestFull && (!view.canCorrect || afterStillOff);
+      const correct = needs && view.canCorrect && !fullFirst;
+      if (needs && view.canCorrect && after) {
+        const a = words(after);
+        notes.push(`“Correct it” should bring it to ${a.vertical || a.horizontal ? a.text : withinWords(after.maxDotYLines)}.`);
+      }
+      const spreadOnly = w.spread && w.vertical === null && w.horizontal === null;
+      let advice: string;
+      if (w.onTarget) advice = 'Your calibration still fits — nothing needs changing.';
+      else if (!needs) advice = 'That’s close enough — nothing needs changing, but you can correct it if you like.';
+      else if (!view.canCorrect) advice = 'This calibration can’t be corrected in place — a full calibration will set it right.';
+      else {
+        advice = spreadOnly
+          ? 'Tracking is off in opposite directions near the top and bottom of the screen, often from sitting nearer or further away than when you calibrated.'
+          : 'Changes in light or posture can shift tracking. “Correct it” re-centers it from the dots you just looked at — no extra steps.';
+        if (fullFirst) advice += ' A quick correction can’t take all of it out: a full calibration will set it right.';
+        else if (view.suggestFull) advice += ' For the best accuracy, a full calibration will do better than a quick correction.';
+      }
+      dom.advice.textContent = advice;
+      dom.tryit.textContent = 'The soft dot shows where I currently think you’re looking — glance around to see for yourself.';
+      setButton(dom.use, 'Correct it', view.canCorrect, correct);
+      setButton(dom.done, 'Done', true, !correct && !fullFirst);
+      setButton(dom.redo, 'Full calibration', view.suggestFull, fullFirst);
+      dom.redo.dataset.choice = 'full';
+      dom.note.textContent = notes.join(' ');
+      this.announce(`${badge}. ${dom.resultTitle.textContent}. ${dom.note.textContent}`.trim());
+      return correct ? dom.use : fullFirst ? dom.redo : dom.done;
+    }
+
     const copy = QUALITY_COPY[report.quality];
     dom.badge.textContent = copy.badge;
     dom.badge.dataset.quality = report.quality;
     dom.resultTitle.textContent = copy.title;
     dom.advice.textContent = copy.advice;
-    dom.statPx.textContent = Number.isFinite(report.meanErrorPx) ? `±${Math.round(report.meanErrorPx)}` : '—';
-    const lines = report.meanErrorYPx / this.linePitch();
+    dom.tryit.textContent = 'The soft dot shows where I think you’re looking — glance around to try it.';
+    const lines = report.meanErrorYPx / pitch;
     dom.statLines.textContent = Number.isFinite(lines) ? `≈ ${lines.toFixed(1)}` : '—';
-    const fullInstead = mode === 'quick' && report.quality === 'poor';
-    dom.redo.textContent = fullInstead ? 'Full calibration' : 'Redo';
+    dom.statLinesUnit.textContent = 'lines';
+    dom.statLinesLabel.textContent = 'vertical error at your text size';
+    if (check) {
+      // Quick refresh: how far off the old model was on these dots, and what the refresh leaves.
+      const after = check.after && Number.isFinite(check.after.offsetYLines) ? check.after : null;
+      const said = (o: OffsetSummary): string => {
+        const x = words(o);
+        return x.onTarget ? withinWords(o.maxDotYLines) : x.text;
+      };
+      notes.unshift(`Before this refresh, tracking read ${said(check.before)}.${after ? ` Now: ${said(after)}.` : ''}`);
+    }
+    dom.note.textContent = notes.join(' ');
+    const poor = report.quality === 'poor';
+    const fullInstead = view.mode === 'quick' && poor;
+    setButton(dom.use, 'Use it', true, true);
+    setButton(dom.done, 'Done', false, false);
+    setButton(dom.redo, fullInstead ? 'Full calibration' : 'Redo', true, false);
     dom.redo.dataset.choice = fullInstead ? 'full' : 'redo';
-    this.drawMap(model, report);
     this.announce(
-      `${copy.badge} calibration. Average error ${Number.isFinite(report.meanErrorPx) ? Math.round(report.meanErrorPx) : 'unknown'} pixels.`,
+      `${copy.badge} calibration. Average error ${Number.isFinite(report.meanErrorPx) ? Math.round(report.meanErrorPx) : 'unknown'} pixels. ${dom.note.textContent}`.trim(),
     );
+    return poor ? dom.redo : dom.use;
   }
 
   /** A little map of the check points: where each one was vs where your gaze landed. */
@@ -1388,11 +1890,14 @@ export class CalibrationOverlay implements Mountable {
     }
     if (phase !== 'results') dom.live.classList.remove('is-on');
     if (phase === 'targets' || phase === 'validating' || phase === 'training') root.focus({ preventScroll: true });
+    const check = this.runMode === 'check';
     const spoken: Partial<Record<Phase, string>> = {
-      positioning: 'Calibration. Position yourself in front of the camera.',
+      positioning: check ? 'Accuracy check. Position yourself in front of the camera.' : 'Calibration. Position yourself in front of the camera.',
       targets: 'Look at the center of each dot until it disappears.',
       training: 'Learning how your eyes move.',
-      validating: 'A few more dots to check accuracy.',
+      validating: check
+        ? 'Look at the center of each dot until it disappears. Nothing changes unless you ask.'
+        : 'A few more dots to check accuracy.',
     };
     const text = spoken[phase];
     if (text) this.announce(text);
@@ -1616,8 +2121,16 @@ export class CalibrationOverlay implements Mountable {
     );
     const statusText = el('span', 'status-text', {}, COACH.waiting);
     const status = el('p', 'status', { role: 'status', 'aria-live': 'polite' }, el('span', 'status-dot', { 'aria-hidden': 'true' }), statusText);
+    // The icon is decoration; the state is spelled out for screen readers.
     const check = (label: string): HTMLLIElement =>
-      el('li', 'check', { 'data-state': 'pending' }, el('span', 'check-icon', { 'aria-hidden': 'true' }), label);
+      el(
+        'li',
+        'check',
+        { 'data-state': 'pending' },
+        el('span', 'check-icon', { 'aria-hidden': 'true' }),
+        label,
+        el('span', 'vh check-state', {}, `: ${CHECK_STATE_TEXT.pending}`),
+      );
     const checks = { face: check('Face'), distance: check('Distance'), center: check('Centered'), light: check('Light') };
     const next = el('p', 'next');
     const start = button('Start', 'start', true);
@@ -1660,13 +2173,20 @@ export class CalibrationOverlay implements Mountable {
     const badge = el('span', 'badge', { 'data-quality': 'good' }, 'Good');
     const resultTitle = el('h2', 'title', { id: id('res-title') }, '');
     const statPx = el('span', 'stat-value', {}, '—');
+    const statPxLabel = el('span', 'stat-label', {}, 'average error');
     const statLines = el('span', 'stat-value', {}, '—');
+    const statLinesUnit = el('span', 'stat-unit', {}, 'lines');
+    const statLinesLabel = el('span', 'stat-label', {}, 'vertical error at your text size');
     const map = doc.createElementNS(SVG_NS, 'svg');
     map.setAttribute('class', `${P}-map`);
     map.setAttribute('role', 'img');
     map.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    const note = el('p', 'note');
     const advice = el('p', 'lede');
+    const tryit = el('p', 'tryit', {}, 'The soft dot shows where I think you’re looking — glance around to try it.');
     const use = button('Use it', 'use', true);
+    const done = button('Done', 'done');
+    done.hidden = true;
     const redo = button('Redo', 'redo');
     const results = el(
       'div',
@@ -1682,24 +2202,20 @@ export class CalibrationOverlay implements Mountable {
           'div',
           'stats',
           {},
-          el('div', 'stat', {}, el('span', 'stat-line', {}, statPx, el('span', 'stat-unit', {}, 'px')), el('span', 'stat-label', {}, 'average error')),
-          el(
-            'div',
-            'stat',
-            {},
-            el('span', 'stat-line', {}, statLines, el('span', 'stat-unit', {}, 'lines')),
-            el('span', 'stat-label', {}, 'vertical error at your text size'),
-          ),
+          el('div', 'stat', {}, el('span', 'stat-line', {}, statPx, el('span', 'stat-unit', {}, 'px')), statPxLabel),
+          el('div', 'stat', {}, el('span', 'stat-line', {}, statLines, statLinesUnit), statLinesLabel),
         ),
         map,
+        note,
         advice,
-        el('p', 'tryit', {}, 'The soft dot shows where I think you’re looking — glance around to try it.'),
-        el('div', 'actions', {}, redo, use),
+        tryit,
+        el('div', 'actions', {}, redo, done, use),
       ),
     );
     const live = el('div', 'live', { 'aria-hidden': 'true' });
 
     // Failure
+    const failTitle = el('h2', 'title', { id: id('fail-title') }, 'Calibration didn’t work');
     const failText = el('p', 'lede failed-text');
     const retry = button('Try again', 'retry', true);
     const failed = el(
@@ -1710,7 +2226,7 @@ export class CalibrationOverlay implements Mountable {
         'section',
         'card card-small',
         { role: 'alert', 'aria-labelledby': id('fail-title') },
-        el('h2', 'title', { id: id('fail-title') }, 'Calibration didn’t work'),
+        failTitle,
         failText,
         el('div', 'actions', {}, button('Cancel', 'cancel'), retry),
       ),
@@ -1753,13 +2269,20 @@ export class CalibrationOverlay implements Mountable {
       badge,
       resultTitle,
       statPx,
+      statPxLabel,
       statLines,
+      statLinesUnit,
+      statLinesLabel,
       map,
+      note,
       advice,
+      tryit,
       use,
+      done,
       redo,
       live,
       failed,
+      failTitle,
       failText,
       retry,
       sr,
@@ -1783,7 +2306,134 @@ function cloneFeatures(f: EyeFeatures): EyeFeatures {
     openness: f.openness,
     faceScale: f.faceScale,
     faceCenter: { x: f.faceCenter?.x ?? Number.NaN, y: f.faceCenter?.y ?? Number.NaN },
+    // The calibration's eyelid baseline (squint in bright light) is built from this.
+    ...(f.squint !== undefined ? { squint: f.squint } : {}),
   };
+}
+
+/** Largest RMS residual (px) at which a wrapper counts as an exact affine map of its core. */
+const WRAPPER_FIT_RMS_PX = 0.05;
+
+/**
+ * The ridge core of `current`, re-expressed so that it predicts what `current` predicts. A
+ * wrapper — the extension's zoom-aware model scales the core's output by the page-zoom ratio —
+ * would otherwise leave refineGazeModel to learn that scale from 5 dots, which its shrunk,
+ * clamped scale fit can't (measured on the synthetic eye: at 1.25× zoom the corrected model
+ * was off by 51 px against the wrapper's 10). The wrapper's per-axis map is fitted on these
+ * samples and folded into the core's screen adjustment only when it is exact (a genuine affine
+ * wrapper); anything else, or a plain RidgeGazeModel, returns `base` unchanged.
+ */
+function alignCore(current: GazeModel | null, base: RidgeGazeModel, samples: readonly CalibrationSample[]): RidgeGazeModel {
+  if (!current || current === base || current instanceof RidgeGazeModel) return base;
+  const xs: [number, number][] = [];
+  const ys: [number, number][] = [];
+  for (const s of samples) {
+    let b: Point | null = null;
+    let c: Point | null = null;
+    try {
+      b = base.predict(s.features);
+      c = current.predict(s.features);
+    } catch {
+      continue;
+    }
+    if (!b || !c || ![b.x, b.y, c.x, c.y].every(Number.isFinite)) continue;
+    xs.push([b.x, c.x]);
+    ys.push([b.y, c.y]);
+  }
+  const fx = fitLine(xs);
+  const fy = fitLine(ys);
+  if (!fx || !fy || fx.rms > WRAPPER_FIT_RMS_PX || fy.rms > WRAPPER_FIT_RMS_PX) return base;
+  const identity = (f: { a: number; c: number }): boolean => Math.abs(f.a - 1) < 1e-9 && Math.abs(f.c) < 1e-6;
+  if (identity(fx) && identity(fy)) return base;
+  if (![fx.a, fy.a].every((a) => a > 0.2 && a < 5)) return base;
+  // current = a·(core − origin) + c in viewport px, i.e. a·core + c + (1 − a)·origin on screen.
+  const o = currentScreenOrigin();
+  const adj = base.adjustment;
+  return base.withAdjustment(
+    {
+      sx: fx.a * adj.sx,
+      ox: fx.a * adj.ox + fx.c + (1 - fx.a) * o.x,
+      sy: fy.a * adj.sy,
+      oy: fy.a * adj.oy + fy.c + (1 - fy.a) * o.y,
+    },
+    { viewport: base.viewport, trainedAt: base.trainedAt },
+  );
+}
+
+/** Least-squares y = a·x + c over pairs, with the residual RMS; null without spread in x. */
+function fitLine(pairs: readonly [number, number][]): { a: number; c: number; rms: number } | null {
+  const n = pairs.length;
+  if (n < 3) return null;
+  let mx = 0;
+  let my = 0;
+  for (const [x, y] of pairs) {
+    mx += x;
+    my += y;
+  }
+  mx /= n;
+  my /= n;
+  let sxx = 0;
+  let sxy = 0;
+  for (const [x, y] of pairs) {
+    sxx += (x - mx) * (x - mx);
+    sxy += (x - mx) * (y - my);
+  }
+  if (!(sxx > 1e-6 * n)) return null;
+  const a = sxy / sxx;
+  const c = my - a * mx;
+  let ss = 0;
+  for (const [x, y] of pairs) ss += (y - (a * x + c)) ** 2;
+  const rms = Math.sqrt(ss / n);
+  return Number.isFinite(a) && Number.isFinite(c) && Number.isFinite(rms) ? { a, c, rms } : null;
+}
+
+function isFiniteStats(s: LightingStats | undefined): s is LightingStats {
+  if (!s || typeof s !== 'object') return false;
+  for (const k of LIGHTING_STAT_KEYS) if (!Number.isFinite(s[k])) return false;
+  return true;
+}
+
+function modelHeight(model: GazeModel): number {
+  const h = model.viewport?.height;
+  return typeof h === 'number' && Number.isFinite(h) && h > 0 ? h : 0;
+}
+
+function summarizeOffset(m: OffsetMeasurement, linePitch: number, viewportWidth: number, maxDotYPx: number): OffsetSummary {
+  const out: OffsetSummary = {
+    meanErrorPx: m.meanErrorPx,
+    offsetXPx: m.offsetXPx,
+    offsetYPx: m.offsetYPx,
+    offsetYLines: m.offsetYPx / linePitch,
+    targets: m.targets,
+  };
+  if (Number.isFinite(m.offsetXPx) && viewportWidth > 0) out.offsetXFrac = m.offsetXPx / viewportWidth;
+  if (Number.isFinite(maxDotYPx)) out.maxDotYLines = maxDotYPx / linePitch;
+  return out;
+}
+
+/**
+ * The mean signed error (prediction − target) over a report's points, like measureOffset, and
+ * the worst dot's vertical error. For a refinement's leave-one-dot-out report, that is what the
+ * correction would leave on a dot it wasn't fitted on.
+ */
+function offsetOfReport(report: CalibrationReport, linePitch: number, viewportWidth: number): OffsetSummary {
+  const k = report.perPoint.length;
+  let dx = 0;
+  let dy = 0;
+  let maxDy = 0;
+  for (const p of report.perPoint) {
+    dx += p.meanPrediction.x - p.target.x;
+    dy += p.meanPrediction.y - p.target.y;
+    maxDy = Math.max(maxDy, Math.abs(p.meanPrediction.y - p.target.y));
+  }
+  return summarizeOffset(
+    k > 0
+      ? { meanErrorPx: report.meanErrorPx, offsetXPx: dx / k, offsetYPx: dy / k, n: report.sampleCount, targets: k }
+      : { meanErrorPx: NaN, offsetXPx: NaN, offsetYPx: NaN, n: 0, targets: 0 },
+    linePitch,
+    viewportWidth,
+    k > 0 ? maxDy : Number.NaN,
+  );
 }
 
 function targetPoint(frac: Point, vp: { width: number; height: number }): Point {
@@ -2080,6 +2730,8 @@ function buildStyles(): string {
 .${p}-check[data-state="ok"] .${p}-check-icon { background: var(--c-good); border-color: var(--c-good); color: var(--c-on-status); }
 .${p}-check[data-state="bad"] { color: var(--c-fg); border-color: var(--c-warn); }
 .${p}-check[data-state="bad"] .${p}-check-icon { background: var(--c-warn); border-color: var(--c-warn); color: var(--c-on-status); }
+.${p}-check[data-state="tip"] { color: var(--c-fg); border-color: var(--c-info); }
+.${p}-check[data-state="tip"] .${p}-check-icon { background: var(--c-info); border-color: var(--c-info); color: var(--c-on-status); font-style: italic; font-weight: 700; }
 
 /* ── training ── */
 .${p}-spinner {
@@ -2108,6 +2760,12 @@ function buildStyles(): string {
 .${p}-map-link { stroke: var(--c-muted); stroke-width: 1.5; stroke-dasharray: 3 3; }
 .${p}-map-target { fill: none; stroke: var(--c-fg); stroke-width: 2; }
 .${p}-map-gaze { fill: var(--c-accent); }
+.${p}-note {
+  margin: 0; padding: 10px 14px; border-radius: 12px;
+  background: var(--c-tint); border-left: 3px solid var(--c-info);
+  color: var(--c-fg); font-size: 14px; line-height: 1.45;
+}
+.${p}-note:empty { display: none; }
 .${p}-live {
   position: absolute; left: 0; top: 0; width: 30px; height: 30px; margin: -15px 0 0 -15px;
   border-radius: 50%; pointer-events: none; opacity: 0; transition: opacity 200ms ease;
@@ -2116,10 +2774,11 @@ function buildStyles(): string {
 }
 .${p}-live.is-on { opacity: 1; }
 
-.${p}-sr {
+.${p}-sr, .${p}-vh {
   position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0;
   overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
 }
+.${p}-check { position: relative; }
 
 @media (max-height: 760px) {
   .${p}-center { padding: 16px; }

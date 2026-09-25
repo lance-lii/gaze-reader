@@ -1,4 +1,5 @@
 import type {
+  AppEvents,
   AppSettings,
   EventBus,
   Fixation,
@@ -22,9 +23,15 @@ import { pageEndZones } from '../reading/pageEndDetector';
  * drift-corrected gaze, the page-end zones, and a small legend panel.
  *
  * Everything it shows arrives on the bus (`gaze`, `fixation`, `line-estimate`,
- * `layout`, `page-end`, `settings-changed`). The page-end detector's verdict on
+ * `layout`, `page-end`, `settings-changed`, `lighting-state`,
+ * `appearance-changed`, `accuracy-check`). The page-end detector's verdict on
  * every sample isn't a bus event, so the host may also pass decisions to
- * `showDecision` to see what the detector is waiting for.
+ * `showDecision` to see what the detector is waiting for, and the eyelid
+ * monitor's state to `showAppearance`.
+ *
+ * With a tracked estimate (TrackedLineEstimate) it also shows the drift belief:
+ * the 2–98 % range of vertical offsets the line tracker still allows, as a
+ * bracket around the drift-corrected gaze and in the panel.
  *
  * Draws only while visible, at most once per animation frame, on a canvas
  * backed at devicePixelRatio. Never intercepts the pointer.
@@ -33,6 +40,18 @@ import { pageEndZones } from '../reading/pageEndDetector';
 export interface DebugOverlayOptions {
   bus: EventBus;
   getSettings: () => AppSettings;
+}
+
+/** The eyelid-appearance monitor as the panel shows it (src/gaze/appearance.ts). */
+export interface AppearanceDebugInfo {
+  /** Monitor state: off, learning, unknown, watching, shifting, settling. */
+  state: string;
+  /** Openness shift in robust SDs (negative = narrower), or null without data. */
+  residualZ: number | null;
+  /** eyeSquint shift in robust SDs, or null. */
+  squintZ: number | null;
+  /** Slow openness level relative to calibration (openness units). */
+  levelVsCalibration: number;
 }
 
 const P = CSS_PREFIX;
@@ -141,6 +160,10 @@ export class DebugOverlay implements Mountable {
   private estimate: LineEstimate | null = null;
   private decision: PageEndDecision | null = null;
   private fired: { at: number; decision: PageEndDecision } | null = null;
+  private lighting: AppEvents['lighting-state'] | null = null;
+  private appearance: AppearanceDebugInfo | null = null;
+  private lastChange: AppEvents['appearance-changed'] | null = null;
+  private lastCheck: AppEvents['accuracy-check'] | null = null;
 
   constructor(opts: DebugOverlayOptions) {
     this.bus = opts.bus;
@@ -169,6 +192,12 @@ export class DebugOverlay implements Mountable {
   /** Feed the page-end detector's decision for the latest sample (optional; shown in the panel). */
   showDecision(decision: PageEndDecision): void {
     this.decision = decision;
+    this.schedule();
+  }
+
+  /** Feed the eyelid-appearance monitor's state (optional; shown in the panel). Null hides the row. */
+  showAppearance(info: AppearanceDebugInfo | null): void {
+    this.appearance = info;
     this.schedule();
   }
 
@@ -243,6 +272,18 @@ export class DebugOverlay implements Mountable {
       }),
       this.bus.on('page-end', (d) => {
         this.fired = { at: this.lastGaze?.t ?? NaN, decision: d };
+        this.schedule();
+      }),
+      this.bus.on('lighting-state', (s) => {
+        this.lighting = s;
+        this.schedule();
+      }),
+      this.bus.on('appearance-changed', (c) => {
+        this.lastChange = c;
+        this.schedule();
+      }),
+      this.bus.on('accuracy-check', (r) => {
+        this.lastCheck = r;
         this.schedule();
       }),
       this.bus.on('settings-changed', ({ settings, changed }) => {
@@ -518,6 +559,25 @@ export class DebugOverlay implements Mountable {
     ctx.moveTo(g.x, cy - 7);
     ctx.lineTo(g.x, cy + 7);
     ctx.stroke();
+    // Drift belief: where the eyes may really be, for every offset the tracker still allows
+    // (2–98 %). Wide after a page turn or an appearance change; narrow once the offset is learned.
+    const range = driftRange(this.estimate);
+    if (range) {
+      const top = g.y - range.high;
+      const bottom = g.y - range.low;
+      if (bottom - top >= 2) {
+        const x = g.x + 12;
+        ctx.strokeStyle = 'rgba(16, 185, 129, 0.55)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(x - 4, top);
+        ctx.lineTo(x, top);
+        ctx.lineTo(x, bottom);
+        ctx.lineTo(x - 4, bottom);
+        ctx.stroke();
+      }
+    }
     ctx.restore();
   }
 
@@ -537,10 +597,38 @@ export class DebugOverlay implements Mountable {
       out.push(
         `driftY ${signed(e.driftY)} px  σy ${Number.isFinite(sigma) ? sigma.toFixed(1) : '–'} px${sigmaLines}`,
       );
+      const range = driftRange(e);
+      if (range) {
+        const inLines = (v: number): string => (pitch > 0 ? signed(v / pitch, 2) : '–');
+        const sd = Number.isFinite(range.sd) && pitch > 0 ? `  sd ${(range.sd / pitch).toFixed(2)}` : '';
+        out.push(`drift belief ${inLines(range.low)}…${inLines(range.high)} ln${sd}`);
+      }
       const away = isTrackedLineEstimate(e) ? `  off-text ${e.excursions}` : '';
       out.push(`fixations on page ${e.fixationsOnPage}${away}`);
     } else {
       out.push(layout ? `${layout.lines.length} lines measured · waiting for fixations` : 'no layout yet');
+    }
+    const light = this.lighting;
+    if (light) {
+      const flags = light.flags.length > 0 ? light.flags.join(', ') : 'ok';
+      const d = light.distance === null ? '–' : light.distance.toFixed(2);
+      const changed = light.changedSinceCalibration ? `  CHANGED${light.dominant ? ` (${light.dominant})` : ''}` : '';
+      out.push(`light ${flags}  D ${d}${changed}`);
+    }
+    const a = this.appearance;
+    if (a) {
+      const z = (v: number | null): string => (v === null || !Number.isFinite(v) ? '–' : signed(v, 1));
+      out.push(`lids ${a.state}  z ${z(a.residualZ)}  squint z ${z(a.squintZ)}  level ${signed(a.levelVsCalibration, 3)}`);
+    }
+    const g0 = this.lastGaze;
+    if (this.lastChange) {
+      const ago = g0 ? (g0.t - this.lastChange.t) / 1000 : NaN;
+      const when = Number.isFinite(ago) && ago >= 0 ? ` ${ago.toFixed(0)} s ago` : '';
+      out.push(`appearance change${when}: ${this.lastChange.reason} · ${this.lastChange.detail}`);
+    }
+    if (this.lastCheck) {
+      const c = this.lastCheck;
+      out.push(`accuracy check: ${Number.isFinite(c.meanErrorPx) ? Math.round(c.meanErrorPx) : '–'} px, y ${signed(c.offsetYLines, 2)} ln${c.applied ? ' (applied)' : ''}`);
     }
     const g = this.lastGaze;
     if (g && !g.valid) out.push('gaze: invalid (no face / blink)');
@@ -566,7 +654,16 @@ function readSettings(getSettings: () => AppSettings): AppSettings | null {
   }
 }
 
-function signed(v: number): string {
+function signed(v: number, digits = 1): string {
   if (!Number.isFinite(v)) return '–';
-  return `${v >= 0 ? '+' : ''}${v.toFixed(1)}`;
+  return `${v >= 0 ? '+' : ''}${v.toFixed(digits)}`;
+}
+
+/** The tracker's drift belief (px), when the estimate carries it. */
+export function driftRange(e: LineEstimate | null): { low: number; high: number; sd: number } | null {
+  if (!isTrackedLineEstimate(e)) return null;
+  const low = e.driftLowY;
+  const high = e.driftHighY;
+  if (low === undefined || high === undefined || !Number.isFinite(low) || !Number.isFinite(high)) return null;
+  return { low: Math.min(low, high), high: Math.max(low, high), sd: e.driftSdY ?? NaN };
 }

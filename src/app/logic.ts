@@ -6,17 +6,24 @@
  * schema, status pill vocabulary) so there is exactly one source of truth.
  */
 import type {
+  AppEvents,
   AppSettings,
   CommandName,
   Corner,
+  EventBus,
+  EventName,
+  GazeSample,
   GazeSourceKind,
+  LightingFlag,
   TextLine,
   Theme,
   TrackerErrorCode,
   TrackingState,
+  Unsubscribe,
 } from '../types';
+import { offsetVerdict, type OffsetBadge } from './offsetWords';
 
-const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
+const clamp =(v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 const clamp01 = (v: number): number => clamp(v, 0, 1);
 
 // ───────────────────────────── Tracking state ──────────────────────────────
@@ -471,6 +478,7 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { keys: ['U'], action: 'undo-turn', label: 'Undo the last page turn', readerOnly: true },
   { keys: ['P'], action: 'toggle-autoscroll', label: 'Pause or resume auto-scroll', readerOnly: true },
   { keys: ['C'], action: 'recalibrate', label: 'Recalibrate the camera', readerOnly: true },
+  { keys: ['A'], action: 'check-accuracy', label: 'Check tracking accuracy (a few dots)', readerOnly: true },
   { keys: ['D'], action: 'toggle-debug', label: 'Show or hide the debug overlay', readerOnly: false },
   { keys: ['G'], action: 'toggle-gaze-dot', label: 'Show or hide the gaze dot', readerOnly: false },
   { keys: ['S'], action: 'open-settings', label: 'Settings', readerOnly: false },
@@ -489,6 +497,7 @@ export interface KeyLike {
 }
 
 const LETTER_ACTIONS: Readonly<Record<string, ShortcutAction>> = {
+  a: 'check-accuracy',
   u: 'undo-turn',
   p: 'toggle-autoscroll',
   c: 'recalibrate',
@@ -696,6 +705,438 @@ export function calibrationOriginFits(
   if (!Number.isFinite(trainedTop) || !Number.isFinite(currentTop)) return true;
   const tolerance = pitchPx != null && Number.isFinite(pitchPx) && pitchPx > 0 ? 0.5 * pitchPx : ORIGIN_TOLERANCE_PX;
   return Math.abs(currentTop - trainedTop) <= tolerance;
+}
+
+// ──────────────────────────── Lighting & guidance ────────────────────────────
+// Light changes how open the eyes are (a squint in bright light or glare, wide eyes in dim
+// light), which moves webcam gaze by lines. The reading layer re-learns the offset by itself;
+// these helpers decide when the reader should hear about it, and never while they read a line.
+
+/**
+ * A line estimate whose line has at least this posterior counts as "pinned": the tracker is sure
+ * of the line, so its drift is the reader's offset rather than a wrong line's. Shared by the
+ * drift watch (touch-up offers) and the gaze dot's / Dewey's drift correction.
+ */
+export const PINNED_MIN_PROBABILITY = 0.6;
+/** For the drift watch, a pinned drift also has a belief SD of at most this many lines. */
+export const PINNED_MAX_DRIFT_SD_LINES = 0.5;
+
+export interface DriftWatchOptions {
+  /** |driftY| of at least this many line pitches counts as far off. */
+  thresholdLines: number;
+  /** …held this long (ms) before a touch-up is worth offering. */
+  holdMs: number;
+  /** Share of the estimates in that stretch that must be over the threshold. */
+  minShare: number;
+  /** Dips under the threshold shorter than this (ms) don't restart the clock. */
+  graceMs: number;
+  /** No estimate for this long (ms; the reader is away) restarts the clock. */
+  gapMs: number;
+}
+
+export const DEFAULT_DRIFT_WATCH: Readonly<DriftWatchOptions> = Object.freeze({
+  thresholdLines: 1.5,
+  holdMs: 20_000,
+  minShare: 0.8,
+  graceMs: 3000,
+  gapMs: 6000,
+});
+
+/**
+ * Notices when the reading layer has had to correct a large vertical offset (|driftY| ≥ 1.5
+ * lines) for about 20 s in one direction. The tracker copes with up to ±5 lines, but at that
+ * point the calibration no longer describes the reader, and a 5-dot touch-up is the better fix.
+ */
+export class DriftWatch {
+  private readonly o: DriftWatchOptions;
+  private since: number | null = null;
+  private sign = 0;
+  private lastAbove = Number.NEGATIVE_INFINITY;
+  private lastT = Number.NEGATIVE_INFINITY;
+  private over = 0;
+  private total = 0;
+  private peak = 0;
+
+  constructor(opts: Partial<DriftWatchOptions> = {}) {
+    this.o = { ...DEFAULT_DRIFT_WATCH, ...opts };
+  }
+
+  /**
+   * Feeds one line estimate's drift (px) at its line pitch; true while the offset has lasted.
+   * `pinned` false (the tracker is unsure of the line or of the drift) is no evidence either way:
+   * it neither extends nor breaks a run, and a long stretch of it counts as a gap.
+   */
+  push(t: number, driftYPx: number, linePitchPx: number, pinned = true): boolean {
+    if (!Number.isFinite(t) || !Number.isFinite(driftYPx) || !Number.isFinite(linePitchPx) || linePitchPx <= 0) return false;
+    if (!pinned) return this.sustained(t);
+    if (t - this.lastT > this.o.gapMs) this.clearRun();
+    this.lastT = t;
+    const lines = driftYPx / linePitchPx;
+    const isOver = Math.abs(lines) >= this.o.thresholdLines;
+    if (isOver) {
+      const sign = Math.sign(lines);
+      if (this.since !== null && sign !== this.sign) this.clearRun();
+      if (this.since === null) {
+        this.since = t;
+        this.sign = sign;
+      }
+      this.lastAbove = t;
+      this.peak = Math.max(this.peak, Math.abs(lines));
+    } else if (this.since !== null && t - this.lastAbove > this.o.graceMs) {
+      this.clearRun();
+    }
+    if (this.since !== null) {
+      this.total++;
+      if (isOver) this.over++;
+    }
+    return this.sustained(t);
+  }
+
+  sustained(t: number): boolean {
+    return this.since !== null && t - this.since >= this.o.holdMs && this.total > 0 && this.over / this.total >= this.o.minShare;
+  }
+
+  /** +1: the gaze reads low (below the text); −1: high; 0: no run. */
+  get direction(): number {
+    return this.since === null ? 0 : this.sign;
+  }
+
+  /** Largest |drift| of the current run, lines. */
+  get peakLines(): number {
+    return this.since === null ? 0 : this.peak;
+  }
+
+  reset(): void {
+    this.clearRun();
+    this.lastT = Number.NEGATIVE_INFINITY;
+  }
+
+  private clearRun(): void {
+    this.since = null;
+    this.sign = 0;
+    this.over = 0;
+    this.total = 0;
+    this.peak = 0;
+    this.lastAbove = Number.NEGATIVE_INFINITY;
+  }
+}
+
+export interface GuidanceGateOptions {
+  /** Minimum time between two touch-up offers, ms. */
+  offerIntervalMs: number;
+  /** Touch-up offers per reading session (book open). */
+  maxOffersPerSession: number;
+  /** No offer this soon after the tracking was corrected (calibration, touch-up, applied check), ms. */
+  quietAfterFixMs: number;
+  /** No offer in the first moments of a session (the reading layer is still settling), ms. */
+  settleMs: number;
+  /** No reading fixation for this long is a pause in reading, ms. */
+  pauseMs: number;
+  /** Right after a page turn the eyes travel anyway: guidance may show for this long, ms. */
+  turnWindowMs: number;
+  /** No offer for this long after the reader chose "Not now", ms. */
+  snoozeMs: number;
+}
+
+export const DEFAULT_GUIDANCE_GATE: Readonly<GuidanceGateOptions> = Object.freeze({
+  offerIntervalMs: 10 * 60_000,
+  maxOffersPerSession: 2,
+  quietAfterFixMs: 3 * 60_000,
+  settleMs: 20_000,
+  pauseMs: 2500,
+  turnWindowMs: 1500,
+  snoozeMs: 30 * 60_000,
+});
+
+/**
+ * Keeps lighting guidance from nagging. Touch-up offers are rate-limited (10 min apart, two per
+ * book, never just after a correction or while a book is settling in), coaching about the light
+ * itself comes once per session, and normal-priority guidance waits for a moment the reader
+ * isn't reading a line: just after a page turn, or a pause of a few seconds.
+ */
+export class GuidanceGate {
+  private readonly o: GuidanceGateOptions;
+  private sessionStart = Number.NEGATIVE_INFINITY;
+  private lastReading = Number.NEGATIVE_INFINITY;
+  private lastTurn = Number.NEGATIVE_INFINITY;
+  private lastOffer = Number.NEGATIVE_INFINITY;
+  private lastFix = Number.NEGATIVE_INFINITY;
+  private snoozedUntil = Number.NEGATIVE_INFINITY;
+  private offers = 0;
+  private coached = false;
+
+  constructor(opts: Partial<GuidanceGateOptions> = {}) {
+    this.o = { ...DEFAULT_GUIDANCE_GATE, ...opts };
+  }
+
+  /** The reader chose "Not now". */
+  snooze(t: number): void {
+    if (Number.isFinite(t)) this.snoozedUntil = t + this.o.snoozeMs;
+  }
+
+  /** A book was opened: per-session budgets start over (the time between offers does not). */
+  startSession(t: number): void {
+    this.sessionStart = t;
+    this.offers = 0;
+    this.coached = false;
+    this.lastReading = Number.NEGATIVE_INFINITY;
+    this.lastTurn = Number.NEGATIVE_INFINITY;
+  }
+
+  /** A fixation on the text. */
+  noteReading(t: number): void {
+    if (Number.isFinite(t)) this.lastReading = Math.max(this.lastReading, t);
+  }
+
+  notePageTurn(t: number): void {
+    if (Number.isFinite(t)) this.lastTurn = t;
+  }
+
+  /** The tracking was just corrected (a calibration, a touch-up, an applied accuracy check). */
+  noteFixed(t: number): void {
+    if (Number.isFinite(t)) this.lastFix = t;
+  }
+
+  noteOffered(t: number): void {
+    this.lastOffer = t;
+    this.offers++;
+  }
+
+  noteCoached(): void {
+    this.coached = true;
+  }
+
+  get hasCoached(): boolean {
+    return this.coached;
+  }
+
+  /** Whether a touch-up may be offered at all now (budgets and quiet periods). */
+  mayOffer(t: number): boolean {
+    return (
+      this.offers < this.o.maxOffersPerSession &&
+      t >= this.snoozedUntil &&
+      t - this.lastOffer >= this.o.offerIntervalMs &&
+      t - this.lastFix >= this.o.quietAfterFixMs &&
+      t - this.sessionStart >= this.o.settleMs
+    );
+  }
+
+  /** Whether normal-priority guidance may interrupt now: a page just turned, or the reader paused. */
+  isPause(t: number): boolean {
+    return t - this.lastTurn <= this.o.turnWindowMs || t - this.lastReading >= this.o.pauseMs;
+  }
+}
+
+/**
+ * One physical change can be reported twice: the eyelid monitor sees a squint within a couple of
+ * seconds, the lighting signature confirms the new light several seconds later with an onset
+ * estimate close to the first. Re-learning the reading layer's offset twice would throw away
+ * what it learned in between, so camera reports whose onsets lie within `mergeMs` of one already
+ * applied are merged. Refreshes and manual reports always apply.
+ */
+export class AppearanceChangeFilter {
+  private applied: { onset: number; at: number }[] = [];
+
+  constructor(
+    private readonly mergeMs = 6000,
+    private readonly memoryMs = 30_000,
+  ) {}
+
+  accept(reason: AppEvents['appearance-changed']['reason'], onset: number, now: number): boolean {
+    this.applied = this.applied.filter((a) => now - a.at <= this.memoryMs);
+    const camera = reason === 'lids' || reason === 'lighting';
+    if (camera && Number.isFinite(onset) && this.applied.some((a) => Math.abs(a.onset - onset) <= this.mergeMs)) return false;
+    if (camera) this.applied.push({ onset: Number.isFinite(onset) ? onset : now, at: now });
+    else this.applied = []; // a refresh re-anchors: later camera reports are new changes
+    return true;
+  }
+
+  reset(): void {
+    this.applied = [];
+  }
+}
+
+/**
+ * What the line tracker's learned drift belongs to: the gaze source and, for the webcam, the
+ * calibration. A book opened with the same owner keeps the drift (reset({ keepDrift: true }));
+ * a different source or a new calibration starts over. Null when unknown.
+ */
+export function driftOwnerKey(kind: GazeSourceKind | null | undefined, calibrationTrainedAt: number | null | undefined): string | null {
+  if (!kind) return null;
+  if (kind !== 'webcam') return kind;
+  return typeof calibrationTrainedAt === 'number' && Number.isFinite(calibrationTrainedAt) ? `webcam:${calibrationTrainedAt}` : null;
+}
+
+/** Fields of a serialized gaze model that a quick refresh leaves untouched (it only adds a screen-space correction). */
+const RIDGE_CORE_KEYS: readonly string[] = ['kind', 'featureLength', 'featureSignature', 'mean', 'std', 'quad', 'expMean', 'expStd', 'wx', 'bx', 'wy', 'by', 'lambda'];
+
+/**
+ * Whether two serialized models share their ridge core: `next` is a quick refresh (or an applied
+ * accuracy-check correction) of `base`, not a new calibration. Unknown shapes are never the same.
+ */
+export function sameRidgeCore(next: unknown, base: unknown): boolean {
+  if (typeof next !== 'object' || next === null || typeof base !== 'object' || base === null) return false;
+  const a = next as Record<string, unknown>;
+  const b = base as Record<string, unknown>;
+  if (!Array.isArray(a.wx) || !Array.isArray(b.wx)) return false;
+  return RIDGE_CORE_KEYS.every((k) => JSON.stringify(a[k] ?? null) === JSON.stringify(b[k] ?? null));
+}
+
+/** "1 line", "2.5 lines" (one decimal, at least 0.1). */
+export function formatLines(lines: number): string {
+  if (!Number.isFinite(lines)) return '? lines';
+  const v = Math.max(0.1, Math.round(Math.abs(lines) * 10) / 10);
+  const text = Number.isInteger(v) ? String(v) : v.toFixed(1);
+  return v === 1 ? '1 line' : `${text} lines`;
+}
+
+export interface AccuracyCheckView {
+  tone: 'success' | 'info' | 'warn' | 'error';
+  title: string;
+  message: string;
+  /** Which of Dewey's reactions fits (a QUIPS key). */
+  quip:
+    | 'accuracyGood'
+    | 'accuracyClose'
+    | 'accuracySlightlyOff'
+    | 'accuracyOff'
+    | 'accuracySideways'
+    | 'accuracyStretched'
+    | 'accuracyFixed'
+    | 'accuracyFailed';
+  /** Offer the quick 5-dot refresh (a shared offset: the refresh re-centres it). */
+  offerTouchUp: boolean;
+  /** Offer a full calibration instead (the dots disagree near the top and bottom: a refresh only takes out part of that). */
+  offerRecalibrate: boolean;
+  /** The overlay's badge for the same measurement (offsetVerdict), so both can be compared. */
+  badge: OffsetBadge | null;
+}
+
+/**
+ * How an accuracy check reads to the reader after "Done" (or an applied correction). It is the
+ * overlay's verdict (offsetVerdict, src/app/offsetWords.ts) in a toast and a Dewey line, with the
+ * same words and rounding: on target → success; close enough → no action; slightly off or drifted
+ * → the quick 5-dot refresh is offered (a full calibration when only the top and bottom are off).
+ * Without `offsetXFrac` the horizontal offset is ignored; without `maxDotYLines` the verdict
+ * rests on the mean offset alone.
+ */
+export function accuracyCheckView(r: AppEvents['accuracy-check']): AccuracyCheckView {
+  if (!Number.isFinite(r.meanErrorPx) || !Number.isFinite(r.offsetYPx) || !Number.isFinite(r.offsetYLines)) {
+    return {
+      tone: 'error',
+      title: 'Couldn’t measure accuracy',
+      message: 'There weren’t enough steady looks at the dots. Try again with your face evenly lit.',
+      quip: 'accuracyFailed',
+      offerTouchUp: false,
+      offerRecalibrate: false,
+      badge: null,
+    };
+  }
+  const { words: w, badge } = offsetVerdict(r.offsetYLines, r.offsetXFrac ?? 0, r.maxDotYLines ?? Number.NaN);
+  const none = { offerTouchUp: false, offerRecalibrate: false, badge };
+  if (r.applied) {
+    return {
+      tone: 'success',
+      title: 'Tracking corrected',
+      message: w.onTarget ? 'It was already close; it’s re-centred on the dots you just looked at.' : `Tracking read ${w.text}. That’s fixed now.`,
+      quip: 'accuracyFixed',
+      ...none,
+    };
+  }
+  if (w.onTarget) {
+    return {
+      tone: 'success',
+      title: 'Tracking is on target',
+      message: `Within half a line of where you look (average error ${Math.round(r.meanErrorPx)} px).`,
+      quip: 'accuracyGood',
+      ...none,
+    };
+  }
+  if (!w.worthCorrecting) {
+    return {
+      tone: 'info',
+      title: 'Close enough',
+      message: `Tracking reads ${w.text}. The reader corrects that much by itself.`,
+      quip: 'accuracyClose',
+      ...none,
+    };
+  }
+  // Only the top and bottom disagree (a scale error or scatter): a refresh re-centres, it doesn't
+  // stretch, so it takes out only part of that. A full calibration is the fix.
+  const stretched = w.vertical === null && w.horizontal === null;
+  const quip: AccuracyCheckView['quip'] = stretched
+    ? 'accuracyStretched'
+    : w.vertical === null
+      ? 'accuracySideways'
+      : w.big
+        ? 'accuracyOff'
+        : 'accuracySlightlyOff';
+  return {
+    tone: w.big ? 'warn' : 'info',
+    title: w.big ? 'Tracking has drifted' : 'Tracking is slightly off',
+    message: `Tracking reads ${w.text}. ${stretched ? 'A full calibration (C) fixes that best.' : 'A quick 5-dot refresh re-centres it.'}`,
+    quip,
+    offerTouchUp: !stretched,
+    offerRecalibrate: stretched,
+    badge,
+  };
+}
+
+/** Flags worth one coaching line per session, most useful first. */
+export const COACHED_LIGHTING_FLAGS: readonly LightingFlag[] = Object.freeze(['backlit', 'glare', 'dark'] satisfies LightingFlag[]);
+
+/**
+ * Lighting flags that have held for `holdMs` without a break (they are already smoothed and
+ * hysteretic; this adds "not just a moment", so turning a lamp or leaning in doesn't coach).
+ */
+export class SustainedFlags {
+  private readonly since = new Map<LightingFlag, number>();
+
+  constructor(private readonly holdMs = 8000) {}
+
+  update(t: number, flags: readonly LightingFlag[]): LightingFlag[] {
+    for (const f of [...this.since.keys()]) if (!flags.includes(f)) this.since.delete(f);
+    for (const f of flags) if (!this.since.has(f)) this.since.set(f, t);
+    return flags.filter((f) => t - (this.since.get(f) ?? t) >= this.holdMs);
+  }
+
+  reset(): void {
+    this.since.clear();
+  }
+}
+
+/** The flag to coach about, if any (see COACHED_LIGHTING_FLAGS). */
+export function coachFlag(sustained: readonly LightingFlag[]): LightingFlag | null {
+  return COACHED_LIGHTING_FLAGS.find((f) => sustained.includes(f)) ?? null;
+}
+
+/**
+ * A view of `bus` whose 'gaze' listeners receive `correct(sample)`; everything else passes
+ * straight through. Lets a component that follows the gaze (Dewey's eyes) see the position the
+ * reading layer believes in (drift-corrected) without knowing about the reading layer. `clear`
+ * removes only the listeners added through this view.
+ */
+export function correctedGazeBus(bus: EventBus, correct: (s: GazeSample) => GazeSample): EventBus {
+  const own = new Set<Unsubscribe>();
+  const wrap = <K extends EventName>(type: K, cb: (payload: AppEvents[K]) => void): ((payload: AppEvents[K]) => void) => {
+    if (type !== 'gaze') return cb;
+    return (payload) => cb(correct(payload as GazeSample) as AppEvents[K]);
+  };
+  const track = (off: Unsubscribe): Unsubscribe => {
+    const unsubscribe = (): void => {
+      if (own.delete(unsubscribe)) off();
+    };
+    own.add(unsubscribe);
+    return unsubscribe;
+  };
+  return {
+    on: (type, cb) => track(bus.on(type, wrap(type, cb))),
+    once: (type, cb) => track(bus.once(type, wrap(type, cb))),
+    emit: (type, payload) => bus.emit(type, payload),
+    clear: () => {
+      for (const off of [...own]) off();
+    },
+  };
 }
 
 // ─────────────────────────────── Theme & layout ─────────────────────────────

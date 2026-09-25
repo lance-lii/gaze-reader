@@ -1,21 +1,28 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { CalibrationSample, EyeFeatures, Point } from '../types';
+import type { CalibrationSample, EyeFeatures, LightingSignature, Point } from '../types';
 import {
   CALIBRATION_STORAGE_KEY,
   DEFAULT_LAMBDAS,
+  GAZE_EXCLUDED_FEATURES,
+  GAZE_MODEL_KIND,
   RidgeGazeModel,
   asRidgeGazeModel,
+  calibrationUpgradeNeeded,
   clearCalibration,
+  computeAppearanceBaseline,
   deserializeGazeModel,
   evaluateModel,
   featureSignature,
   loadCalibration,
+  measureOffset,
   modelChromeTop,
   qualityFromError,
   refineGazeModel,
   saveCalibration,
+  savedCalibrationNeedsUpgrade,
   trainGazeModel,
 } from './calibrationModel';
+import { FEATURE_NAMES } from './features';
 
 const VIEWPORT = { width: 1280, height: 800 };
 const FEATURE_COUNT = 13;
@@ -401,6 +408,10 @@ describe('serialization', () => {
       { ...good, adjust: { sx: -1, ox: 0, sy: 1, oy: 0 } },
       { ...good, lambda: -1 },
       { ...good, bx: 'NaN' },
+      { ...good, excluded: [FEATURE_COUNT] },
+      { ...good, excluded: 'lids' },
+      // 1.0 models read gaze from the lids: recalibrate rather than load them.
+      { ...good, kind: 'gr-ridge-poly2' },
     ];
     for (const b of bad) expect(deserializeGazeModel(b)).toBeNull();
   });
@@ -582,5 +593,292 @@ describe('qualityFromError', () => {
     expect(qualityFromError(-1, 800)).toBe('poor');
     expect(qualityFromError(40, 0)).toBe('excellent');
     expect(qualityFromError(40, Number.NaN)).toBe('excellent');
+  });
+});
+
+describe('gaze-excluded features (the lids)', () => {
+  // The synthetic eye's feature 3 (a lookDown-like score) and 4 (lid aperture) carry vertical gaze.
+  // Named as lid features, the model must not use them at all.
+  const names = Array.from({ length: FEATURE_COUNT }, (_, i) => (i === 3 ? 'eyeBlinkLeft' : i === 4 ? 'rightOpen' : `f${i}`));
+
+  it('neutralizes them: never dominant, zero effect on a prediction, recorded in the JSON', () => {
+    const { model, report, diagnostics } = trainGazeModel(collect(GRID, 30, 151), { viewport: VIEWPORT, featureNames: names });
+    expect(diagnostics.excludedFeatures).toEqual([3, 4]);
+    expect(model.excludedFeatures).toEqual([3, 4]);
+    expect(diagnostics.dominantFeatures.length).toBeGreaterThan(0);
+    for (const j of diagnostics.dominantFeatures) expect([3, 4]).not.toContain(j);
+    expect(report.meanErrorPx).toBeLessThan(60); // the iris features alone still track
+
+    const f = eyeFeatures(GRID[5], rng(152), { noise: 0 });
+    const squinting = { ...f, vector: f.vector.map((v, i) => (i === 3 ? v + 0.4 : i === 4 ? v - 0.05 : v)) };
+    expect(model.predict(squinting)).toEqual(model.predict(f));
+    // Even absurd values: never a glitch, never a shift.
+    expect(model.predict({ ...f, vector: f.vector.map((v, i) => (i === 4 ? v + 1e3 : v)) })).toEqual(model.predict(f));
+
+    const restored = deserializeGazeModel(JSON.parse(JSON.stringify(model.toJSON())) as unknown, { featureNames: names })!;
+    expect(restored.excludedFeatures).toEqual([3, 4]);
+    expect(restored.predict(squinting)).toEqual(model.predict(f));
+  });
+
+  it('can be switched off (the 1.0 behaviour), and needs feature names to apply', () => {
+    const samples = collect(GRID, 30, 153);
+    const all = trainGazeModel(samples, { viewport: VIEWPORT, featureNames: names, excludedFeatures: [] });
+    expect(all.diagnostics.excludedFeatures).toEqual([]);
+    expect(all.diagnostics.dominantFeatures.some((j) => j === 3 || j === 4)).toBe(true);
+    const f = eyeFeatures(GRID[5], rng(154), { noise: 0 });
+    const lidsMoved = { ...f, vector: f.vector.map((v, i) => (i === 4 ? v - 0.05 : v)) };
+    expect(Math.abs(all.model.predict(lidsMoved)!.y - all.model.predict(f)!.y)).toBeGreaterThan(5);
+
+    expect(trainGazeModel(samples, { viewport: VIEWPORT }).diagnostics.excludedFeatures).toEqual([]);
+    const custom = trainGazeModel(samples, { viewport: VIEWPORT, featureNames: names, excludedFeatures: new Set(['f2']) });
+    expect(custom.diagnostics.excludedFeatures).toEqual([2]);
+  });
+
+  it('covers exactly the lid-driven entries of FEATURE_NAMES, never the 5-point iris, eyeLook or posture', () => {
+    const all: readonly string[] = FEATURE_NAMES;
+    for (const name of GAZE_EXCLUDED_FEATURES) expect(all).toContain(name);
+    expect([...GAZE_EXCLUDED_FEATURES].sort()).toEqual(
+      ['eyeBlinkLeft', 'eyeBlinkRight', 'rightOpen', 'leftOpen', 'rightLidY', 'leftLidY', 'rightV', 'leftV', 'meanV', 'rightU', 'leftU', 'meanU'].sort(),
+    );
+    const used = FEATURE_NAMES.filter((n) => !GAZE_EXCLUDED_FEATURES.has(n));
+    expect(used).toEqual(
+      expect.arrayContaining(['rightU5', 'rightVc5', 'leftU5', 'leftVc5', 'meanU5', 'meanVc5', 'eyeLookUpLeft', 'eyeLookDownRight', 'eyeLookInLeft', 'eyeLookOutRight', 'yaw', 'pitch', 'ty', 'faceScale']),
+    );
+    expect(used).toHaveLength(21);
+  });
+});
+
+/** A model with the running build's feature layout (x = 500 + 100·f0, y = 400 + 100·f1). */
+function realLayoutModel(): RidgeGazeModel {
+  const n = FEATURE_NAMES.length;
+  const wx = new Float64Array(n);
+  const wy = new Float64Array(n);
+  wx[0] = 100;
+  wy[1] = 100;
+  return new RidgeGazeModel({
+    featureLength: n,
+    featureSignature: featureSignature(FEATURE_NAMES),
+    mean: new Float64Array(n),
+    std: new Float64Array(n).fill(1),
+    quad: [],
+    expMean: new Float64Array(n),
+    expStd: new Float64Array(n).fill(1),
+    wx,
+    bx: 500,
+    wy,
+    by: 400,
+    lambda: 1,
+    viewport: VIEWPORT,
+    origin: { x: 0, y: 0 },
+    adjust: { sx: 1, ox: 0, sy: 1, oy: 0 },
+    trainedAt: 1,
+  });
+}
+
+describe('calibrationUpgradeNeeded', () => {
+  const current = realLayoutModel().toJSON();
+
+  it('is false for current models, nothing, garbage and foreign JSON', () => {
+    expect(current.kind).toBe(GAZE_MODEL_KIND);
+    expect(calibrationUpgradeNeeded(current)).toBe(false);
+    expect(calibrationUpgradeNeeded({ ...current, extDevicePixelRatio: 1.25 })).toBe(false); // the extension's copy
+    for (const other of [null, undefined, 42, 'model', [], {}, { version: 1 }, { version: 1, kind: 'webgazer' }, { kind: GAZE_MODEL_KIND }]) {
+      expect(calibrationUpgradeNeeded(other)).toBe(false);
+    }
+  });
+
+  it('is true for a model an older build saved: older kind, version or feature layout', () => {
+    const legacy1 = { ...current, kind: 'gr-ridge-poly2', featureLength: 27, featureSignature: featureSignature(FEATURE_NAMES.slice(0, 27)) };
+    expect(calibrationUpgradeNeeded(legacy1)).toBe(true);
+    expect(calibrationUpgradeNeeded({ ...legacy1, extDevicePixelRatio: 2 })).toBe(true);
+    expect(calibrationUpgradeNeeded({ ...current, version: 2 })).toBe(true);
+    expect(calibrationUpgradeNeeded({ ...current, featureSignature: featureSignature([...FEATURE_NAMES].reverse()) })).toBe(true);
+    expect(calibrationUpgradeNeeded({ ...current, featureLength: 27 })).toBe(true);
+    // Such models don't load, which is what makes the explanation necessary.
+    expect(deserializeGazeModel(legacy1, { featureNames: FEATURE_NAMES })).toBeNull();
+  });
+
+  it('reads the saved calibration', () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+    });
+    expect(savedCalibrationNeedsUpgrade()).toBe(false);
+    store.set(`gazeReader.${CALIBRATION_STORAGE_KEY}`, JSON.stringify({ ...current, kind: 'gr-ridge-poly2' }));
+    expect(savedCalibrationNeedsUpgrade()).toBe(true);
+    saveCalibration(realLayoutModel());
+    expect(savedCalibrationNeedsUpgrade()).toBe(false);
+  });
+});
+
+const LIGHT: LightingSignature = {
+  v: 1,
+  n: 40,
+  yaw: 0.02,
+  pitch: 0.06,
+  c: { sclera: -2, backlight: -0.3, side: 0.1, shade: -0.7, glare: 0, range: 2 },
+  sd: { sclera: 0.05, backlight: 0.1, side: 0.02, shade: 0.03, glare: 0, range: 0.1 },
+};
+
+/** Lids that narrow as the reader looks lower (openness = at0 + slope·y/H), with some squint. */
+function withLids(samples: CalibrationSample[], seed: number, at0 = 0.34, slope = -0.1, squint = 0.1): CalibrationSample[] {
+  const r = rng(seed);
+  return samples.map((s) => ({
+    ...s,
+    features: {
+      ...s.features,
+      openness: at0 + slope * (s.target.y / VIEWPORT.height) + 0.01 * gaussian(r),
+      squint: squint + 0.02 * gaussian(r),
+    },
+  }));
+}
+
+describe('calibration environment', () => {
+  it('stores the caller’s lighting and the eyelid baseline of the samples, and round-trips', () => {
+    const light = structuredClone(LIGHT);
+    const { model } = trainGazeModel(withLids(collect(GRID, 25, 161), 162), { viewport: VIEWPORT, environment: { lighting: light } });
+    light.c.sclera = 99; // the model keeps its own copy
+    const env = model.environment!;
+    expect(env.lighting).toEqual(LIGHT);
+    expect(env.capturedAt).toBe(model.trainedAt);
+    const a = env.appearance!;
+    expect(a.opennessAt0).toBeCloseTo(0.34, 2);
+    expect(a.opennessSlope).toBeCloseTo(-0.1, 1);
+    expect(a.opennessResidualSd).toBeGreaterThan(0.007);
+    expect(a.opennessResidualSd).toBeLessThan(0.013);
+    expect(a.squintMedian).toBeCloseTo(0.1, 2);
+    expect(a.squintSd).toBeGreaterThan(0.014);
+    expect(a.squintSd).toBeLessThan(0.026);
+
+    const json = JSON.parse(JSON.stringify(model.toJSON())) as Record<string, unknown>;
+    const restored = deserializeGazeModel(json)!;
+    expect(restored.environment).toEqual(env);
+    expect(restored.toJSON()).toEqual(model.toJSON());
+    // Samples with constant openness and no squint (older sources): a flat baseline, no lighting.
+    expect(trainGazeModel(collect(GRID, 10, 163), { viewport: VIEWPORT }).model.environment).toMatchObject({
+      lighting: null,
+      appearance: { opennessSlope: 0, squintMedian: 0, squintSd: 0 },
+    });
+  });
+
+  it('never rejects a model over its environment: malformed parts become null', () => {
+    const bad = { v: 1, n: 3, yaw: 0, pitch: 0, c: { sclera: 1 }, sd: {} } as unknown as LightingSignature;
+    const { model } = trainGazeModel(withLids(collect(GRID, 15, 164), 165), { viewport: VIEWPORT, environment: { lighting: bad } });
+    expect(model.environment!.lighting).toBeNull();
+    expect(model.environment!.appearance).not.toBeNull();
+
+    const good = trainGazeModel(withLids(collect(GRID, 15, 166), 167), { viewport: VIEWPORT, environment: { lighting: LIGHT } }).model.toJSON();
+    const env = good.environment as Record<string, unknown>;
+    const variants: [unknown, 'none' | 'lighting' | 'appearance'][] = [
+      [undefined, 'none'],
+      [null, 'none'],
+      ['sunny', 'none'],
+      [{ ...env, capturedAt: 'now' }, 'none'],
+      [{ ...env, lighting: { ...LIGHT, v: 2 } }, 'appearance'],
+      [{ ...env, lighting: { ...LIGHT, sd: { ...LIGHT.sd, glare: -1 } } }, 'appearance'],
+      [{ ...env, appearance: { ...(env.appearance as object), opennessSlope: null } }, 'lighting'],
+    ];
+    for (const [environment, kept] of variants) {
+      const m = deserializeGazeModel({ ...good, environment });
+      expect(m).not.toBeNull();
+      if (kept === 'none') expect(m!.environment).toBeNull();
+      if (kept === 'lighting') expect(m!.environment).toMatchObject({ lighting: LIGHT, appearance: null });
+      if (kept === 'appearance') {
+        expect(m!.environment!.lighting).toBeNull();
+        expect(m!.environment!.appearance).toEqual(env.appearance);
+      }
+    }
+  });
+
+  it('a quick refresh replaces it: today’s light and lids become the reference', () => {
+    const base = trainGazeModel(withLids(collect(GRID, 20, 171), 172), { viewport: VIEWPORT, environment: { lighting: LIGHT } }).model;
+    const QUICK: Point[] = [{ x: 640, y: 400 }, { x: 192, y: 120 }, { x: 1088, y: 120 }, { x: 192, y: 680 }, { x: 1088, y: 680 }];
+    const squinting = withLids(collect(QUICK, 20, 173), 174, 0.3, -0.1, 0.3);
+    const bright: LightingSignature = { ...LIGHT, c: { ...LIGHT.c, sclera: -1 } };
+    const refreshed = refineGazeModel(base, squinting, { viewport: VIEWPORT, environment: { lighting: bright } }).model;
+    expect(refreshed.environment!.lighting).toEqual(bright);
+    expect(refreshed.environment!.capturedAt).toBe(refreshed.trainedAt);
+    expect(refreshed.environment!.appearance!.opennessAt0).toBeCloseTo(0.3, 2);
+    expect(refreshed.environment!.appearance!.squintMedian).toBeCloseTo(0.3, 1);
+    // Unknown light today: the old signature no longer describes the reference.
+    expect(refineGazeModel(base, squinting, { viewport: VIEWPORT }).model.environment!.lighting).toBeNull();
+    // Other copies keep theirs.
+    expect(base.withAdjustment({ sx: 1, ox: 5, sy: 1, oy: 0 }, { viewport: VIEWPORT, trainedAt: 2 }).environment).toEqual(base.environment);
+  });
+});
+
+describe('computeAppearanceBaseline', () => {
+  it('fits openness against gaze height robustly (blinks and glances away do not move it)', () => {
+    const r = rng(181);
+    const samples = withLids(collect(GRID, 30, 182), 183, 0.33, -0.09).map((s, i) =>
+      i % 10 === 0
+        ? { ...s, features: { ...s.features, openness: 0.02 } }
+        : i % 17 === 0
+          ? { ...s, features: { ...s.features, openness: 0.33 + 0.2 * r() } }
+          : s,
+    );
+    const b = computeAppearanceBaseline(samples, VIEWPORT.height)!;
+    expect(b.v).toBe(1);
+    expect(b.n).toBe(samples.length);
+    expect(b.opennessAt0).toBeCloseTo(0.33, 2);
+    expect(Math.abs(b.opennessSlope + 0.09)).toBeLessThan(0.01);
+    expect(b.opennessResidualSd).toBeGreaterThan(0.008);
+    expect(b.opennessResidualSd).toBeLessThan(0.014);
+  });
+
+  it('returns null without enough usable samples, and a flat line with a single row of targets', () => {
+    const samples = withLids(collect(GRID, 5, 184), 185);
+    expect(computeAppearanceBaseline(samples.slice(0, 9), VIEWPORT.height)).toBeNull();
+    expect(computeAppearanceBaseline(samples, 0)).toBeNull();
+    expect(computeAppearanceBaseline(samples, Number.NaN)).toBeNull();
+    expect(computeAppearanceBaseline(null as unknown as CalibrationSample[], VIEWPORT.height)).toBeNull();
+    const nan = samples.map((s) => ({ ...s, features: { ...s.features, openness: Number.NaN } }));
+    expect(computeAppearanceBaseline(nan, VIEWPORT.height)).toBeNull();
+
+    const row = withLids(collect([{ x: 200, y: 400 }, { x: 640, y: 400 }, { x: 1000, y: 400 }], 10, 186), 187);
+    const flat = computeAppearanceBaseline(row, VIEWPORT.height)!;
+    expect(flat.opennessSlope).toBe(0);
+    expect(flat.opennessAt0).toBeCloseTo(0.34 - 0.05, 2);
+  });
+});
+
+describe('measureOffset', () => {
+  const exact = {
+    viewport: VIEWPORT,
+    trainedAt: 0,
+    toJSON: () => ({ version: 1 }),
+    predict: (f: EyeFeatures): Point => ({ x: f.vector[0], y: f.vector[1] }),
+  };
+
+  it('measures the mean signed offset over targets, ignoring wild samples and blinks', () => {
+    const targets: Point[] = [{ x: 640, y: 400 }, { x: 200, y: 150 }, { x: 1080, y: 650 }];
+    const r = rng(191);
+    const samples: CalibrationSample[] = [];
+    targets.forEach((target, ti) => {
+      for (let i = 0; i < 20; i++) {
+        const wild = i % 9 === 4;
+        const vector = wild ? [target.x - 600, target.y + 500] : [target.x + 12 + 3 * gaussian(r), target.y - 30 + 3 * gaussian(r)];
+        samples.push({ target, t: ti * 1000 + i, features: { ...eyeFeatures(target, r), vector } });
+      }
+    });
+    samples.push({ target: targets[0], t: 0, features: { ...eyeFeatures(targets[0], r), vector: [0, 0], blink: 0.95 } });
+    const m = measureOffset(exact, samples);
+    expect(m.targets).toBe(3);
+    // The 6 wild samples and the blink are out (the MAD rule also trims a few Gaussian tails).
+    expect(m.n).toBeLessThanOrEqual(3 * 18);
+    expect(m.n).toBeGreaterThan(3 * 15);
+    // 3 px noise over ~50 samples: the means are within ~1 px; the wild ones would move them 200+ px.
+    expect(Math.abs(m.offsetXPx - 12)).toBeLessThan(1.5);
+    expect(Math.abs(m.offsetYPx + 30)).toBeLessThan(1.5);
+    expect(Math.abs(m.meanErrorPx - Math.hypot(12, 30))).toBeLessThan(1.5);
+  });
+
+  it('is NaN with n 0 when nothing is evaluable', () => {
+    const m = measureOffset(exact, []);
+    expect(m.n).toBe(0);
+    expect(m.targets).toBe(0);
+    expect(Number.isNaN(m.offsetXPx) && Number.isNaN(m.offsetYPx) && Number.isNaN(m.meanErrorPx)).toBe(true);
   });
 });

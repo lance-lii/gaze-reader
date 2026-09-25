@@ -1,20 +1,60 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AppEvents, EyeFeatures, FeatureFrame, FeatureSource, Point, Unsubscribe } from '../types';
+import type { AppEvents, EyeFeatures, FeatureFrame, FeatureSource, GazeModel, LightingSignature, LightingStats, Point, Unsubscribe } from '../types';
 import { createEventBus } from '../core/events';
-import { evaluateModel, trainGazeModel } from '../gaze/calibrationModel';
+import { evaluateModel, measureOffset, refineGazeModel, trainGazeModel } from '../gaze/calibrationModel';
+import { buildLightingSignature } from '../gaze/lighting';
+import { accuracyCheckView } from '../app/logic';
 import {
+  CHECK_TARGETS,
   CalibrationOverlay,
   DEFAULT_POSITION_THRESHOLDS,
   QUICK_TARGETS,
   STANDARD_TARGETS,
   VALIDATION_TARGETS,
   assessPosition,
+  describeLightingChange,
+  describeOffset,
+  offsetVerdict,
   type CalibrationOverlayOptions,
   type PositionMetrics,
 } from './calibrationOverlay';
 
 type CalEvent = AppEvents['calibration'];
+type CheckEvent = AppEvents['accuracy-check'];
+
+/**
+ * A well-lit scene as the camera side measures it (src/gaze/lighting.ts): sclera ≈ 0.4 linear,
+ * background a little darker, no clipping, the normal corneal glint. Raises no LightingMonitor flag.
+ */
+function light(over: Partial<LightingStats> = {}): LightingStats {
+  return {
+    faceLuma: 0.45,
+    faceLin: 0.18,
+    faceRange: 1.4,
+    faceClip: 0,
+    frameLin: 0.2,
+    bgLin: 0.15,
+    bgClip: 0,
+    scleraR: 0.4,
+    scleraL: 0.4,
+    backlight: Math.log2(0.4 / 0.15),
+    side: 0.1,
+    shade: -0.3,
+    glareR: 0.004,
+    glareL: 0.004,
+    irisGlintR: 0.02,
+    irisGlintL: 0.02,
+    facePx: 6000,
+    ...over,
+  };
+}
+
+function signatureOf(stats: LightingStats, n = 30): LightingSignature {
+  const sig = buildLightingSignature(Array.from({ length: n }, () => ({ stats, yaw: 0.02, pitch: -0.05 })));
+  if (!sig) throw new Error('no signature');
+  return sig;
+}
 
 const VW = 1024; // jsdom's default window.innerWidth
 const VH = 768;
@@ -94,6 +134,12 @@ interface Reader {
    * to a sustained ~0.65 and the tracker's quality score drops with it.
    */
   lidsLowered: ((gaze: Point) => boolean) | null;
+  /** Lighting measurement attached to every 5th frame (≈ 6 Hz, like the camera side), or none. */
+  lighting: LightingStats | null;
+  /** EyeFeatures.squint, when the blendshapes provide one. */
+  squint: number | undefined;
+  /** Page zoom relative to the calibration: the eyes look at CSS px / zoom in calibration-time px. */
+  zoom: number;
   pointIndex: number;
   attempt: number;
 }
@@ -108,9 +154,13 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
     shift: [],
     closeEyes: null,
     lidsLowered: null,
+    lighting: null,
+    squint: undefined,
+    zoom: 1,
     pointIndex: -1,
     attempt: 0,
   };
+  let frameNo = 0;
   bus.on('calibration', (e) => {
     if ((e.phase === 'point' || e.phase === 'validating') && e.index !== undefined && e.message !== 'resumed' && e.message !== 'paused' && e.message !== 'face-lost') {
       reader.attempt = e.message === 'retry' ? reader.attempt + 1 : 0;
@@ -128,9 +178,10 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
       src.push({ t: performance.now(), faceFound: false, features: null, quality: 0 });
       return;
     }
-    const features = eyeFeatures(gaze, r, reader.shift);
+    const features = eyeFeatures({ x: gaze.x / reader.zoom, y: gaze.y / reader.zoom }, r, reader.shift);
     features.faceScale = reader.faceScale;
     features.faceCenter = { ...reader.faceCenter };
+    if (reader.squint !== undefined) features.squint = reader.squint;
     let quality = 0.9;
     if (reader.lidsLowered?.(gaze)) {
       features.blink = 0.65;
@@ -139,7 +190,8 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
     }
     const shrinking = target?.classList.contains('is-shrinking') ?? false;
     if (shrinking && reader.closeEyes?.(reader.pointIndex, reader.attempt)) features.blink = 0.9;
-    src.push({ t: performance.now(), faceFound: true, features, quality });
+    const lighting = reader.lighting && frameNo++ % 5 === 0 ? { ...reader.lighting } : undefined;
+    src.push({ t: performance.now(), faceFound: true, features, quality, ...(lighting ? { lighting } : {}) });
   }, periodMs);
   return { reader, stop: () => clearInterval(id) };
 }
@@ -148,6 +200,14 @@ function setup(opts: Partial<CalibrationOverlayOptions> = {}, readerPeriodMs = 3
   const bus = createEventBus();
   const events: CalEvent[] = [];
   bus.on('calibration', (e) => events.push(e));
+  const checks: CheckEvent[] = [];
+  /** Both event kinds in the order they were emitted. */
+  const log: string[] = [];
+  bus.on('accuracy-check', (e) => {
+    checks.push(e);
+    log.push(`accuracy-check:${e.applied}`);
+  });
+  bus.on('calibration', (e) => log.push(e.phase));
   const src = new FakeSource();
   const host = document.createElement('div');
   document.body.append(host);
@@ -161,8 +221,41 @@ function setup(opts: Partial<CalibrationOverlayOptions> = {}, readerPeriodMs = 3
     return found;
   };
   const root = q<HTMLDivElement>('.gr-cal');
-  return { bus, events, src, host, shadow, overlay, sim, q, root };
+  return { bus, events, checks, log, src, host, shadow, overlay, sim, q, root };
 }
+
+/** Yesterday's full calibration of the synthetic eye (optionally with the light it was made in). */
+function baseModel(seed: number, lighting: LightingSignature | null = null) {
+  const r = rng(seed);
+  const samples = STANDARD_TARGETS.flatMap((f) =>
+    Array.from({ length: 30 }, (_, i) => {
+      const target = { x: f.x * VW, y: f.y * VH };
+      return { target, features: eyeFeatures(target, r), t: i };
+    }),
+  );
+  return trainGazeModel(samples, { viewport: { width: VW, height: VH }, environment: { lighting } }).model;
+}
+
+/** Fresh synthetic samples at these viewport fractions (independent of the overlay's run). */
+function samplesAt(fractions: readonly Point[], shift: readonly number[], seed: number, perTarget = 40) {
+  const r = rng(seed);
+  return fractions.flatMap((f) =>
+    Array.from({ length: perTarget }, (_, i) => {
+      // The overlay keeps a 40 px margin; these fractions are all inside it at 1024 × 768.
+      const target = { x: f.x * VW, y: f.y * VH };
+      return { target, features: eyeFeatures(target, r, shift), t: i };
+    }),
+  );
+}
+
+/**
+ * Eyes that read low: the vertical features move as if the reader looked ~0.07 of the screen
+ * lower (feature 2 ≈ 0.05·ny, 3 ≈ sigmoid(4ny), 4 ≈ −0.06·ny near the centre).
+ */
+const READS_LOW = [0, 0, 0.0035, 0.07, -0.0042];
+
+const visibleButton = (scope: ParentNode, action: string): HTMLButtonElement | null =>
+  scope.querySelector<HTMLButtonElement>(`.gr-cal-center:not([hidden]) [data-action="${action}"]:not([hidden])`);
 
 async function advanceUntil(pred: () => boolean, maxMs = 120_000, stepMs = 100): Promise<void> {
   for (let t = 0; t <= maxMs; t += stepMs) {
@@ -182,7 +275,22 @@ async function startCalibration(ctx: ReturnType<typeof setup>): Promise<void> {
   const start = ctx.q<HTMLButtonElement>('[data-action="start"]');
   await advanceUntil(() => !start.disabled, 5000);
   start.click();
-  await advanceUntil(() => ctx.root.dataset.phase === 'targets', 2000, 20);
+  // The accuracy check's dots are 'validating' ones.
+  await advanceUntil(() => ctx.root.dataset.phase === 'targets' || ctx.root.dataset.phase === 'validating', 2000, 20);
+}
+
+/** The visible results card's pieces. */
+function resultsCard(ctx: ReturnType<typeof setup>) {
+  const card = ctx.shadow.querySelector<HTMLElement>('.gr-cal-center:not([hidden]) .gr-cal-card');
+  if (!card) throw new Error('no visible card');
+  const text = (sel: string): string => card.querySelector(sel)?.textContent ?? '';
+  return {
+    title: text('.gr-cal-title'),
+    badge: text('.gr-cal-badge'),
+    stats: [...card.querySelectorAll('.gr-cal-stat')].map((s) => s.textContent ?? ''),
+    note: text('.gr-cal-note'),
+    advice: text('.gr-cal-lede'),
+  };
 }
 
 beforeEach(() => {
@@ -248,6 +356,11 @@ describe('CalibrationOverlay — standard flow', () => {
     expect(shadow.querySelectorAll('.gr-cal-stat-value')[1].textContent).toBe(`≈ ${(report.meanErrorYPx / 20).toFixed(1)}`);
     expect(events.at(-1)).toEqual({ phase: 'done', report });
     expect(model.viewport).toEqual({ width: VW, height: VH });
+    // No lighting numbers from this camera: no lighting signature, but the eyelid baseline is there.
+    expect(model.environment?.lighting).toBeNull();
+    expect(model.environment?.appearance?.opennessAt0).toBeCloseTo(0.3, 6);
+    expect(ctx.checks).toEqual([]); // a full calibration isn't an accuracy check
+    expect(result!.check).toBeUndefined();
 
     const p = model.predict(eyeFeatures({ x: 300, y: 500 }, rng(99), [], 0));
     expect(p).not.toBeNull();
@@ -263,6 +376,30 @@ describe('CalibrationOverlay — standard flow', () => {
     window.removeEventListener('keydown', seen);
     ctx.sim.stop();
     overlay.destroy();
+  });
+
+  it('stores the light and the eyelids of the calibration with the model', async () => {
+    const ctx = setup();
+    ctx.sim.reader.lighting = light({ side: 0.3 });
+    ctx.sim.reader.squint = 0.12;
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 120_000, 250);
+    ctx.q<HTMLButtonElement>('[data-action="use"]').click();
+    const result = await done;
+    const env = result!.model.environment;
+    // Built from the dots phase only: ~13 × 2.2 s at ~6 measurements a second.
+    expect(env?.lighting?.n).toBeGreaterThanOrEqual(120);
+    expect(env?.lighting?.n).toBeLessThanOrEqual(260);
+    expect(env?.lighting?.c.sclera).toBeCloseTo(Math.log2(0.4), 2);
+    expect(env?.lighting?.c.side).toBeCloseTo(0.3, 6);
+    expect(env?.lighting?.yaw).toBeCloseTo(0.02, 6);
+    expect(env?.lighting?.pitch).toBeCloseTo(-0.05, 6);
+    // The squint score survives into the samples, so the eyelid baseline knows it.
+    expect(env?.appearance?.squintMedian).toBeCloseTo(0.12, 6);
+    // It survives a save and load.
+    expect(JSON.parse(JSON.stringify(result!.model.toJSON())).environment.lighting.c.side).toBeCloseTo(0.3, 6);
+    ctx.sim.stop();
   });
 
   it('Esc cancels: resolves null and emits cancelled', async () => {
@@ -457,20 +594,14 @@ describe('CalibrationOverlay — standard flow', () => {
 
 describe('CalibrationOverlay — quick mode', () => {
   it('refines a saved model from 5 points without a validation pass', async () => {
-    // Yesterday's full calibration…
-    const r = rng(5);
-    const baseSamples = STANDARD_TARGETS.flatMap((f) =>
-      Array.from({ length: 30 }, (_, i) => {
-        const target = { x: f.x * VW, y: f.y * VH };
-        return { target, features: eyeFeatures(target, r), t: i };
-      }),
-    );
-    const base = trainGazeModel(baseSamples, { viewport: { width: VW, height: VH } }).model;
+    // Yesterday's full calibration, in yesterday's light…
+    const base = baseModel(5, signatureOf(light()));
 
-    // …and today the reader sits a little differently.
+    // …and today the reader sits a little differently, with a brighter lamp.
     const shift = [0.015, -0.012, 0.004, 0.04, -0.006];
     const ctx = setup({ mode: 'quick', baseModel: base });
     ctx.sim.reader.shift = shift;
+    ctx.sim.reader.lighting = light({ scleraR: 0.8, scleraL: 0.8 });
     const done = ctx.overlay.run();
     expect(ctx.q('.gr-cal-next').textContent).toMatch(/5 dots/);
     await startCalibration(ctx);
@@ -480,6 +611,16 @@ describe('CalibrationOverlay — quick mode', () => {
     expect(points.map((e) => e.index)).toEqual([...QUICK_TARGETS.keys()]);
     expect(points.every((e) => e.total === QUICK_TARGETS.length)).toBe(true);
     expect(ctx.events.some((e) => e.phase === 'validating')).toBe(false);
+
+    // The results say how far off the old model was on these dots, what the tune-up leaves, and why.
+    const truth = measureOffset(base, samplesAt(QUICK_TARGETS, shift, 61));
+    const card = resultsCard(ctx);
+    expect(card.note).toBe(
+      'Before this refresh, tracking read about 1 line low and a bit to the right. Now: within half a line. ' +
+        'The light has changed since you calibrated: your eyes are more brightly lit now.',
+    );
+    expect(visibleButton(ctx.shadow, 'done')).toBeNull();
+    expect(ctx.checks).toEqual([]); // reported once the reader decides
 
     ctx.q<HTMLButtonElement>('[data-action="use"]').click();
     const result = await done;
@@ -494,6 +635,52 @@ describe('CalibrationOverlay — quick mode', () => {
     const after = evaluateModel(result!.model, today).meanErrorPx;
     expect(after).toBeLessThan(before / 2);
     expect(result!.model.toJSON()).toMatchObject({ version: 1 });
+
+    // Before/after, in the result and on the bus.
+    const check = result!.check!;
+    expect(check).toMatchObject({ mode: 'quick', applied: true, lightingChange: { changed: true, dominant: 'sclera' } });
+    expect(Math.abs(check.before.offsetYPx - truth.offsetYPx)).toBeLessThan(6);
+    expect(Math.abs(check.before.offsetXPx - truth.offsetXPx)).toBeLessThan(6);
+    expect(check.before.offsetYLines).toBeCloseTo(check.before.offsetYPx / (22 * 1.9), 9);
+    expect(Math.abs(check.after!.offsetYPx)).toBeLessThan(Math.abs(check.before.offsetYPx) / 3);
+    expect(check.before.offsetXFrac).toBeCloseTo(check.before.offsetXPx / VW, 9);
+    expect(check.before.maxDotYLines).toBeGreaterThanOrEqual(Math.abs(check.before.offsetYLines));
+    expect(ctx.checks).toEqual([
+      {
+        meanErrorPx: check.before.meanErrorPx,
+        offsetXPx: check.before.offsetXPx,
+        offsetYPx: check.before.offsetYPx,
+        offsetYLines: check.before.offsetYLines,
+        offsetXFrac: check.before.offsetXFrac,
+        maxDotYLines: check.before.maxDotYLines,
+        applied: true,
+      },
+    ]);
+    expect(ctx.log.slice(-2)).toEqual(['accuracy-check:true', 'done']);
+    expect(ctx.overlay.lastAccuracyCheck).toEqual(check);
+    // Today's light is the new reference.
+    expect(result!.model.environment?.lighting?.c.sclera).toBeCloseTo(Math.log2(0.8), 2);
+    ctx.sim.stop();
+  });
+
+  it('a redo reports the measurement as not applied, and the next one counts', async () => {
+    const base = baseModel(5);
+    const ctx = setup({ mode: 'quick', baseModel: base });
+    ctx.sim.reader.shift = READS_LOW;
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 60_000, 250);
+    visibleButton(ctx.shadow, 'redo')!.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.root.dataset.phase).toBe('positioning');
+    expect(ctx.checks.map((c) => c.applied)).toEqual([false]);
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 60_000, 250);
+    // Esc on the results: that measurement isn't applied either.
+    key('Escape');
+    await expect(done).resolves.toBeNull();
+    expect(ctx.checks.map((c) => c.applied)).toEqual([false, false]);
+    expect(ctx.log.slice(-2)).toEqual(['accuracy-check:false', 'cancelled']);
     ctx.sim.stop();
   });
 
@@ -539,6 +726,306 @@ describe('CalibrationOverlay — quick mode', () => {
   });
 });
 
+describe('CalibrationOverlay — accuracy check', () => {
+  it('measures the model without training, says the offset in plain words, and "Correct it" applies a quick refresh', async () => {
+    const base = baseModel(5, signatureOf(light()));
+    const baseJson = JSON.stringify(base.toJSON());
+    const ctx = setup({ mode: 'check', baseModel: base, linePitchPx: 20 });
+    ctx.sim.reader.shift = READS_LOW; // the lamp went on: gaze now reads low
+    ctx.sim.reader.lighting = light({ scleraR: 0.8, scleraL: 0.8 });
+    const done = ctx.overlay.run();
+    expect(ctx.q('.gr-cal-next').textContent).toMatch(/^Accuracy check: 5 dots, .* nothing changes unless you ask\.$/);
+    await startCalibration(ctx);
+    expect(ctx.root.dataset.phase).toBe('validating');
+    expect(ctx.q('.gr-cal-hud-label').textContent).toBe('Accuracy check');
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 60_000, 250);
+
+    // Five dots, as 'validating' events; nothing was trained.
+    expect(ctx.events.filter((e) => e.phase === 'validating').map((e) => e.index)).toEqual([...CHECK_TARGETS.keys()]);
+    expect(ctx.events.some((e) => e.phase === 'point' || e.phase === 'training')).toBe(false);
+
+    // The measurement matches what the model does on these eyes, measured independently.
+    const truth = measureOffset(base, samplesAt(CHECK_TARGETS, READS_LOW, 77));
+    const check = ctx.overlay.lastAccuracyCheck!;
+    expect(check.applied).toBe(false);
+    expect(Math.abs(check.before.offsetYPx - truth.offsetYPx)).toBeLessThan(6);
+    expect(Math.abs(check.before.offsetXPx)).toBeLessThan(8);
+    expect(check.before.offsetYLines).toBeCloseTo(check.before.offsetYPx / 20, 9);
+    expect(check.before.targets).toBe(CHECK_TARGETS.length);
+    expect(ctx.checks).toEqual([]); // reported once the reader decides
+
+    const card = resultsCard(ctx);
+    expect(card.title).toBe('Tracking reads about 3 lines low');
+    expect(card.badge).toBe('Drifted');
+    expect(card.stats[1]).toBe(`${check.before.offsetYLines.toFixed(1)}lines lowvertical offset at your text size`);
+    expect(card.note).toBe(
+      'The light has changed since you calibrated: your eyes are more brightly lit now. “Correct it” should bring it to within half a line.',
+    );
+    expect(card.advice).toMatch(/“Correct it” re-centers it/);
+    // "Correct it" is the suggestion; "Done" leaves things as they are; no full calibration needed.
+    const correct = visibleButton(ctx.shadow, 'use')!;
+    expect(correct.textContent).toBe('Correct it');
+    expect(correct.classList.contains('gr-cal-btn-primary')).toBe(true);
+    expect(ctx.shadow.activeElement).toBe(correct);
+    expect(visibleButton(ctx.shadow, 'done')?.classList.contains('gr-cal-btn-primary')).toBe(false);
+    expect(visibleButton(ctx.shadow, 'redo')).toBeNull();
+    const row = [...ctx.shadow.querySelectorAll<HTMLButtonElement>('.gr-cal-center:not([hidden]) .gr-cal-actions button:not([hidden])')];
+    expect(row.map((b) => b.textContent)).toEqual(['Done', 'Correct it']);
+    expect(ctx.q('.gr-cal-sr').textContent).toMatch(/^Drifted\. Tracking reads about 3 lines low\./);
+    // The live dot follows the model in use, so the offset can be seen: the reader looks at the centre.
+    await vi.advanceTimersByTimeAsync(300);
+    const live = ctx.q('.gr-cal-live');
+    expect(live.classList.contains('is-on')).toBe(true);
+    const liveY = Number(/translate3d\([-\d.]+px, ([-\d.]+)px/.exec(live.style.transform)?.[1]);
+    expect(liveY - VH / 2).toBeGreaterThan(30);
+
+    correct.click();
+    const result = await done;
+    expect(result).not.toBeNull();
+    expect(result!.check).toMatchObject({ mode: 'check', applied: true, before: check.before });
+    expect(Math.abs(result!.check!.after!.offsetYLines)).toBeLessThan(0.5);
+    expect(ctx.checks).toEqual([
+      {
+        meanErrorPx: check.before.meanErrorPx,
+        offsetXPx: check.before.offsetXPx,
+        offsetYPx: check.before.offsetYPx,
+        offsetYLines: check.before.offsetYLines,
+        offsetXFrac: check.before.offsetXFrac,
+        maxDotYLines: check.before.maxDotYLines,
+        applied: true,
+      },
+    ]);
+    expect(ctx.log.slice(-2)).toEqual(['accuracy-check:true', 'done']);
+    expect(ctx.events.at(-1)).toEqual({ phase: 'done', report: result!.report });
+
+    // The corrected model reads today's eyes right, elsewhere on the screen too.
+    const today = samplesAt(VALIDATION_TARGETS, READS_LOW, 78);
+    const errBefore = evaluateModel(base, today).meanErrorPx;
+    const errAfter = evaluateModel(result!.model, today).meanErrorPx;
+    expect(errAfter).toBeLessThan(errBefore / 3);
+    expect(Math.abs(measureOffset(result!.model, today).offsetYPx)).toBeLessThan(10);
+    // Today's light is the new reference; the checked model itself was never touched.
+    expect(result!.model.environment?.lighting?.c.sclera).toBeCloseTo(Math.log2(0.8), 2);
+    expect(JSON.stringify(base.toJSON())).toBe(baseJson);
+    ctx.sim.stop();
+  });
+
+  it('"Done" keeps the model: run() resolves null, and the measurement is still reported', async () => {
+    const base = baseModel(8);
+    const baseJson = JSON.stringify(base.toJSON());
+    const ctx = setup({ mode: 'check', baseModel: base, linePitchPx: 20 });
+    ctx.sim.reader.shift = [0, 0, 0.002, 0.04, -0.0024]; // ≈ 1.6 lines low
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 60_000, 250);
+    const card = resultsCard(ctx);
+    expect(card.title).toBe('Tracking reads about 2 lines low');
+    expect(card.badge).toBe('Slightly off');
+    // No lighting numbers from this camera: nothing to compare, and nothing claimed.
+    expect(ctx.overlay.lastAccuracyCheck).toMatchObject({ lighting: null, lightingChange: null });
+    expect(card.note).not.toMatch(/light/);
+
+    visibleButton(ctx.shadow, 'done')!.click();
+    await expect(done).resolves.toBeNull();
+    expect(ctx.checks).toHaveLength(1);
+    expect(ctx.checks[0].applied).toBe(false);
+    expect(ctx.checks[0].offsetYLines).toBeGreaterThan(1.2);
+    expect(ctx.overlay.lastAccuracyCheck).toMatchObject({ mode: 'check', applied: false });
+    expect(ctx.log.slice(-2)).toEqual(['accuracy-check:false', 'done']);
+    expect(ctx.events.some((e) => e.phase === 'training')).toBe(false);
+    expect(JSON.stringify(base.toJSON())).toBe(baseJson);
+    expect(ctx.root.hidden).toBe(true);
+    expect(ctx.src.listenerCount).toBe(0);
+    ctx.sim.stop();
+  });
+
+  it('on target it says so and suggests "Done"; Esc reports the measurement as not applied', async () => {
+    const ctx = setup({ mode: 'check', baseModel: baseModel(11), linePitchPx: 20 });
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 60_000, 250);
+    const card = resultsCard(ctx);
+    expect(card.title).toBe('Right on target');
+    expect(card.badge).toBe('On target');
+    expect(card.advice).toMatch(/still fits — nothing needs changing/);
+    expect(card.note).toBe('');
+    const doneButton = visibleButton(ctx.shadow, 'done')!;
+    expect(ctx.shadow.activeElement).toBe(doneButton);
+    expect(doneButton.classList.contains('gr-cal-btn-primary')).toBe(true);
+    expect(visibleButton(ctx.shadow, 'use')?.classList.contains('gr-cal-btn-primary')).toBe(false);
+    // The suggestion sits last, in the DOM too, so Tab follows what the eye sees.
+    const row = (): (string | null)[] =>
+      [...ctx.shadow.querySelectorAll<HTMLButtonElement>('.gr-cal-center:not([hidden]) .gr-cal-actions button:not([hidden])')].map((b) => b.textContent);
+    expect(row()).toEqual(['Correct it', 'Done']);
+    key('Tab');
+    expect(ctx.shadow.activeElement?.textContent).toBe('Correct it'); // wraps from the last button to the first
+
+    key('Escape');
+    await expect(done).resolves.toBeNull();
+    expect(ctx.checks.map((c) => c.applied)).toEqual([false]);
+    expect(Math.abs(ctx.checks[0].offsetYLines)).toBeLessThan(0.5);
+    expect(ctx.log.slice(-2)).toEqual(['accuracy-check:false', 'cancelled']);
+    ctx.sim.stop();
+  });
+
+  it('a scale error is not "On target": the worst dot counts, and a full calibration is suggested (regression)', async () => {
+    // Sitting further back than at calibration: the top reads high and the bottom low, 20 % of the
+    // distance from the centre. The check's dots are symmetric, so the mean offset is ~0.
+    const core = baseModel(5);
+    const c = VH / 2;
+    const stretched: GazeModel = {
+      predict: (f) => {
+        const p = core.predict(f);
+        return p ? { x: p.x, y: c + 1.2 * (p.y - c) } : null;
+      },
+      viewport: core.viewport,
+      trainedAt: core.trainedAt,
+      toJSON: () => core.toJSON(),
+    };
+    const ctx = setup({ mode: 'check', baseModel: stretched, linePitchPx: 30 });
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 60_000, 250);
+    const check = ctx.overlay.lastAccuracyCheck!;
+    expect(Math.abs(check.before.offsetYLines)).toBeLessThan(0.5); // the mean hides it…
+    expect(check.before.maxDotYLines).toBeGreaterThan(1.6); // …the dots don't (±1.79 lines by construction)
+    const card = resultsCard(ctx);
+    expect(card.badge).not.toBe('On target');
+    expect(card.badge).toBe('Slightly off');
+    expect(card.title).toBe('Tracking reads up to 2 lines off near the top and bottom');
+    expect(card.advice).not.toMatch(/nothing needs changing/);
+    // "Correct it" re-centres; it takes out only part of a scale error, so it isn't the suggestion.
+    expect(check.after!.maxDotYLines).toBeGreaterThanOrEqual(1);
+    const full = visibleButton(ctx.shadow, 'redo')!;
+    expect(full.textContent).toBe('Full calibration');
+    expect(full.classList.contains('gr-cal-btn-primary')).toBe(true);
+    expect(ctx.shadow.activeElement).toBe(full);
+    expect(visibleButton(ctx.shadow, 'use')?.classList.contains('gr-cal-btn-primary')).toBe(false);
+    expect(card.advice).toMatch(/can’t take all of it out/);
+
+    visibleButton(ctx.shadow, 'done')!.click();
+    await expect(done).resolves.toBeNull();
+    // The toast and Dewey after "Done" agree: not "on target", and a full calibration is offered.
+    const view = accuracyCheckView(ctx.checks[0]!);
+    expect(view.quip).not.toBe('accuracyGood');
+    expect(view).toMatchObject({ badge: 'Slightly off', title: 'Tracking is slightly off', offerRecalibrate: true, offerTouchUp: false });
+    ctx.sim.stop();
+  });
+
+  it('announces a check as a check: the first event is {phase: "start", message: "check"}', async () => {
+    const first = async (opts: Partial<CalibrationOverlayOptions>) => {
+      const ctx = setup(opts);
+      const done = ctx.overlay.run();
+      await vi.advanceTimersByTimeAsync(0);
+      const event = ctx.events[0];
+      ctx.overlay.cancel();
+      await done;
+      ctx.sim.stop();
+      return event;
+    };
+    expect(await first({ mode: 'check', baseModel: baseModel(5) })).toEqual({ phase: 'start', message: 'check' });
+    expect(await first({ mode: 'quick', baseModel: baseModel(5) })).toEqual({ phase: 'start' });
+    expect(await first({ mode: 'standard' })).toEqual({ phase: 'start' });
+    expect(await first({ mode: 'check', baseModel: null })).toEqual({ phase: 'start' }); // no model: a calibration
+  });
+
+  it('corrects a wrapped model (the extension’s zoom-aware one) without losing the wrapper’s scale', async () => {
+    const core = baseModel(5);
+    const zoom = 1.25; // this page is zoomed differently from the one calibrated on
+    const wrapped: GazeModel = {
+      predict: (f) => {
+        const p = core.predict(f);
+        return p ? { x: p.x * zoom, y: p.y * zoom } : null;
+      },
+      viewport: core.viewport,
+      trainedAt: core.trainedAt,
+      toJSON: () => ({ ...core.toJSON(), calibrationDpr: 2 }),
+    };
+    const ctx = setup({ mode: 'check', baseModel: wrapped, linePitchPx: 20 });
+    ctx.sim.reader.zoom = zoom;
+    ctx.sim.reader.shift = READS_LOW;
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 60_000, 250);
+    // Measured through the wrapper: 57 calibration px low is ~71 px on this page.
+    expect(resultsCard(ctx).title).toBe('Tracking reads about 4 lines low');
+    visibleButton(ctx.shadow, 'use')!.click();
+    const result = await done;
+
+    // Today's eyes on this page: dots in this page's px, eyes pointed at the same physical spots.
+    const r = rng(79);
+    const today = VALIDATION_TARGETS.flatMap((f) =>
+      Array.from({ length: 40 }, (_, i) => {
+        const target = { x: f.x * VW, y: f.y * VH };
+        return { target, features: eyeFeatures({ x: target.x / zoom, y: target.y / zoom }, r, READS_LOW), t: i };
+      }),
+    );
+    const errWrapped = evaluateModel(wrapped, today).meanErrorPx;
+    const errCorrected = evaluateModel(result!.model, today).meanErrorPx;
+    expect(errWrapped).toBeGreaterThan(60);
+    expect(errCorrected).toBeLessThan(15);
+    // Refining the bare core instead has to learn the 1.25× scale from 5 dots, and can't.
+    const collected = CHECK_TARGETS.flatMap((f) =>
+      Array.from({ length: 35 }, (_, i) => {
+        const target = { x: f.x * VW, y: f.y * VH };
+        return { target, features: eyeFeatures({ x: target.x / zoom, y: target.y / zoom }, r, READS_LOW), t: i };
+      }),
+    );
+    const naive = refineGazeModel(core, collected, { viewport: { width: VW, height: VH } }).model;
+    expect(evaluateModel(naive, today).meanErrorPx).toBeGreaterThan(3 * errCorrected);
+    ctx.sim.stop();
+  });
+
+  it('cancelling during the dots reports nothing', async () => {
+    const ctx = setup({ mode: 'check', baseModel: baseModel(5) });
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await vi.advanceTimersByTimeAsync(3000);
+    key('Escape');
+    await expect(done).resolves.toBeNull();
+    expect(ctx.checks).toEqual([]);
+    expect(ctx.overlay.lastAccuracyCheck).toBeNull();
+    ctx.sim.stop();
+  });
+
+  it('offers a full calibration when the saved model can’t read these eyes', async () => {
+    const ctx = setup({ mode: 'check', baseModel: baseModel(8) });
+    ctx.sim.reader.shift = [1, 1, 1, 1, 1]; // every prediction is rejected
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'failed', 60_000, 250);
+    expect(ctx.q('#' + ctx.q('.gr-cal-center:not([hidden]) [role="alert"]').getAttribute('aria-labelledby')).textContent).toBe(
+      'The accuracy check didn’t work',
+    );
+    expect(ctx.q('.gr-cal-failed-text').textContent).toMatch(/couldn’t compare/);
+    const retry = ctx.q<HTMLButtonElement>('[data-action="retry"]');
+    expect(retry.textContent).toBe('Full calibration');
+    expect(ctx.checks).toEqual([]);
+
+    ctx.sim.reader.shift = [];
+    retry.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.q('.gr-cal-next').textContent).toMatch(/13 dots/);
+    const before = ctx.events.length;
+    await startCalibration(ctx);
+    expect(ctx.events.slice(before).find((e) => e.phase === 'point')?.total).toBe(STANDARD_TARGETS.length);
+    ctx.overlay.cancel();
+    await done;
+    ctx.sim.stop();
+  });
+
+  it('falls back to a full calibration without a model to check', async () => {
+    const ctx = setup({ mode: 'check', baseModel: null });
+    const done = ctx.overlay.run();
+    expect(ctx.q('.gr-cal-next').textContent).toMatch(/13 dots/);
+    await startCalibration(ctx);
+    expect(ctx.events.find((e) => e.phase === 'point')?.total).toBe(STANDARD_TARGETS.length);
+    ctx.overlay.cancel();
+    await done;
+    ctx.sim.stop();
+  });
+});
+
 describe('CalibrationOverlay — positioning coach', () => {
   it('coaches distance and direction from the live features', async () => {
     const ctx = setup();
@@ -568,6 +1055,79 @@ describe('CalibrationOverlay — positioning coach', () => {
     expect(start.disabled).toBe(false);
     expect(start.textContent).toBe('Start anyway');
 
+    ctx.overlay.cancel();
+    await done;
+    ctx.sim.stop();
+  });
+
+  it('coaches the light from the camera side’s lighting numbers — no video element needed (the extension)', async () => {
+    const ctx = setup(); // no `video`, like the extension: the camera lives in the offscreen document
+    const { sim, q } = ctx;
+    const done = ctx.overlay.run();
+    const text = (): string => q('.gr-cal-status-text').textContent ?? '';
+    const lightCheck = (): HTMLElement => ctx.shadow.querySelectorAll<HTMLElement>('.gr-cal-check')[3];
+    const start = q<HTMLButtonElement>('[data-action="start"]');
+
+    // Eyes ~2.5 stops under-exposed: judged from the whites of the eyes, not the skin.
+    sim.reader.lighting = light({ scleraR: 0.07, scleraL: 0.075 });
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(text()).toMatch(/hard to see — more light on your face/);
+    expect(lightCheck().dataset.state).toBe('bad');
+    expect(lightCheck().textContent).toBe('!Light: needs attention');
+    expect(start.disabled).toBe(true);
+
+    sim.reader.lighting = light();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(text()).toMatch(/all set/);
+    expect(lightCheck().dataset.state).toBe('ok');
+    expect(lightCheck().textContent).toBe('✓Light: fine');
+    expect(start.disabled).toBe(false);
+
+    // A bright window behind the reader.
+    sim.reader.lighting = light({ backlight: -1.6, bgLin: 0.9, bgClip: 0.4 });
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(text()).toMatch(/Bright light behind you puts your face in shadow/);
+    expect(start.disabled).toBe(true);
+
+    // Reflections on glasses: a tip, not a blocker.
+    sim.reader.lighting = light({ glareR: 0.05, glareL: 0.03 });
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(text()).toMatch(/^You’re all set\. One tip: .*reflections on your glasses/);
+    expect(lightCheck().dataset.state).toBe('tip');
+    expect(lightCheck().textContent).toBe('iLight: fine, with a tip');
+    expect(start.disabled).toBe(false);
+    expect(start.textContent).toBe('Start');
+    expect(q('.gr-cal-preview').dataset.state).toBe('good');
+
+    // A washed-out picture (clipped skin).
+    sim.reader.lighting = light({ faceClip: 0.12 });
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(text()).toMatch(/washed out/);
+
+    // When the camera side stops measuring, there is no light advice without data.
+    sim.reader.lighting = null;
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(lightCheck().dataset.state).toBe('ok');
+    expect(text()).toMatch(/all set/);
+
+    ctx.overlay.cancel();
+    await done;
+    ctx.sim.stop();
+  });
+
+  it('asks for a moment while the light is changing (camera still adjusting)', async () => {
+    const ctx = setup();
+    const done = ctx.overlay.run();
+    ctx.sim.reader.lighting = light();
+    await vi.advanceTimersByTimeAsync(1200);
+    // Exposure jumps by 1.5 stops: a lamp switched on, or auto-exposure hunting.
+    ctx.sim.reader.lighting = light({ frameLin: 0.2 * 2 ** 1.5, faceLin: 0.18 * 2 ** 1.5 });
+    await vi.advanceTimersByTimeAsync(800);
+    expect(ctx.q('.gr-cal-status-text').textContent).toMatch(/light is changing/);
+    expect(ctx.q<HTMLButtonElement>('[data-action="start"]').disabled).toBe(true);
+    // Settled: the swing leaves the 3 s window.
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(ctx.q('.gr-cal-status-text').textContent).toMatch(/all set/);
     ctx.overlay.cancel();
     await done;
     ctx.sim.stop();
@@ -778,11 +1338,31 @@ describe('assessPosition', () => {
     yaw: 0,
     pitch: 0,
     quality: 0.9,
-    brightness: 0.5,
+    lighting: [],
   };
 
   it('is happy with a well-placed face', () => {
-    expect(assessPosition(good)).toEqual({ issue: null, checks: { face: true, distance: true, center: true, light: true } });
+    expect(assessPosition(good)).toEqual({ issue: null, tip: null, checks: { face: true, distance: true, center: true, light: true } });
+    // Light that isn't measured (no lighting numbers from the camera side) is not a problem either.
+    expect(assessPosition({ ...good, lighting: null })).toEqual(assessPosition(good));
+  });
+
+  it('turns lighting flags into issues and tips', () => {
+    const issue = (lighting: PositionMetrics['lighting']) => assessPosition({ ...good, lighting });
+    expect(issue(['dark']).issue).toBe('too-dark');
+    expect(issue(['dark']).checks.light).toBe(false);
+    expect(issue(['backlit']).issue).toBe('backlit');
+    expect(issue(['overexposed']).issue).toBe('overexposed');
+    expect(issue(['unstable']).issue).toBe('light-changing');
+    // Backlight explains dark eyes (and what to do about it) better than "add light".
+    expect(issue(['dark', 'backlit']).issue).toBe('backlit');
+    // While the light is changing the other flags may be the camera still adjusting.
+    expect(issue(['dark', 'unstable']).issue).toBe('light-changing');
+    // Reflections and side light are advice: no issue, the light check still passes.
+    expect(issue(['glare'])).toEqual({ issue: null, tip: 'glare', checks: { face: true, distance: true, center: true, light: true } });
+    expect(issue(['side-lit'])).toMatchObject({ issue: null, tip: 'side-lit' });
+    expect(issue(['glare', 'side-lit']).tip).toBe('glare');
+    expect(issue(['side-lit', 'dark'])).toMatchObject({ issue: 'too-dark', tip: 'side-lit' });
   });
 
   it('gives directions from the reader’s point of view (the image is not mirrored)', () => {
@@ -797,10 +1377,11 @@ describe('assessPosition', () => {
     expect(assessPosition({ ...good, faceScale: t.minFaceScale / 2 }).issue).toBe('too-far');
     expect(assessPosition({ ...good, faceScale: t.maxFaceScale * 1.5 }).issue).toBe('too-close');
     expect(assessPosition({ ...good, yaw: 0.6, faceScale: 0.03 }).issue).toBe('not-facing');
-    expect(assessPosition({ ...good, brightness: 0.05 }).issue).toBe('too-dark');
-    expect(assessPosition({ ...good, brightness: null, quality: 0.2 }).issue).toBe('unsteady');
-    expect(assessPosition({ ...good, brightness: 0.05, faceCenter: { x: 0.9, y: 0.45 } }).issue).toBe('move-right');
-    const both = assessPosition({ ...good, faceScale: 0.03, brightness: 0.05 });
+    expect(assessPosition({ ...good, lighting: ['dark'] }).issue).toBe('too-dark');
+    expect(assessPosition({ ...good, lighting: null, quality: 0.2 }).issue).toBe('unsteady');
+    expect(assessPosition({ ...good, lighting: ['dark'], quality: 0.2 }).issue).toBe('too-dark');
+    expect(assessPosition({ ...good, lighting: ['dark'], faceCenter: { x: 0.9, y: 0.45 } }).issue).toBe('move-right');
+    const both = assessPosition({ ...good, faceScale: 0.03, lighting: ['dark'] });
     expect(both.checks).toEqual({ face: true, distance: false, center: true, light: false });
   });
 
@@ -808,5 +1389,91 @@ describe('assessPosition', () => {
     expect(assessPosition({ ...good, faceFound: false }).issue).toBe('no-face');
     expect(assessPosition({ ...good, faceScale: Number.NaN }).issue).toBe('no-face');
     expect(assessPosition({ ...good, faceCenter: { x: Infinity, y: 0.5 } }).checks.face).toBe(false);
+    expect(assessPosition({ ...good, faceFound: false, lighting: ['glare'] }).tip).toBeNull();
+  });
+});
+
+describe('describeOffset', () => {
+  it('puts a vertical offset in plain words (positive = gaze reads low)', () => {
+    expect(describeOffset(2.1)).toEqual({
+      text: 'about 2 lines low',
+      onTarget: false,
+      worthCorrecting: true,
+      big: true,
+      vertical: 'low',
+      horizontal: null,
+      spread: false,
+    });
+    expect(describeOffset(-1.2).text).toBe('about 1 line high');
+    expect(describeOffset(2.85).text).toBe('about 3 lines low');
+    expect(describeOffset(0.6)).toMatchObject({ text: 'about half a line low', onTarget: false, worthCorrecting: false });
+    expect(describeOffset(0.8)).toMatchObject({ text: 'about 1 line low', worthCorrecting: true });
+    expect(describeOffset(-0.3)).toMatchObject({ text: 'within half a line', onTarget: true, worthCorrecting: false });
+  });
+
+  it('mentions a horizontal offset as a fraction of the screen width', () => {
+    expect(describeOffset(0.2, 0.1)).toMatchObject({ text: 'a bit to the right', onTarget: false, worthCorrecting: true, horizontal: 'right' });
+    expect(describeOffset(-3.4, -0.2).text).toBe('about 3 lines high and to the left');
+    expect(describeOffset(0, 0.03)).toMatchObject({ onTarget: true, horizontal: null });
+  });
+
+  it('is honest about garbage', () => {
+    expect(describeOffset(Number.NaN)).toMatchObject({ text: 'unknown', onTarget: false, worthCorrecting: false });
+    expect(describeOffset(1.6, Number.NaN).text).toBe('about 2 lines low');
+    expect(describeOffset(0.2, 0, Number.NaN)).toMatchObject({ onTarget: true, spread: false }); // worst dot unknown: the mean decides
+  });
+
+  it('judges the worst dot too: a scale error cancels in the mean (regression: "On target" at ±2 lines)', () => {
+    // Dots ±0.93 lines off (a 10 % gain at 30 px lines): still on target.
+    expect(describeOffset(0, 0, 0.93)).toMatchObject({ onTarget: true, text: 'within half a line' });
+    // ±1.2 lines: not on target, but not worth correcting either ("Close enough").
+    expect(describeOffset(0.05, 0, 1.2)).toMatchObject({
+      onTarget: false,
+      worthCorrecting: false,
+      spread: true,
+      text: 'up to 1 line off near the top and bottom',
+    });
+    expect(describeOffset(0, 0, 1.87)).toMatchObject({ worthCorrecting: true, big: false, text: 'up to 2 lines off near the top and bottom' });
+    expect(describeOffset(0, 0, 2.8)).toMatchObject({ worthCorrecting: true, big: true, text: 'up to 3 lines off near the top and bottom' });
+    // A shared offset with dots close to it is worded by the offset alone…
+    expect(describeOffset(2.1, 0, 2.4)).toMatchObject({ text: 'about 2 lines low', spread: false });
+    // …but dots a line or more beyond it are mentioned.
+    expect(describeOffset(0.6, 0, 2.5).text).toBe('about half a line low, and up to 3 lines off near the top and bottom');
+  });
+});
+
+describe('offsetVerdict', () => {
+  it('orders the badges: on target, close enough, drifted, slightly off', () => {
+    expect(offsetVerdict(0.2)).toMatchObject({ badge: 'On target', quality: 'excellent' });
+    expect(offsetVerdict(0.6)).toMatchObject({ badge: 'Close enough', quality: 'good' });
+    expect(offsetVerdict(1.4)).toMatchObject({ badge: 'Slightly off', quality: 'fair' });
+    expect(offsetVerdict(2.2)).toMatchObject({ badge: 'Drifted', quality: 'poor' });
+    expect(offsetVerdict(0.2, 0.15)).toMatchObject({ badge: 'Drifted' });
+    expect(offsetVerdict(0.2, 0.08)).toMatchObject({ badge: 'Slightly off' });
+    expect(offsetVerdict(0, 0, 1.87)).toMatchObject({ badge: 'Slightly off' });
+    expect(offsetVerdict(0, 0, 2.8)).toMatchObject({ badge: 'Drifted' });
+  });
+});
+
+describe('describeLightingChange', () => {
+  const ref = signatureOf(light());
+
+  it('stays quiet when the light is the same', () => {
+    const same = describeLightingChange(ref, signatureOf(light()));
+    expect(same.changed).toBe(false);
+    expect(same.text).toBeNull();
+    expect(same.distance).toBeCloseTo(0, 6);
+  });
+
+  it('names what changed, in words the reader can act on', () => {
+    // The whole room brighter or dimmer: the eyes change, the ratio to the background doesn't.
+    const brighter = describeLightingChange(ref, signatureOf(light({ scleraR: 0.8, scleraL: 0.8 })));
+    expect(brighter).toMatchObject({ changed: true, dominant: 'sclera', text: 'your eyes are more brightly lit now' });
+    expect(brighter.distance).toBeCloseTo(1 / 0.75, 2); // one stop, tolerance 0.75 stop
+    expect(describeLightingChange(ref, signatureOf(light({ scleraR: 0.15, scleraL: 0.15 }))).text).toBe('your eyes are more dimly lit now');
+    const window = describeLightingChange(ref, signatureOf(light({ backlight: -1.5, bgLin: 1, bgClip: 0.3 })));
+    expect(window).toMatchObject({ changed: true, dominant: 'backlight', text: 'there’s more light behind you now' });
+    expect(describeLightingChange(ref, signatureOf(light({ side: 1.3 }))).text).toBe('more of the light comes from one side now');
+    expect(describeLightingChange(ref, signatureOf(light({ glareR: 0.06 }))).text).toBe('there are more reflections on your glasses or eyes now');
   });
 });

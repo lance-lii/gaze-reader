@@ -37,6 +37,10 @@ What's new in each release is in [CHANGELOG.md](CHANGELOG.md).
   follows the structure of reading instead of trusting raw coordinates. It groups gaze into
   fixations, tracks which line you're on with a hidden Markov model, spots return sweeps to the
   next line, and learns your vertical drift as you read.
+- **Copes with changing light.** Turning on a lamp or reading as the sun goes down no longer throws
+  the page turns off: the tracker reads your gaze from the iris rather than your eyelids, the reading
+  model re-learns the offset by itself, and **A** checks the accuracy in about 10 seconds. See
+  [Lighting](#lighting).
 - **You stay in control.** Choose from three sensitivity presets. You can also look below the page
   to turn it, press **U** to undo a turn, press **P** to pause, or page with the keyboard as usual.
 - **Dewey.** An animated nerd with round glasses whose pupils follow your gaze. He flips his tiny
@@ -93,8 +97,9 @@ Tips for good tracking:
 - **Distance:** about an arm's length from the screen (50–70 cm), with your face centered in
   the camera image. Put the laptop at a height where your eyes are level with the top of the screen.
 - **Keep your head still-ish:** follow the dots with your eyes, not your head, and read in roughly
-  the posture you calibrated in. Small movements are fine. After a big change in posture, lighting
-  or seating, recalibrate (**C**; takes about a minute).
+  the posture you calibrated in. Small movements are fine. After a big change in posture or
+  seating, recalibrate (**C**; takes about a minute). Changes in the light are handled for you
+  (see [Lighting](#lighting)).
 - **Glasses:** tilt the screen or the lamp to get rid of reflections on the lenses. Glare over
   the iris confuses the tracker.
 - **Window size:** calibration is tied to the window's size and layout. If you resize or zoom the
@@ -130,6 +135,7 @@ In the app (shortcuts are ignored while you're typing in a field):
 | U | Undo the last page turn |
 | P | Pause or resume auto-scroll |
 | C | Recalibrate the camera |
+| A | Check tracking accuracy (a few dots; correct it on the spot if it's off) |
 | D | Show or hide the debug overlay |
 | G | Show or hide the gaze dot |
 | S | Settings |
@@ -143,6 +149,59 @@ Alt+Shift+C recalibrates, Alt+Shift+H lists all of them, and Alt+Shift+X turns G
 Alt+Shift+G turns it on or off from anywhere; you can change this shortcut at
 `chrome://extensions/shortcuts`.
 
+## Lighting
+
+Light changes how open your eyes are. In bright light or glare most people squint a little
+(the lid opening shrinks by about 0.75 mm at 1,200 lux), and in a dim room the eyes open wider.
+Gaze Reader 1.0 read up-and-down gaze mostly from the eyelids, so a lamp switched on made it
+think you were reading a few lines lower than you were (pages turned early), and dim light made
+it read higher (pages turned late). Here is what changed:
+
+- **The tracker reads the iris, not the lids.** Vertical gaze now comes from the centre of the
+  iris (averaged over MediaPipe's five iris points) measured from the eye corners, plus the
+  "look up/down" scores and head pose. In simulation a 10% squint used to move the gaze by
+  0.8–5.5 lines; now it moves it by 0.2–1.1 lines, or 0.5–2.8 when only the upper lid drops (the
+  usual case in bright light). The reading model and the accuracy check absorb the rest.
+  Cross-validated calibration error is as good or better; frame-to-frame jitter is slightly
+  higher. Calibrations from 1.0 no longer fit, so the app asks you to **recalibrate once**.
+- **The reading model re-learns the offset.** It tracks a vertical offset of up to ±5 lines (1.0:
+  ±1.5), re-anchors it at every page turn, and resets it when the camera sees the light or your
+  eyelids change. In the simulator, offsets of ±2 to ±4 lines keep the reader on the right line
+  95–99.5% of the time with no early or missed page turns (1.0: 0–5%, and every turn early or
+  missed).
+- **It notices the light.** A few times a second the app measures the lighting on your face
+  (about 17 numbers, never pictures; see [PRIVACY.md](PRIVACY.md)) and compares it with the light
+  you calibrated in. The comparison uses ratios (the whites of your eyes against the background,
+  one cheek against the other), so it doesn't depend on skin tone.
+
+**Tips.** Calibrate in the light you read in. Light your face from the front; a window or lamp
+behind you leaves your face in shadow. If your glasses reflect a lamp, tilt the screen or the lamp
+a little. Dewey mentions a back light, reflections or a very dark room once per book (a small
+message does, when he's hidden or set to quiet).
+
+**Accuracy check (A).** Five dots show how far off the tracking is right now, in lines ("reads
+about 2 lines low", or "up to 2 lines off near the top and bottom" when the dots disagree), and
+whether the light has changed since calibration. **Correct it** applies a quick fix fitted on
+those same dots; **Done** leaves the calibration alone. When the quick fix can't take the error
+out (typically after sitting nearer or further than when you calibrated), it suggests a full
+calibration instead. It's also in Settings → Eye tracking → Check accuracy.
+
+**Quick 5-dot refresh.** When the light has changed since calibration, or the reading model has had
+to correct more than 1.5 lines for about 20 seconds, Dewey and a small message offer a quick
+refresh: five dots that re-centre your calibration (about 10 seconds). The offer waits until you
+pause or turn a page, comes at most every 10 minutes (twice per book, once per change of light),
+and **Not now** silences it for half an hour.
+
+**Tracking diagnostics.** If tracking misbehaves, Settings → Advanced → **Record tracking
+diagnostics (no video)** records up to 10 minutes of numbers: the eye measurements, gaze
+estimates, lighting readings, line positions and page turns, plus your settings, your browser, and
+your camera's settings and name (usually its model). No video, no images and no book text. It
+stays in the browser until you press **Stop and download**, which saves a JSON file you can share
+with the developers; see [PRIVACY.md](PRIVACY.md). A chip in the top bar shows while it records. Developers replay a recording through the current reading model
+with `GR_REPLAY=path/to/file.json npm run bench -- bench/replay` (PowerShell:
+`$env:GR_REPLAY='…'; npm run bench -- bench/replay`). The web app only; the Artifact build has
+no camera and no downloads.
+
 ## How page-turn detection works
 
 ```
@@ -151,10 +210,11 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
        → fixations → line tracker (HMM) → page-end detector → smooth scroll
 ```
 
-1. **Eye features.** For each video frame, the app measures where each iris sits between the eye
-   corners and relative to the lids. It adds lid aperture, head pose and the model's
-   "look up/down/in/out" blendshape scores. Blinks, and frames where the eyes are closed, are
-   dropped.
+1. **Eye features.** For each video frame, the app measures where the centre of each iris (the
+   mean of MediaPipe's five iris points) sits relative to the eye corners. It adds head pose and
+   the model's "look up/down/in/out" blendshape scores. Lid aperture and blink scores are still
+   measured, for blink detection and to notice squinting, but the gaze model ignores them: light
+   moves the lids. Blinks, and frames where the eyes are closed, are dropped.
 2. **Calibration** fits a ridge regression from those features to screen coordinates, with a few
    quadratic terms for the strongest features. The regularisation strength is chosen by
    leave-one-target-out cross-validation. Gaze is then smoothed with a One Euro filter.
@@ -163,7 +223,9 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
 4. **Which line?** The reader view measures every visible line of text. A hidden Markov model
    tracks which line you're on. Its transition probabilities follow the saccade just made:
    *forward*, *regression*, *return sweep* to the next line, or *jump*. It also learns the
-   tracker's vertical drift, which webcams suffer from most.
+   tracker's vertical offset (up to ±5 lines), which webcams suffer from most, re-anchors it at
+   every page turn, and re-learns it when the camera reports that the light or the eyelids
+   changed.
 5. **Page end.** The page turns when any of these holds for long enough (the thresholds come from
    the sensitivity preset):
    - the tracker is confident you're on the last fully visible line and your gaze has stayed near
@@ -266,13 +328,15 @@ src/reader/                 Book loading (txt/md/html/epub/pdf), sanitizer, libr
 src/buddy/                  Dewey: avatar, behaviour, quips, styles
 src/ui/                     Calibration overlay, top bar, library, settings, help, onboarding,
                             toasts, camera preview, gaze dot, debug overlay
-src/app/                    Controller (wires everything) and pure shell logic
+src/app/                    Controller (wires everything), pure shell logic, diagnostics recorder
 src/styles/app.css          App shell styles and theme tokens
 src/styles/artifact.css     Extra styles for the Artifact build (layout inside the frame)
 public/samples/             The two sample books
 extension/                  Chrome MV3 extension: service worker, offscreen tracker, content
                             script, popup, camera setup page
 scripts/                    Extension and Artifact builds, MediaPipe WASM copy, icon generator
+bench/                      Slow scoreboards: lighting robustness of the gaze features, reading-layer
+                            offset tolerance, replay of diagnostics recordings (npm run bench)
 docs/ARCHITECTURE.md        Module contracts and design notes
 ```
 
@@ -289,6 +353,7 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 | `npm run typecheck` | TypeScript checks for the app and the extension |
 | `npm test` | Run the unit and integration tests (Vitest, with jsdom for DOM tests) |
 | `npm run check` | All of the above: typecheck, tests, app build, extension build |
+| `npm run bench` | Slow accuracy scoreboards in `bench/` (several minutes). `GR_REPLAY=file.json npm run bench -- bench/replay` replays a diagnostics recording |
 
 ## Known limitations
 
@@ -298,7 +363,10 @@ docs/ARCHITECTURE.md        Module contracts and design notes
   lot of this, but large text and generous line spacing (the defaults) help. Very small text makes
   the last line hard to tell apart.
 - **Lighting and glasses.** Dim or back-lit faces and reflections on glasses make tracking
-  noticeably worse, and so does a camera that sees you from a steep angle.
+  noticeably worse, and so does a camera that sees you from a steep angle. A reflection right on
+  the iris moves the iris-based gaze more than it moved 1.0's lid-based gaze. The lighting and
+  eyelid thresholds were tuned on simulations and a synthetic face, not yet on many real webcams:
+  diagnostics recordings (see [Lighting](#lighting)) are the way to check them.
 - **Posture drift.** Calibration assumes you sit roughly as you did while calibrating. The model
   compensates for window moves and learns slow vertical drift, but after a big change in posture
   it's best to recalibrate. The web app doesn't compensate for page zoom, fullscreen or toolbar

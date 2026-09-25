@@ -244,6 +244,24 @@ describe('classifySaccade', () => {
     expect(classifySaccade(prev, fix(170, y0), layout, short)).toBe('regression');
   });
 
+  it('classifies on dx alone when the vertical step belongs to the sensor (ignoreDy)', () => {
+    // The gaze bias stepped 4 lines down between two fixations (a light switched on): with dy it
+    // is a jump; the eyes only made a forward saccade, a sweep or a regression.
+    const down = 4 * pitch;
+    expect(classifySaccade(fix(300, y0), fix(385, y0 + down), layout)).toBe('jump');
+    expect(classifySaccade(fix(300, y0), fix(385, y0 + down), layout, null, { ignoreDy: true })).toBe('forward');
+    expect(classifySaccade(fix(830, y0), fix(200, y0 + down), layout, null, { ignoreDy: true })).toBe('return-sweep');
+    expect(classifySaccade(fix(830, y0), fix(200, y0 - down), layout, null, { ignoreDy: true })).toBe('return-sweep');
+    expect(classifySaccade(fix(500, y0), fix(440, y0 - down), layout, null, { ignoreDy: true })).toBe('regression');
+    // Horizontal limits still apply, and a short paragraph-final line's sweep needs no drop.
+    expect(classifySaccade(fix(170, y0), fix(820, y0 + down), layout, null, { ignoreDy: true })).toBe('jump');
+    const short = { ...layout.lines[3]!, right: layout.lines[3]!.left + 150 };
+    expect(classifySaccade(fix(short.left + 130, y0), fix(210, y0 - down), layout, short, { ignoreDy: true })).toBe('return-sweep');
+    // A non-finite y doesn't matter then either; a non-finite x still does.
+    expect(classifySaccade(fix(300, NaN), fix(385, y0), layout, null, { ignoreDy: true })).toBe('forward');
+    expect(classifySaccade(fix(NaN, y0), fix(385, y0), layout, null, { ignoreDy: true })).toBe('jump');
+  });
+
   it('works without a layout using typical metrics', () => {
     expect(classifySaccade(fix(300, 100), fix(380, 102), null)).toBe('forward');
     expect(classifySaccade(fix(900, 100), fix(250, 140), null)).toBe('return-sweep');

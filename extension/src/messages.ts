@@ -18,6 +18,7 @@ import type {
   FeatureFrame,
   GazeSourceKind,
   HeadPose,
+  LightingStats,
   TrackerErrorCode,
   TrackingState,
 } from '../../src/types';
@@ -181,14 +182,54 @@ export function isEyeFeatures(x: unknown): x is EyeFeatures {
     isFiniteNum(x.blink) &&
     isFiniteNum(x.openness) &&
     isFiniteNum(x.faceScale) &&
-    isPoint(x.faceCenter)
+    isPoint(x.faceCenter) &&
+    // Optional (older offscreen documents don't send it): a 0..1 blendshape score.
+    (x.squint === undefined || (isFiniteNum(x.squint) && x.squint >= 0 && x.squint <= 1))
   );
+}
+
+/**
+ * Plausible range of every LightingStats field (the Record type keeps this in
+ * step with the contract). Levels and fractions are 0..1, ratios are log2
+ * stops (|x| ≤ 10 by construction), facePx is a pixel count.
+ */
+const LIGHTING_BOUNDS: Readonly<Record<keyof LightingStats, readonly [number, number]>> = {
+  faceLuma: [0, 1],
+  faceLin: [0, 1],
+  faceRange: [0, 16],
+  faceClip: [0, 1],
+  frameLin: [0, 1],
+  bgLin: [0, 1],
+  bgClip: [0, 1],
+  scleraR: [0, 1],
+  scleraL: [0, 1],
+  backlight: [-16, 16],
+  side: [-16, 16],
+  shade: [-16, 16],
+  glareR: [0, 1],
+  glareL: [0, 1],
+  irisGlintR: [0, 1],
+  irisGlintL: [0, 1],
+  facePx: [0, 1e7],
+};
+const LIGHTING_ENTRIES = Object.entries(LIGHTING_BOUNDS) as [keyof LightingStats, readonly [number, number]][];
+
+/** Aggregate lighting numbers from the offscreen document (never pixels). Extra keys are tolerated (newer senders). */
+export function isLightingStats(x: unknown): x is LightingStats {
+  if (!isObj(x)) return false;
+  for (const [key, [lo, hi]] of LIGHTING_ENTRIES) {
+    const v = x[key];
+    if (!isFiniteNum(v) || v < lo || v > hi) return false;
+  }
+  return true;
 }
 
 export function isFeatureFrame(x: unknown): x is FeatureFrame {
   if (!isObj(x)) return false;
   if (!isFiniteNum(x.t) || !isBool(x.faceFound) || !isFiniteNum(x.quality)) return false;
   if (x.quality < 0 || x.quality > 1) return false;
+  // Optional, like PageState.pageMode: an older offscreen document never sends it.
+  if (x.lighting !== undefined && !isLightingStats(x.lighting)) return false;
   if (x.features === null) return true;
   return isEyeFeatures(x.features);
 }

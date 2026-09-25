@@ -172,6 +172,33 @@ export function makeReadingPage(seed: number, opts: ReadingPageOptions = {}): Li
   return doc.layoutAt(0, { viewport: { left: 0, top: vTop, right: 1024, bottom } });
 }
 
+/**
+ * The page with extra vertical space before line `index` (an hr scene break spans ≈ 2.8 pitches
+ * in the app, an h2 with its margins ≈ 2.6): that line and every line below it move down by
+ * `gapPx`, and so do the viewport's and the column's bottom, so what was (fully) visible stays so.
+ * With `widthFraction` that line becomes a short one starting at the column's left edge (the first
+ * line after a break isn't indented).
+ */
+export function withBlockGap(layout: LineLayout, index: number, gapPx: number, widthFraction?: number): LineLayout {
+  const col = layout.column;
+  const lines = layout.lines.map((l, i): TextLine => {
+    if (i < index) return l;
+    const moved = { ...l, top: l.top + gapPx, bottom: l.bottom + gapPx, centerY: l.centerY + gapPx, docTop: l.docTop + gapPx };
+    if (i !== index || widthFraction === undefined) return moved;
+    const charWidth = (l.right - l.left) / Math.max(1, l.charCount);
+    const right = col.left + widthFraction * (col.right - col.left);
+    return { ...moved, left: col.left, right, charCount: Math.max(1, Math.round((right - col.left) / Math.max(1e-6, charWidth))) };
+  });
+  return {
+    ...layout,
+    lines,
+    viewport: { ...layout.viewport, bottom: layout.viewport.bottom + gapPx },
+    column: { ...col, bottom: col.bottom + gapPx },
+    scrollHeight: layout.scrollHeight + gapPx,
+    clientHeight: layout.clientHeight + gapPx,
+  };
+}
+
 /** Index of the last fully visible line, or -1. */
 export function lastFullyVisibleIndex(layout: LineLayout): number {
   for (let i = layout.lines.length - 1; i >= 0; i--) if (layout.lines[i]!.fullyVisible) return i;

@@ -1,4 +1,4 @@
-import type { EyeFeatures, GazeModel, Point, SerializedGazeModel } from '../../src/types';
+import type { CalibrationEnvironment, EyeFeatures, GazeModel, Point, SerializedGazeModel } from '../../src/types';
 import { deserializeGazeModel, type ModelCompatibility } from '../../src/gaze/calibrationModel';
 
 /**
@@ -40,6 +40,15 @@ export class ZoomAwareGazeModel implements GazeModel {
     return this.inner.trainedAt;
   }
 
+  /**
+   * Lighting and eyelid appearance when the model was calibrated (or last
+   * refreshed). Page zoom doesn't change them: the lighting signature is made
+   * of light ratios and the eyelid baseline is in viewport heights.
+   */
+  get environment(): CalibrationEnvironment | null {
+    return this.inner.environment ?? null;
+  }
+
   /** Current CSS px per calibration-time CSS px (1 at the calibration zoom). */
   scale(): number {
     const k = this.calibrationDpr / this.dpr();
@@ -51,6 +60,19 @@ export class ZoomAwareGazeModel implements GazeModel {
     if (!p) return null;
     const k = this.scale();
     return k === 1 ? p : { x: p.x * k, y: p.y * k };
+  }
+
+  /**
+   * Where the reader looks as a fraction of the calibration viewport's height
+   * (0 = top): the x-axis of the eyelid baseline (AppearanceBaseline). Zoom
+   * independent, because the prediction and the height are both in the CSS px
+   * of the calibration page. Null when the features are unusable.
+   */
+  gazeYNorm(features: EyeFeatures): number | null {
+    const h = this.inner.viewport.height;
+    if (!(h > 0)) return null;
+    const p = this.inner.predict(features);
+    return p && Number.isFinite(p.y) ? p.y / h : null;
   }
 
   toJSON(): SerializedGazeModel {

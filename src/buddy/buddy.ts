@@ -291,6 +291,12 @@ export class Buddy implements Mountable {
   private held: { mood: BuddyMood; until: number } | null = null;
   private calibrationMood: BuddyMood | null = null;
   private calPhase: CalibrationPhase | null = null;
+  /**
+   * The run in progress is an accuracy check ('start' with message 'check'): nothing is learned,
+   * so calibration coaching would be wrong, and the host sums up the result itself. Cleared as
+   * soon as a real calibration takes over ('point' or 'training') and when the run ends.
+   */
+  private checkRun = false;
   private noFace = false;
   private worried = false;
   private worriedSpoken = false;
@@ -621,6 +627,7 @@ export class Buddy implements Mountable {
       // Calibration ended without its closing event: don't stay above panels and toasts.
       this.calibrationMood = null;
       this.calPhase = null;
+      this.checkRun = false;
       this.raise(false);
       this.refreshMood();
     }
@@ -679,7 +686,8 @@ export class Buddy implements Mountable {
       case 'start':
         this.raise(true);
         this.calibrationMood = 'excited';
-        if (!repeat) this.coach('calibrationStart');
+        this.checkRun = e.message === 'check';
+        if (!repeat) this.coach(this.checkRun ? 'accuracyCheckStart' : 'calibrationStart');
         break;
       case 'positioning':
         this.raise(true);
@@ -690,6 +698,8 @@ export class Buddy implements Mountable {
         // Targets can appear anywhere, including under Dewey: step behind the overlay.
         this.raise(false);
         this.calibrationMood = 'reading';
+        // A check never shows 'point' dots: a real calibration took over ("Full calibration").
+        this.checkRun = false;
         // Only the first target's first announcement; the overlay re-emits it with a
         // message on retry / pause / resume, which isn't worth a new tip.
         if (e.index === 0 && typeof e.message !== 'string') this.coach('calibrationPoint');
@@ -697,19 +707,26 @@ export class Buddy implements Mountable {
       case 'training':
         this.raise(true);
         this.calibrationMood = 'thinking';
+        this.checkRun = false;
         if (!repeat) this.coach('calibrationTraining');
         break;
       case 'validating':
         this.raise(false);
         this.calibrationMood = 'reading';
-        if (!repeat) this.coach('calibrationValidating');
+        // The check's own dots: "let's see how well I learned" would be wrong, nothing was learned.
+        if (!repeat && !this.checkRun) this.coach('calibrationValidating');
         break;
       case 'done': {
         this.calibrationMood = null;
         this.calPhase = null;
         this.raise(true, 7_000);
         const q = e.report?.quality;
-        if (q === 'excellent' || q === 'good') {
+        if (this.checkRun) {
+          // The host sums up an accuracy check itself ('accuracy-check' → a toast and a line of
+          // ours); a calibration grade here would contradict it.
+          this.checkRun = false;
+          this.setTransient('happy', 2_500);
+        } else if (q === 'excellent' || q === 'good') {
           this.setTransient('excited', 3_500);
           this.coach('calibrationGood');
         } else if (q === 'fair') {
@@ -727,14 +744,16 @@ export class Buddy implements Mountable {
         this.calibrationMood = null;
         this.calPhase = null;
         this.raise(false);
-        this.coach('calibrationCancelled');
+        this.coach(this.checkRun ? 'accuracyCheckCancelled' : 'calibrationCancelled');
+        this.checkRun = false;
         break;
       case 'failed':
         this.calibrationMood = null;
         this.calPhase = null;
+        // checkRun stays: "Try again" continues the same run (the next 'start' resets it anyway).
         this.raise(true, 7_000);
         this.setTransient('worried', 3_000);
-        this.coach('calibrationFailed');
+        this.coach(this.checkRun ? 'accuracyFailed' : 'calibrationFailed');
         break;
     }
     this.refreshMood();

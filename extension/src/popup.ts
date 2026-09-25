@@ -28,6 +28,15 @@ import {
   type PageState,
   type RuntimeRequest,
 } from './messages';
+import { OUTDATED_CALIBRATION_SHORT, storedCalibrationStatus, type CalibrationStatus } from './calibrationStatus';
+import { lightingAdvice } from './lightingTips';
+import {
+  PAGE_EXTRA_NONE,
+  isPageExtraState,
+  type PageExtraCommand,
+  type PageExtraRequest,
+  type PageExtraState,
+} from './pageExtras';
 
 const POLL_MS = 1_000;
 /** How long "Click again to forget" waits for the second click. */
@@ -77,6 +86,8 @@ async function main(): Promise<void> {
     pageTurnHint: el<HTMLSpanElement>('page-turn-hint'),
     buddy: el<HTMLInputElement>('buddy'),
     gazeDot: el<HTMLInputElement>('gaze-dot'),
+    light: el<HTMLParagraphElement>('light'),
+    check: el<HTMLButtonElement>('check'),
     recalibrate: el<HTMLButtonElement>('recalibrate'),
     setup: el<HTMLButtonElement>('setup'),
   };
@@ -90,9 +101,11 @@ async function main(): Promise<void> {
   const store = createSettingsStore(bus, { persist: false, initial: await loadSettings(storage.area) });
   syncSettings({ bus, store, storage, origin: makeOrigin('popup') });
 
-  let calibrated = (await loadCalibrationJSON(storage.area)) !== null;
+  let calibration: CalibrationStatus = storedCalibrationStatus(await loadCalibrationJSON(storage.area));
   let ext: ExtSettings = await loadExtSettings(storage.area);
   let page: PageState = PAGE_OFF;
+  /** The light as the page sees it (older content scripts don't answer: nothing shown). */
+  let extra: PageExtraState = PAGE_EXTRA_NONE;
   let busy = false;
   /** Bumped by every on/off request, so a poll that was already in flight can't overwrite its answer. */
   let pageEpoch = 0;
@@ -115,7 +128,7 @@ async function main(): Promise<void> {
       disarmForget();
       const hadFocus = document.activeElement === forget;
       void clearCalibrationJSON(storage.area).then(() => {
-        calibrated = false;
+        calibration = 'none';
         render();
         // The button just left the page; hand focus to the natural next step, not <body>.
         if (hadFocus && !ui.recalibrate.disabled) ui.recalibrate.focus();
@@ -134,6 +147,20 @@ async function main(): Promise<void> {
     disarmForget();
     render();
   });
+
+  /** Sends one of the page's extra commands (the check runs on the page, so the popup gets out of the way). */
+  async function pageExtra(command: PageExtraCommand): Promise<void> {
+    if (tabId === undefined) return;
+    const request: PageExtraRequest = { type: 'page-extra-command', command };
+    await chrome.tabs.sendMessage(tabId, request, { frameId: 0 }).catch(() => undefined);
+    window.close();
+  }
+
+  const refreshLink = document.createElement('button');
+  refreshLink.type = 'button';
+  refreshLink.className = 'link';
+  refreshLink.textContent = 'Quick 5-dot refresh';
+  refreshLink.addEventListener('click', () => void pageExtra('touch-up'));
 
   function render(): void {
     const s = store.get();
@@ -158,17 +185,39 @@ async function main(): Promise<void> {
     ui.gazeDot.checked = s.showGazeDot;
 
     ui.calibration.hidden = !webcam;
+    const calibrated = calibration === 'current';
     if (!calibrated && forgetArmed) disarmForget(); // cleared elsewhere: don't come back armed
     forget.textContent = forgetArmed ? 'Click again to forget' : 'Forget calibration';
     if (calibrated) {
       // Kept across polls (not rebuilt), so keyboard focus stays on the button.
       if (forget.parentElement !== ui.calibration) ui.calibration.replaceChildren('Calibrated on this computer. ', forget);
+    } else if (calibration === 'outdated') {
+      ui.calibration.replaceChildren(OUTDATED_CALIBRATION_SHORT);
     } else {
       ui.calibration.replaceChildren("You'll do a one-minute calibration the first time.");
     }
+    renderLight(webcam && page.enabled);
 
-    ui.recalibrate.disabled = busy || !webcam || restricted !== null || tabId === undefined;
+    const unavailable = busy || !webcam || restricted !== null || tabId === undefined;
+    ui.recalibrate.disabled = unavailable;
+    // The check measures a calibration: the page's, or (with Gaze Reader off here) the stored one.
+    ui.check.disabled = unavailable || !(page.enabled ? page.calibrated : calibrated);
     ui.main?.setAttribute('aria-busy', String(busy));
+  }
+
+  /** What the page measured about the light: changed since calibration (offer the refresh), or a tip. */
+  function renderLight(show: boolean): void {
+    const l = show ? extra.lighting : null;
+    if (l?.changedSinceCalibration && extra.canCheck) {
+      ui.light.dataset.tone = 'warn';
+      if (refreshLink.parentElement !== ui.light) ui.light.replaceChildren('The light has changed since you calibrated. ', refreshLink);
+      ui.light.hidden = false;
+      return;
+    }
+    const advice = l ? lightingAdvice(l.flags) : null;
+    ui.light.dataset.tone = 'info';
+    ui.light.textContent = advice ?? '';
+    ui.light.hidden = advice === null;
   }
 
   async function refreshPage(): Promise<void> {
@@ -182,8 +231,19 @@ async function main(): Promise<void> {
     } catch {
       next = PAGE_OFF; // no content script: Gaze Reader is off here
     }
+    let nextExtra: PageExtraState = PAGE_EXTRA_NONE;
+    if (next.enabled) {
+      const query: PageExtraRequest = { type: 'page-extra-query' };
+      try {
+        const state: unknown = await chrome.tabs.sendMessage(tabId, query, { frameId: 0 });
+        nextExtra = isPageExtraState(state) ? state : PAGE_EXTRA_NONE;
+      } catch {
+        /* an older content script: nothing extra to show */
+      }
+    }
     if (epoch !== pageEpoch || busy) return;
     page = next;
+    extra = nextExtra;
     render();
   }
 
@@ -215,8 +275,9 @@ async function main(): Promise<void> {
   ui.enabled.addEventListener('change', () => {
     const on = ui.enabled.checked;
     void setEnabled(on).then((ok) => {
-      // First webcam run: calibration starts on the page, so get out of the way.
-      if (ok && on && store.get().gazeSource === 'webcam' && !calibrated) setTimeout(() => window.close(), 350);
+      // First webcam run (or the first after an upgrade): calibration starts, or is explained, on the
+      // page, so get out of the way.
+      if (ok && on && store.get().gazeSource === 'webcam' && calibration !== 'current') setTimeout(() => window.close(), 350);
     });
   });
   for (const r of radios('source')) {
@@ -242,12 +303,20 @@ async function main(): Promise<void> {
     void (async () => {
       if (tabId === undefined) return;
       if (!page.enabled && !(await setEnabled(true))) return;
-      // A fresh session without a saved model calibrates on its own.
-      if (calibrated || page.calibrated) {
+      // A fresh session without a saved model calibrates on its own (after an upgrade it asks first).
+      if (calibration !== 'none' || page.calibrated) {
         const request: PageRequest = { type: 'page-command', command: 'recalibrate' };
         await chrome.tabs.sendMessage(tabId, request, { frameId: 0 }).catch(() => undefined);
       }
       window.close();
+    })();
+  });
+
+  ui.check.addEventListener('click', () => {
+    void (async () => {
+      if (tabId === undefined) return;
+      if (!page.enabled && !(await setEnabled(true))) return;
+      await pageExtra('check-accuracy');
     })();
   });
 
@@ -262,7 +331,7 @@ async function main(): Promise<void> {
     render();
   });
   watchKey(storage, KEYS.calibration, (value) => {
-    calibrated = value !== undefined && value !== null;
+    calibration = storedCalibrationStatus(value);
     render();
   });
 
@@ -288,7 +357,8 @@ function describePage(page: PageState, restricted: boolean): ['ok' | 'warn' | 'e
     case 'no-face':
       return ['warn', mouse ? 'Point at the page' : "Can't see your eyes"];
     case 'poor':
-      return ['warn', 'Tracking is shaky: try more light'];
+      // The page words what the light measurements blame ("Shaky: bright light behind you").
+      return ['warn', page.detail ?? 'Tracking is shaky: try more light'];
     case 'paused':
       return ['off', page.detail ?? 'Auto-scroll paused'];
     case 'error':
