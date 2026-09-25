@@ -7,6 +7,7 @@ import type {
   Sensitivity,
   TextLine,
 } from '../types';
+import { isTrackedLineEstimate } from './lineTracker';
 
 /**
  * Decides when the reader has reached the end of the visible page. Pure logic:
@@ -34,10 +35,30 @@ import type {
  *    out of it drains 3× as fast, and brief tracking dropouts (blinks) freeze
  *    the count. One noisy sample doesn't restart a dwell; a sustained exit does.
  *  - Rule 1 needs the tracker to have *entered* L: to have put the reader there
- *    right after a return sweep, a jump or a fresh page, or been ≥ 90 % sure of
- *    it for 3 fixations. Vertical noise can slide the tracker onto L while the
+ *    right after a return sweep or on a fresh page, or been ≥ 90 % sure of it
+ *    for 3 fixations. Vertical noise can slide the tracker onto L while the
  *    reader is still finishing L−1; this stops that from turning the page early.
+ *    A jump onto L needs the 3 sure fixations too: a peek at the end of the
+ *    page mid-page looks like one, and so does the gaze bias stepping down
+ *    several lines (a light switched on) — the tracker then follows the "jump"
+ *    and the sweep shortcut and the dwell would turn the page lines early. (At
+ *    an 800 / 1200 ms peek the page turned in 13 / 39 of 48 simulated runs with
+ *    the jump counting as an entry, 5 / 18 without; a reader who really skips
+ *    to the last line and reads it still turns it.) The exception is a jump
+ *    exactly one line down that lands at the start of the column: a return
+ *    sweep across a scene break or a heading margin (> 2.5 pitches, so the
+ *    tracker calls it a jump) enters the line like any other sweep (a short
+ *    last line 2.8 pitches below the one before: turn latency p90 922 →
+ *    256 ms, as in 1.0; peeks at the end of the page turn no more often).
  *    Any scroll forgets the entry: it belongs to the view it happened in.
+ *  - Every zone test compares drift-corrected gaze (y − driftY) with the page.
+ *    The tracker models drift up to ±5 lines (lighting can shift webcam gaze
+ *    that far), so the zones follow a large learned offset rather than reading
+ *    it as "below the page" — but only once the tracker has pinned it (≥ 60 %
+ *    sure of the line, drift SD ≤ 0.5 pitch); an unpinned driftY is clamped to
+ *    ±1.5 pitches. In steady light at high noise or on long gapless paragraphs
+ *    the tracker can sit a few lines behind with a spurious 2–4-line drift, and
+ *    zones that followed it in full missed turns and scrolled unread text away.
  *  - Doubt (≥ 10 % still on L−1) doubles rule 1's dwell and disables the sweep
  *    shortcut; ≥ 25 % at the moment of firing anchors the turn at L−1, so an
  *    early turn repeats a line rather than scrolling unread text away.
@@ -169,7 +190,7 @@ const SHORT_LINE_COL = 0.7;
 const SHORT_SWEEP_MIN_DY_LINES = 0.3;
 /** Bottom-dwell is vetoed when the tracker is this sure the reader is above the last two lines. */
 const ZONE_VETO_CONFIDENCE = 0.8;
-/** Fixations after a return sweep, jump or fresh page whose line counts as "the line entered". */
+/** Fixations after a return sweep or a fresh page whose line counts as "the line entered". */
 const ENTRY_FIXATIONS = 2;
 /** The tracker being this sure of one line for this many fixations in a row also counts as entering it. */
 const SETTLED_CONFIDENCE = 0.9;
@@ -204,6 +225,17 @@ const LOOK_UP_LINES = 1;
  * column. Without this, a peek at the last line mid-page turned the page once the eyes were back.
  */
 const LAST_LINE_REACH_LINES = 1.5;
+/**
+ * The zones use the tracker's driftY in full only while it is pinned: the tracker at least this
+ * sure of its line, with the drift that goes with that line known to within this SD (pitches).
+ * Otherwise it is clamped to ± this many pitches. In steady light at high noise, or on long
+ * gapless paragraphs, the ±5-line tracker sometimes sits a few lines behind with a matching 2–4-line
+ * drift ("line k − 3, +3" explains unstructured text as well as "line k, 0"); 97 % of fixations
+ * with |driftY| ≥ 1.5 lines are unpinned. Estimates without driftSdY (hand-made) are not clamped.
+ */
+const PIN_CONFIDENCE = 0.6;
+const PIN_MAX_DRIFT_SD_LINES = 0.5;
+const UNPINNED_MAX_DRIFT_LINES = 1.5;
 
 type Tri = boolean | null;
 
@@ -261,6 +293,8 @@ export class PageEndDetector {
   /** docTop of the line the tracker put the reader on when they last entered a line. */
   private enteredDocTop: number | null = null;
   private entryLeft = 0;
+  /** The tracker's line at the previous fixation (-1: none yet in this view). */
+  private prevLineIndex = -1;
   private settledDocTop: number | null = null;
   private settledRun = 0;
   private glanceArmed = true;
@@ -344,24 +378,49 @@ export class PageEndDetector {
     const th = this.th;
 
     const est = input.estimate && input.estimate.posterior.length === layout.lines.length ? input.estimate : null;
-    const drift = est && Number.isFinite(est.driftY) ? est.driftY : 0;
+    let drift = est && Number.isFinite(est.driftY) ? est.driftY : 0;
+    if (est && isTrackedLineEstimate(est)) {
+      // A large drift the tracker hasn't pinned (unsure of the line, or of the drift that goes
+      // with it) is as often a spurious (line k − 3, +3) reading of unstructured text as a real
+      // offset: the zones follow only as much of it as the old tracker modelled.
+      const sd = est.driftSdY ?? NaN;
+      const pinned = est.probability >= PIN_CONFIDENCE && sd <= PIN_MAX_DRIFT_SD_LINES * pitch; // NaN: unpinned
+      if (!pinned) drift = Math.min(UNPINNED_MAX_DRIFT_LINES * pitch, Math.max(-UNPINNED_MAX_DRIFT_LINES * pitch, drift));
+    }
     let pEnd = 0;
     if (est) for (let j = L; j < est.posterior.length; j++) pEnd += est.posterior[j]!;
     const x = valid ? g!.x : NaN;
     const yc = valid ? g!.y - drift : NaN;
     const progress = valid ? endProgress(Lline, x, zones.columnWidth) : NaN;
 
-    // Which line did the tracker say the reader entered (right after a return sweep, a jump or a
-    // fresh page — or by being very sure of it for a while)? A tracker that slides onto the last
-    // line mid-line on vertical evidence alone hasn't seen the reader get there; the sweep into it
-    // (or a glance back from its end) will show it.
+    // Which line did the tracker say the reader entered (right after a return sweep or on a fresh
+    // page — or by being very sure of it for a while)? A tracker that slides onto the last line
+    // mid-line on vertical evidence alone hasn't seen the reader get there; the sweep into it (or
+    // a glance back from its end) will show it. Nor has a tracker that followed a jump there (a
+    // peek at the end of the page, the gaze bias stepping down): that takes the sure fixations.
     if (est && est.fixationsOnPage !== this.lastFixCount) {
       if (est.lastSaccade === 'return-sweep' && t <= this.armedUntil && this.lastFixCount >= 0) this.sweepSeen = true;
-      const fresh = est.lastSaccade !== 'forward' && est.lastSaccade !== 'regression';
+      const fresh = est.lastSaccade === 'return-sweep' || est.lastSaccade === null;
       if (fresh) this.entryLeft = ENTRY_FIXATIONS;
       const line = layout.lines[est.lineIndex];
       if (line) {
-        if (this.entryLeft > 0) {
+        // A jump that moves the tracker exactly one line down and lands at the start of the column
+        // is a return sweep across a block gap (an hr scene break spans ≈ 2.8 pitches, an h2 ≈ 2.6,
+        // so the sweep is classified as a jump): it enters the line like any return sweep.
+        const gapSweep =
+          est.lastSaccade === 'jump' &&
+          this.prevLineIndex >= 0 &&
+          est.lineIndex === this.prevLineIndex + 1 &&
+          valid &&
+          x <= zones.columnLeft + SWEEP_LAND_COL * zones.columnWidth;
+        if (gapSweep) {
+          this.enteredDocTop = line.docTop;
+          this.entryLeft = ENTRY_FIXATIONS - 1;
+        } else if (est.lastSaccade === 'jump') {
+          // A jump up (back to re-read) leaves the line entered; a jump down doesn't enter one.
+          this.entryLeft = 0;
+          if (this.enteredDocTop !== null && line.docTop < this.enteredDocTop) this.enteredDocTop = line.docTop;
+        } else if (this.entryLeft > 0) {
           // The furthest line placed during the entry: a wobble on the corrective saccade doesn't undo an arrival.
           this.enteredDocTop = fresh || this.enteredDocTop === null ? line.docTop : Math.max(this.enteredDocTop, line.docTop);
           this.entryLeft--;
@@ -372,6 +431,7 @@ export class PageEndDetector {
         if (this.settledRun >= SETTLED_FIXATIONS) this.enteredDocTop = line.docTop;
       }
       this.lastFixCount = est.fixationsOnPage;
+      this.prevLineIndex = est.lineIndex;
     }
     const entered = this.enteredDocTop !== null && this.enteredDocTop >= Lline.docTop - 0.5 * pitch;
 
@@ -546,6 +606,7 @@ export class PageEndDetector {
     this.lastFixCount = -1;
     this.enteredDocTop = null;
     this.entryLeft = 0;
+    this.prevLineIndex = -1;
     this.settledDocTop = null;
     this.settledRun = 0;
   }

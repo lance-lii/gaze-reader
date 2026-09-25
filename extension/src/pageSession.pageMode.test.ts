@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppEvents, AppSettings, EventBus, EventName, LineLayout, TextLine } from '../../src/types';
 import type { MeasureOptions } from '../../src/reader/lineGeometry';
 import { DEFAULT_SETTINGS } from '../../src/core/settings';
+import { LineTracker } from '../../src/reading/lineTracker';
 import { KEYS, type ExtSettings } from './extStorage';
 import { PORT_TAB } from './messages';
 import { HOST_TAG, PageSession, resetPageModeNotice, type PageSessionDeps } from './pageSession';
@@ -148,6 +149,34 @@ describe('PageSession page mode', () => {
     expect(again.state().pageMode).toBe(true);
     expect(saidAgain.filter((s) => PAGE_MODE_TEXT.test(s.text))).toHaveLength(0);
     again.destroy();
+  });
+
+  it('keeps the line tracker out of page mode, so it learns no gaze offset from lines nobody reads', async () => {
+    const t = setup();
+    const session = await PageSession.start(t.deps);
+    const fixations = record('fixation');
+    const estimates = record('line-estimate');
+    const learn = vi.spyOn(LineTracker.prototype, 'onFixation');
+    const readAlong = async (ms: number) => {
+      for (let elapsed = 0; elapsed < ms; elapsed += 300) {
+        pointAt(250 + ((elapsed / 300) % 6) * 90, 300); // fixations stepping along a line
+        await vi.advanceTimersByTimeAsync(300);
+      }
+    };
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(session.state().pageMode).toBe(true);
+    await readAlong(3_000);
+    expect(fixations.length).toBeGreaterThan(5); // still reported (the debug overlay draws them)…
+    expect(learn).not.toHaveBeenCalled(); // …but the tracker sits it out
+    expect(estimates).toEqual([]);
+
+    text.lines = 12; // back to real text: the tracker reads along again
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(session.state().pageMode).toBe(false);
+    await readAlong(3_000);
+    expect(learn).toHaveBeenCalled();
+    expect(estimates.length).toBeGreaterThan(5);
+    session.destroy();
   });
 
   it('never enters page mode while there is text to read', async () => {

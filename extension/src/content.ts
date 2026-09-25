@@ -9,6 +9,7 @@
  */
 import { chromeLocalStorage } from './extStorage';
 import { PAGE_OFF, PORT_TAB, isPageRequest, type PageRequest, type PageState, type RuntimeRequest } from './messages';
+import { PAGE_EXTRA_NONE, isPageExtraRequest, type PageExtraState } from './pageExtras';
 import { PageSession } from './pageSession';
 import { extensionContextValid } from './ports';
 
@@ -79,9 +80,17 @@ function install(): ContentHandle {
   };
 
   const stateNow = (): PageState => session?.state() ?? PAGE_OFF;
+  const extraNow = (): PageExtraState => session?.extraState() ?? PAGE_EXTRA_NONE;
 
   const onMessage = (msg: unknown, sender: chrome.runtime.MessageSender, sendResponse: (response?: unknown) => void) => {
-    if (sender.id !== chrome.runtime.id || !isPageRequest(msg)) return false;
+    if (sender.id !== chrome.runtime.id) return false;
+    if (isPageExtraRequest(msg)) {
+      // The accuracy check and the quick refresh (popup), and what the page knows about the light.
+      if (msg.type === 'page-extra-command') session?.command(msg.command);
+      sendResponse(extraNow());
+      return false;
+    }
+    if (!isPageRequest(msg)) return false;
     const request: PageRequest = msg;
     switch (request.type) {
       case 'page-ping':

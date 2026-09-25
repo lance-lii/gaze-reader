@@ -119,6 +119,59 @@ const QUIP_TABLE = {
     'Hmm, calibration didn’t work. Let’s try again?',
     'Something went wrong there. One more try?',
   ],
+  // Lighting (said by the app shell through 'buddy-say', see src/app/controller.ts)
+  lightChanged: [
+    'The light changed since we calibrated. A quick 5-dot refresh keeps page turns on time.',
+    'New lighting! Five quick dots and I’ll follow your eyes properly again.',
+  ],
+  driftOffer: [
+    'I’ve been making up for an offset for a while. Five quick dots would help me.',
+    'My guesses and your eyes drifted apart a little. Fancy a quick 5-dot refresh?',
+  ],
+  lightBacklit: [
+    'A bright light behind you puts your face in shadow. Light from the front helps me.',
+  ],
+  lightGlare: [
+    'I see reflections on your glasses or eyes. Tilting the lamp or screen a bit helps.',
+  ],
+  lightDark: [
+    'It’s a little dim for me to see your eyes. A lamp in front of you would help.',
+  ],
+  trackerUpgraded: [
+    'I’ve learned to handle changing light better — please recalibrate once.',
+  ],
+  // The accuracy check (A). Its dots are 'validating' events of a run that starts with message 'check'.
+  accuracyCheckStart: [
+    'Quick accuracy check: just look at each dot. Nothing changes unless you say so.',
+  ],
+  accuracyCheckCancelled: [
+    'No problem, nothing changed.',
+  ],
+  accuracyGood: [
+    'Spot on! I’m following your eyes to within half a line.',
+    'Right on target. Happy reading!',
+  ],
+  accuracyClose: [
+    'Close enough! I can make up that small difference myself.',
+  ],
+  accuracySlightlyOff: [
+    'I’m a little off. A quick 5-dot refresh would put me back on your line.',
+  ],
+  accuracyOff: [
+    'I’m a few lines off. A quick 5-dot refresh will fix that.',
+  ],
+  accuracySideways: [
+    'My guesses lean to one side. A quick 5-dot refresh will fix that.',
+  ],
+  accuracyStretched: [
+    'I’m off near the top and bottom of the screen. A fresh calibration would help me.',
+  ],
+  accuracyFixed: [
+    'All fixed! I’m back on your line.',
+  ],
+  accuracyFailed: [
+    'I couldn’t get a steady look at the dots. Shall we try again?',
+  ],
   break: [
     'Eye break! Look at something about 20 feet (6 m) away for 20 seconds.',
     '20-20-20 time: gaze at something ~6 m (20 ft) away for 20 seconds.',

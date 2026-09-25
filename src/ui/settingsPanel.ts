@@ -12,9 +12,44 @@ export interface SettingsPanelOptions {
   hasSavedCalibration: () => boolean;
   onForgetCalibration: () => void;
   onRecalibrate: () => void;
+  /** "Check accuracy": a few dots measured against the calibration in use (omit to hide the button). */
+  onCheckAccuracy?: () => void;
   onShowHelp: () => void;
   onReplayIntro: () => void;
   onClose?: () => void;
+  /** The tracking-diagnostics recorder (Advanced). Omitted where downloads don't exist (the Artifact build). */
+  diagnostics?: DiagnosticsControls;
+}
+
+export interface DiagnosticsStatus {
+  recording: boolean;
+  elapsedMs: number;
+  limitMs: number;
+  /** A recording (finished or running) can be downloaded. */
+  hasData: boolean;
+}
+
+export interface DiagnosticsControls {
+  status(): DiagnosticsStatus;
+  start(): void;
+  /** Stops and downloads. */
+  stop(): void;
+  download(): void;
+}
+
+/**
+ * What the diagnostics recorder keeps, in plain words. The same list is in README ("Tracking
+ * diagnostics") and PRIVACY.md ("Tracking diagnostics"); src/app/diagnostics.ts is the truth.
+ */
+export const DIAGNOSTICS_PRIVACY_TEXT =
+  'Records numbers only, for up to 10 minutes: eye measurements, gaze estimates, lighting readings, ' +
+  'line positions and page turns, plus your settings, your browser, and your camera’s settings and name (usually its model). ' +
+  'No video, no images, no book text. It stays on this device until you download it, and nothing is uploaded.';
+
+/** "3:07" */
+export function formatClock(ms: number): string {
+  const s = Math.max(0, Math.floor((Number.isFinite(ms) ? ms : 0) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
 type Updater = (s: AppSettings) => void;
@@ -52,6 +87,10 @@ export class SettingsPanel implements Mountable {
   private readonly offSettings: () => void;
   private readonly confirmTimers = new Map<HTMLButtonElement, ReturnType<typeof setTimeout>>();
   private readonly statusTimers = new Map<HTMLElement, ReturnType<typeof setTimeout>>();
+  /** Null in the Artifact build (no calibration) or when the host offers no check. */
+  private readonly checkBtn: HTMLButtonElement | null;
+  private diag: { record: HTMLButtonElement; download: HTMLButtonElement; status: HTMLElement } | null = null;
+  private diagTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: SettingsPanelOptions) {
     this.opts = opts;
@@ -82,6 +121,7 @@ export class SettingsPanel implements Mountable {
         section.appendChild(this.renderControl(control, uid));
       }
       if (group.id === 'tracking') section.appendChild(IS_ARTIFACT ? artifactTrackingNote() : this.renderCalibrationActions());
+      if (group.id === 'advanced' && opts.diagnostics && !IS_ARTIFACT) section.appendChild(this.renderDiagnostics(opts.diagnostics, uid));
       body.appendChild(section);
     }
 
@@ -103,6 +143,7 @@ export class SettingsPanel implements Mountable {
     surface.appendChild(body);
 
     this.forgetBtn = surface.querySelector<HTMLButtonElement>('.gr-settings__forget');
+    this.checkBtn = surface.querySelector<HTMLButtonElement>('.gr-settings__check');
     this.offSettings = opts.bus.on('settings-changed', ({ settings }) => this.update(settings));
     this.update(opts.getSettings());
   }
@@ -118,10 +159,12 @@ export class SettingsPanel implements Mountable {
   open(): void {
     this.update(this.opts.getSettings());
     this.layer.open();
+    this.syncDiagTimer();
   }
 
   close(): void {
     this.layer.close();
+    this.syncDiagTimer();
   }
 
   toggle(): void {
@@ -132,10 +175,30 @@ export class SettingsPanel implements Mountable {
   /** Re-sync every control from settings (does not emit events). */
   update(s: AppSettings): void {
     for (const u of this.updaters) u(s);
-    if (this.forgetBtn) this.forgetBtn.disabled = !this.opts.hasSavedCalibration();
+    const saved = this.opts.hasSavedCalibration();
+    if (this.forgetBtn) this.forgetBtn.disabled = !saved;
+    if (this.checkBtn) this.checkBtn.disabled = !saved;
+    this.refreshDiagnostics();
+  }
+
+  /** Re-reads the diagnostics recorder's state (the host calls this when it starts or stops). */
+  refreshDiagnostics(): void {
+    if (IS_ARTIFACT) return;
+    const d = this.diag;
+    const controls = this.opts.diagnostics;
+    if (!d || !controls) return;
+    const st = controls.status();
+    const label = d.record.querySelector('span');
+    if (label) label.textContent = st.recording ? `Stop and download (${formatClock(st.elapsedMs)} of ${formatClock(st.limitMs)})` : 'Record tracking diagnostics (no video)';
+    d.record.dataset.recording = String(st.recording);
+    d.record.setAttribute('aria-pressed', String(st.recording));
+    d.download.hidden = st.recording || !st.hasData;
+    this.syncDiagTimer();
   }
 
   destroy(): void {
+    if (this.diagTimer !== null) clearInterval(this.diagTimer);
+    this.diagTimer = null;
     this.offSettings();
     for (const t of this.confirmTimers.values()) clearTimeout(t);
     this.confirmTimers.clear();
@@ -321,8 +384,63 @@ export class SettingsPanel implements Mountable {
       this.flash(status, 'Calibration forgotten. You’ll calibrate again next time you use your eyes.');
     }, 'trash');
     this.confirmable(forget, 'Click again to forget');
-    wrap.append(recal, forget, status);
+    const onCheck = this.opts.onCheckAccuracy;
+    if (onCheck) {
+      const check = this.button('Check accuracy', 'gr-btn--ghost gr-settings__check', () => {
+        this.close();
+        onCheck();
+      }, 'sun');
+      check.title = 'A few dots show how far off the tracking is now, e.g. after the light changed (A)';
+      wrap.append(recal, check, forget, status);
+    } else {
+      wrap.append(recal, forget, status);
+    }
     return wrap;
+  }
+
+  private renderDiagnostics(controls: DiagnosticsControls, uid: string): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'gr-set-row gr-set-diag';
+    const title = document.createElement('p');
+    title.className = 'gr-set-row__label';
+    title.id = `${uid}-diag`;
+    title.textContent = 'Tracking diagnostics';
+    title.style.margin = '0';
+    const hint = document.createElement('small');
+    hint.className = 'gr-set-row__hint';
+    hint.id = `${uid}-diag-hint`;
+    hint.textContent = DIAGNOSTICS_PRIVACY_TEXT;
+    const actions = document.createElement('div');
+    actions.className = 'gr-set-actions';
+    actions.style.gridColumn = '1 / -1';
+    const status = this.statusElement();
+    const record = this.button('Record tracking diagnostics (no video)', 'gr-btn--soft gr-settings__record', () => {
+      if (controls.status().recording) {
+        controls.stop();
+        this.flash(status, 'Recording stopped and saved as a JSON file.');
+      } else {
+        controls.start();
+        this.flash(status, 'Recording. Read as usual; stop here within 10 minutes (it stops by itself then).');
+      }
+      this.refreshDiagnostics();
+    }, 'record');
+    record.setAttribute('aria-describedby', hint.id);
+    const download = this.button('Download the last recording', 'gr-btn--ghost gr-settings__diag-download', () => controls.download(), 'download');
+    download.hidden = true;
+    actions.append(record, download, status);
+    wrap.append(title, hint, actions);
+    this.diag = { record, download, status };
+    return wrap;
+  }
+
+  /** Ticks the recording clock on the button while the drawer is open and recording. */
+  private syncDiagTimer(): void {
+    const want = this.isOpen && this.opts.diagnostics?.status().recording === true;
+    if (want && this.diagTimer === null) this.diagTimer = setInterval(() => this.refreshDiagnostics(), 1000);
+    else if (!want && this.diagTimer !== null) {
+      clearInterval(this.diagTimer);
+      this.diagTimer = null;
+    }
   }
 
   private statusElement(): HTMLElement {

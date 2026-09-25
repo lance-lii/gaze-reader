@@ -53,6 +53,11 @@ export interface EyeFeatures {
   faceScale: number;
   /** Face center in normalized image coordinates (0..1), NOT mirrored. */
   faceCenter: Point;
+  /**
+   * 0..1 mean of MediaPipe's eyeSquint blendshapes (0 when blendshapes are missing).
+   * Used to notice light-driven squinting; never a gaze-model input.
+   */
+  squint?: number;
 }
 
 export interface FeatureFrame {
@@ -62,6 +67,90 @@ export interface FeatureFrame {
   features: EyeFeatures | null;
   /** 0..1 heuristic tracking quality (face present, big enough, roughly frontal, eyes open). */
   quality: number;
+  /** Aggregate lighting measurements (never pixels), attached to roughly 5–7 frames per second. */
+  lighting?: LightingStats;
+}
+
+// ───────────────────────────────── Lighting ──────────────────────────────────
+
+/**
+ * Lighting measured from the camera frame in regions defined by the face
+ * landmarks (src/gaze/lighting.ts). Luma values are 0..1; "Lin" values are
+ * linear-light means; ratios are log2 stops. Only these numbers ever leave the
+ * measurement code.
+ */
+export interface LightingStats {
+  /** Face-oval mean luma (gamma-encoded). Depends on skin tone: live coaching only, never stored. */
+  faceLuma: number;
+  faceLin: number;
+  /** log2(p90 / p10) of face luma: how contrasty the lighting on the face is. */
+  faceRange: number;
+  /** Fraction of clipped face pixels. */
+  faceClip: number;
+  frameLin: number;
+  /** Background (frame minus the head-and-torso column) linear mean and clipped fraction. */
+  bgLin: number;
+  bgClip: number;
+  /** Sclera brightness (p85 of non-saturated lid-aperture pixels), linear. Skin-tone independent. */
+  scleraR: number;
+  scleraL: number;
+  /** log2(mean sclera / bgLin): strongly negative when a light or window is behind the reader. */
+  backlight: number;
+  /** log2(cheek L / cheek R): side lighting. */
+  side: number;
+  /** log2(eye-box non-saturated mean / cheek mean): shadowed or bright eye sockets. */
+  shade: number;
+  /** Near-saturated fraction in each eye box (glasses reflections). */
+  glareR: number;
+  glareL: number;
+  /** Near-saturated fraction inside each iris disk (reflections on the eye itself). */
+  irisGlintR: number;
+  irisGlintL: number;
+  /** Pixels measured in the face oval (resolution of the measurement). */
+  facePx: number;
+}
+
+export type LightingFlag = 'dark' | 'overexposed' | 'glare' | 'backlit' | 'side-lit' | 'unstable';
+
+export type LightingComponent = 'sclera' | 'backlight' | 'side' | 'shade' | 'glare' | 'range';
+
+/** Compact, skin-tone-independent description of the lighting, stored with a calibration. */
+export interface LightingSignature {
+  v: 1;
+  /** Samples it was built from. */
+  n: number;
+  /** Median head yaw/pitch (radians) while it was captured. */
+  yaw: number;
+  pitch: number;
+  /** Median of each component. */
+  c: Record<LightingComponent, number>;
+  /** Robust spread (1.4826 × MAD) of each component. */
+  sd: Record<LightingComponent, number>;
+}
+
+/**
+ * How the reader's eyelids looked during calibration, so squinting (bright
+ * light, glare) or wide eyes (dim light) can be recognised later. Lid aperture
+ * also follows vertical gaze, so it is modelled against the gaze position.
+ */
+export interface AppearanceBaseline {
+  v: 1;
+  n: number;
+  /** openness ≈ opennessAt0 + opennessSlope × (y / viewport height), fitted on calibration samples. */
+  opennessAt0: number;
+  opennessSlope: number;
+  /** Robust SD of the residual openness around that line. */
+  opennessResidualSd: number;
+  /** Median and robust SD of EyeFeatures.squint. */
+  squintMedian: number;
+  squintSd: number;
+}
+
+/** Conditions at calibration time, stored with the gaze model. */
+export interface CalibrationEnvironment {
+  lighting: LightingSignature | null;
+  appearance: AppearanceBaseline | null;
+  capturedAt: number;
 }
 
 export type TrackerErrorCode =
@@ -134,6 +223,8 @@ export interface GazeModel {
   /** Viewport size (CSS px) at calibration time. */
   readonly viewport: { width: number; height: number };
   readonly trainedAt: number;
+  /** Lighting and eyelid appearance at calibration; null or absent when unknown. */
+  readonly environment?: CalibrationEnvironment | null;
   toJSON(): SerializedGazeModel;
 }
 
@@ -322,7 +413,8 @@ export type CommandName =
   | 'toggle-debug'
   | 'toggle-gaze-dot'
   | 'open-library'
-  | 'show-help';
+  | 'show-help'
+  | 'check-accuracy';
 
 export type BuddyMood =
   | 'idle'
@@ -384,6 +476,38 @@ export interface AppEvents {
   'buddy-say': { text: string; priority?: SpeechPriority; durationMs?: number; mood?: BuddyMood };
   'buddy-poke': Record<string, never>;
   error: { code: string; message: string };
+  /** Live lighting assessment (about once a second while the camera runs). */
+  'lighting-state': {
+    flags: LightingFlag[];
+    /** Signature distance to the calibration's lighting (≥ 1 means changed), or null when unknown. */
+    distance: number | null;
+    changedSinceCalibration: boolean;
+    /** The component that moved most, when changed. */
+    dominant: LightingComponent | null;
+  };
+  /**
+   * The eyes' appearance changed in a way that biases gaze (light switched on or
+   * off, squinting, glare). The reading layer re-learns its vertical offset for
+   * fixations starting at or after `t`.
+   */
+  'appearance-changed': { t: number; reason: 'lighting' | 'lids' | 'refresh' | 'manual'; detail: string };
+  /** Result of an accuracy check: a few dots measured without changing the model. */
+  'accuracy-check': {
+    meanErrorPx: number;
+    /** Mean signed error (prediction − target), px; positive y = gaze reads lower than reality. */
+    offsetXPx: number;
+    offsetYPx: number;
+    offsetYLines: number;
+    /** offsetXPx as a fraction of the viewport width (> 0 = right), when known. */
+    offsetXFrac?: number;
+    /**
+     * Largest vertical error of a single dot (|mean prediction − target|), lines, when known.
+     * The mean offset hides a scale error (top reads high, bottom reads low); this doesn't.
+     */
+    maxDotYLines?: number;
+    /** Whether the measured offset was applied as a quick correction. */
+    applied: boolean;
+  };
 }
 
 export type EventName = keyof AppEvents;

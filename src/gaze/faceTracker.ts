@@ -1,7 +1,7 @@
 import type { FaceLandmarkerOptions, FilesetResolver } from '@mediapipe/tasks-vision';
 import { FACE_LANDMARKER_MODEL_URL, MEDIAPIPE_WASM_DIR } from '../core/constants';
 import { IS_ARTIFACT } from '../core/target';
-import type { FeatureFrame, FeatureSource, Unsubscribe } from '../types';
+import type { EyeFeatures, FeatureFrame, FeatureSource, LightingStats, Unsubscribe } from '../types';
 import {
   cameraSupportError,
   openCamera,
@@ -12,6 +12,7 @@ import {
   type OpenCameraOptions,
 } from './camera';
 import { extractEyeFeatures, frameQuality, type BlendshapeLike, type LandmarkLike } from './features';
+import { LightingProbe, type LightingBackend, type LightingProbeLike, type LightingSource } from './lighting';
 import { blockMediapipeTelemetry } from './mediapipeTelemetry';
 
 export { TrackerError } from './camera';
@@ -413,6 +414,11 @@ export interface FaceTrackerDeps {
   openCamera(opts: OpenCameraOptions): Promise<CameraHandle>;
   loadLandmarker(cfg: LandmarkerConfig): Promise<LandmarkerHandle>;
   now(): number;
+  /**
+   * Builds the lighting probe (once, at the first session); null turns
+   * lighting measurement off. Default: a LightingProbe.
+   */
+  createLightingProbe(): LightingProbeLike | null;
 }
 
 interface Session {
@@ -452,6 +458,8 @@ export class CameraFeatureSource implements FeatureSource {
   private landmarks: readonly LandmarkLike[] | null = null;
   private error: TrackerError | null = null;
   private frameErrorLogged = false;
+  /** undefined until the first session; null when off or after it failed. */
+  private lightingProbe: LightingProbeLike | null | undefined = undefined;
 
   constructor(opts: CameraFeatureSourceOptions = {}, deps: Partial<FaceTrackerDeps> = {}) {
     this.opts = { ...opts };
@@ -459,6 +467,7 @@ export class CameraFeatureSource implements FeatureSource {
       openCamera: deps.openCamera ?? openCamera,
       loadLandmarker: deps.loadLandmarker ?? loadFaceLandmarker,
       now: deps.now ?? (() => performance.now()),
+      createLightingProbe: deps.createLightingProbe ?? (() => new LightingProbe()),
     };
   }
 
@@ -492,6 +501,11 @@ export class CameraFeatureSource implements FeatureSource {
   /** The delegate in use while running. */
   get delegate(): Delegate | null {
     return this.session?.landmarker.delegate ?? null;
+  }
+
+  /** How lighting is measured ('off' when unsupported or after a failure); null before the first session. */
+  get lightingBackend(): LightingBackend | null {
+    return this.lightingProbe === undefined ? null : (this.lightingProbe?.backend ?? 'off');
   }
 
   onFrame(cb: (frame: FeatureFrame) => void): Unsubscribe {
@@ -543,6 +557,11 @@ export class CameraFeatureSource implements FeatureSource {
         }
       }
       s.camera.stop();
+    }
+    try {
+      this.lightingProbe?.reset(); // closes a frame clone still being copied
+    } catch {
+      this.lightingProbe = null;
     }
     this.frameIntervalEma = 0;
     this.lastFrameAt = null;
@@ -631,6 +650,13 @@ export class CameraFeatureSource implements FeatureSource {
   private beginSession(camera: CameraHandle, landmarker: LandmarkerHandle): void {
     const s: Session = { camera, landmarker, lastVideoTime: -1, lastDriverTickAt: this.deps.now(), cancels: [] };
     this.session = s;
+    if (this.lightingProbe === undefined) {
+      try {
+        this.lightingProbe = this.deps.createLightingProbe();
+      } catch {
+        this.lightingProbe = null;
+      }
+    }
 
     const onEnded = (): void => this.handleTrackEnded(s);
     camera.track.addEventListener('ended', onEnded);
@@ -719,7 +745,39 @@ export class CameraFeatureSource implements FeatureSource {
       result.facialTransformationMatrixes?.[0]?.data ?? null,
       { aspectRatio },
     );
-    this.emit({ t, faceFound: true, features, quality: frameQuality(features) });
+    const quality = frameQuality(features);
+    // `frame` is still open here: the track-processor driver closes it after this returns.
+    const lighting = features ? this.measureLighting(frame ?? s.camera.video, landmarks, features, quality, t) : undefined;
+    this.emit(lighting ? { t, faceFound: true, features, quality, lighting } : { t, faceFound: true, features, quality });
+  }
+
+  /**
+   * A few times a second, lighting statistics from the frame MediaPipe just
+   * saw (see lighting.ts). Cheap on the frames it skips. A probe that throws is
+   * dropped for good: tracking never depends on it.
+   */
+  private measureLighting(
+    source: LightingSource,
+    landmarks: readonly LandmarkLike[],
+    features: EyeFeatures,
+    quality: number,
+    t: number,
+  ): LightingStats | undefined {
+    const probe = this.lightingProbe;
+    if (!probe) return undefined;
+    try {
+      probe.maybeMeasure(source, landmarks, features, quality, t);
+      return probe.take();
+    } catch (err) {
+      this.lightingProbe = null;
+      try {
+        probe.dispose();
+      } catch {
+        /* already broken */
+      }
+      console.warn('[gaze] Lighting measurement failed; continuing without it.', err);
+      return undefined;
+    }
   }
 
   private updateFps(t: number): void {

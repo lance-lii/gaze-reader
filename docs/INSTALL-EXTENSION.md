@@ -73,16 +73,25 @@ when your mouse pointer rests at the end of the last line.
 
 Back on your page, calibration starts on its own. It takes about a minute.
 
-1. Sit the way you normally read, about an arm's length from the screen, with your face evenly
-   lit (not with a bright window behind you).
-2. Fit your face in the oval until the checklist turns green.
+1. Sit the way you normally read, about an arm's length from the screen, in the light you
+   normally read in, with your face evenly lit (not with a bright window behind you).
+2. Fit your face in the oval until the checklist turns green. The light check tells you if
+   there's light behind you, reflections on your glasses, or not enough light on your eyes.
 3. Follow each dot with your **eyes**, keeping your head still. There are 13 dots, then 4 check
    points. Press **Space** to pause or **Esc** to cancel.
 4. At the end you'll see your accuracy. Choose **Use it**, or **Redo** if it looks poor.
 
 The calibration is saved in the extension and shared by every site. It adjusts automatically for
-each site's zoom level. Recalibrate (popup → **Recalibrate**, or **Alt+Shift+C**) after a big
-change in posture, lighting or seating.
+each site's zoom level. It also remembers what the light and your eyes looked like, so Gaze
+Reader can tell when the light changes later (see
+[Pages turn early or late when the light changes](#pages-turn-early-or-late-when-the-light-changes)).
+Recalibrate (popup → **Recalibrate**, or **Alt+Shift+C**) after a big change in posture or
+seating.
+
+To see how accurate the calibration still is, click **Check accuracy** in the popup or press
+**Alt+Shift+A**: five dots, about 10 seconds. The result says how far off the tracking is (for
+example "about 2 lines low"). **Correct it** fixes the offset from those same dots; **Done**
+leaves the calibration as it is.
 
 ## 5. Reading
 
@@ -112,6 +121,7 @@ On a page where Gaze Reader is on (ignored while you type in a text field):
 | Alt+Shift+↑ (or Alt+Shift+Page Up) | Previous page |
 | Alt+Shift+U | Undo the last page turn |
 | Alt+Shift+C | Recalibrate |
+| Alt+Shift+A | Check accuracy (5 dots; can correct an offset) |
 | Alt+Shift+O | Show or hide the gaze dot |
 | Alt+Shift+D | Debug overlay (measured lines, what the page-end detector is waiting for) |
 | Alt+Shift+H | List these shortcuts |
@@ -131,7 +141,11 @@ After you pull new code or change it:
    the old version. It notices the update and says "Gaze Reader was updated or reloaded. Refresh
    the page to use it here again."
 
-Your settings and calibration are kept across reloads and updates.
+Your settings and calibration are kept across reloads and updates. The one exception is an update
+that changes how the eyes are tracked, such as the lighting update (it stopped reading vertical gaze
+from the eyelids, which the light moves). A calibration made before it doesn't fit the new tracking.
+The page and the popup then say "Gaze Reader was upgraded: recalibrate once", and you calibrate one
+more time.
 
 ## Turning it off or uninstalling
 
@@ -169,14 +183,60 @@ Your settings and calibration are kept across reloads and updates.
   to file URLs**.
 - **After you follow a link to a new page,** Gaze Reader is off again. Turn it on for each page
   you read. (Pages that change their content without a full reload keep it on.)
-- **Check the popup's status line.** "Not calibrated yet" means you need to calibrate. "Auto-scroll
-  paused" means press **Alt+Shift+P**. "Can't see your eyes" means check the light and your
-  position.
+- **Check the popup's status line.** "Not calibrated yet" means you need to calibrate.
+  "Recalibrate once (upgraded)" means the calibration is from an older version of Gaze Reader.
+  "Auto-scroll paused" means press **Alt+Shift+P**. "Can't see your eyes" means check the light
+  and your position. "Shaky: …" names what's wrong with the light (see below).
 - **The page turns at the wrong time, or never.** Press **Alt+Shift+D** to see the lines Gaze Reader
   measured. If it chose the wrong part of the page (a sidebar instead of the article, say), the
   site's layout fooled its main-text detection. Text inside frames (`<iframe>`) isn't measured.
   If pages turn too early, choose **Relaxed**. If they turn too late, choose **Eager**.
   **Alt+Shift+U** undoes a turn.
+
+### Pages turn early or late when the light changes
+
+Light changes how open your eyes are. Bright light, a lamp in view or glare on your glasses makes you
+squint a little, and a webcam tracker reads narrower eyes as looking lower on the page, so pages
+turn before you finish them. Dim light opens your eyes wider, which reads as looking higher, so pages
+turn late or not at all. Gaze Reader copes with a lot of this by itself:
+
+- It follows the iris between the eye corners rather than the eyelids, so a squint moves its
+  estimate much less than before.
+- It learns how far off your gaze reads while you read (up to about 5 lines) and corrects for it.
+- It watches the light and your eyelids. When they change (a lamp goes on, the sun comes out), it
+  learns that offset again instead of trusting the old one.
+- If the light is clearly different from when you calibrated, or the offset it had to learn is
+  large (1.5 lines or more for a while), the status pill offers a **quick 5-dot refresh** (about
+  10 seconds). It asks at most once every 10 minutes across all your tabs. **Not now** keeps it
+  quiet for 30 minutes. The popup shows the same offer while the light is different.
+
+If pages still turn at the wrong time:
+
+1. **Check accuracy** (popup, or **Alt+Shift+A**). If it says the tracking reads a line or more
+   high or low, choose **Correct it**.
+2. **Calibrate in the light you read in.** A calibration made in daylight is off at night under a
+   desk lamp. After a big change of lighting, recalibrate (**Alt+Shift+C**).
+3. **Light your face evenly from the front.** A window or lamp behind you puts your face in shadow,
+   and a single lamp at one side lights one eye more than the other.
+4. **Get rid of reflections.** Tilt the screen or move the lamp until you no longer see bright spots
+   on your glasses.
+5. **Keep the light steady.** Flickering or changing light (a TV, moving clouds, a lamp on a dimmer)
+   makes the camera keep adjusting.
+
+When tracking is shaky, the status line says what the light measurements blame:
+
+| Status | What to do |
+|---|---|
+| Shaky: too dark | Add light in front of you. It's measured on the whites of your eyes, so it doesn't depend on your skin tone. |
+| Shaky: bright light behind you | Face the light, or close the blind behind you. |
+| Shaky: too much light | Less light directly on your face, or turn the screen brightness down. |
+| Shaky: reflections on glasses | Tilt the screen or move the lamp a little. |
+| Shaky: light from one side | Add light on the darker side, or turn toward the light. |
+| Shaky: light keeps changing | Steady the light, and give the camera a moment to settle. |
+
+To measure the light, Gaze Reader reduces each camera picture it checks (about six a second) to 17
+numbers, such as how bright the whites of your eyes are compared with the background. The
+numbers never leave your computer, and no picture is kept (see [PRIVACY.md](../PRIVACY.md)).
 
 ### Canvas and image readers (page mode)
 

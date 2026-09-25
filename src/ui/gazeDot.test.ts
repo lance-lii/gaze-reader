@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { GazeSample } from '../types';
+import type { GazeSample, LineEstimate } from '../types';
 import { createEventBus } from '../core/events';
 import { createSettingsStore } from '../core/settings';
 import { IGNORE_ATTR } from '../core/constants';
-import { GazeDot } from './gazeDot';
+import { DriftCorrection, GazeDot } from './gazeDot';
 
 /** Manual animation frames: the test decides when a frame happens. */
 function manualFrames() {
@@ -181,4 +181,82 @@ describe('GazeDot', () => {
     dot.mount(host); // a destroyed component stays gone
     expect(host.childNodes).toHaveLength(0);
   });
+  it('shows the gaze where the reading layer believes it is: minus the line tracker’s drift', () => {
+    const { bus, dot, host } = setup();
+    dot.mount(host);
+    const el = host.querySelector<HTMLElement>('.gr-gaze-dot')!;
+    const estimate = (t: number, driftY: number): LineEstimate => ({
+      t, lineIndex: 3, probability: 0.9, posterior: [], progressX: 0.5, lastSaccade: 'forward', driftY, fixationsOnPage: 4,
+    });
+    bus.emit('line-estimate', estimate(1, 84)); // gaze reads two lines low
+    bus.emit('gaze', gaze(100, 300));
+    frames.flush();
+    expect(el.style.transform).toBe('translate3d(91.0px, 207.0px, 0)');
+    // A new calibration starts the drift over.
+    bus.emit('calibration', { phase: 'start' });
+    bus.emit('gaze', gaze(100, 300));
+    frames.flush();
+    expect(el.style.transform).toBe('translate3d(91.0px, 291.0px, 0)');
+    dot.destroy();
+  });
+
+  it('can show the raw gaze instead (correctDrift: false)', () => {
+    const bus = createEventBus();
+    const store = createSettingsStore(bus, { persist: false, initial: { showGazeDot: true } });
+    const dot = new GazeDot({ bus, getSettings: store.get, correctDrift: false });
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    dot.mount(host);
+    bus.emit('line-estimate', { t: 1, lineIndex: 0, probability: 1, posterior: [1], progressX: 0, lastSaccade: null, driftY: 84, fixationsOnPage: 1 });
+    bus.emit('gaze', gaze(100, 300));
+    frames.flush();
+    expect(host.querySelector<HTMLElement>('.gr-gaze-dot')!.style.transform).toBe('translate3d(91.0px, 291.0px, 0)');
+    dot.destroy();
+  });
 });
+
+describe('DriftCorrection', () => {
+  const PITCH = 42;
+  const est = (t: number, driftY: number, probability = 0.9, lineIndex = 3) => ({ t, driftY, probability, lineIndex });
+
+  it('subtracts the latest drift from y and rawY, and forgets a stale one', () => {
+    const d = new DriftCorrection(30_000);
+    const s: GazeSample = { t: 1000, x: 5, y: 300, rawX: 5, rawY: 310, valid: true, confidence: 1, source: 'webcam' };
+    expect(d.correct(s)).toBe(s); // nothing learned yet
+    d.noteEstimate(est(900, -42));
+    expect(d.correct(s)).toMatchObject({ y: 342, rawY: 352, x: 5 });
+    expect(d.offsetAt(30_900)).toBe(-42);
+    expect(d.offsetAt(30_901)).toBe(0); // stale
+    d.noteEstimate(est(950, Number.NaN)); // ignored
+    expect(d.offsetAt(1000)).toBe(-42);
+    d.reset();
+    expect(d.offsetAt(1000)).toBe(0);
+  });
+
+  it('holds the last pinned drift while the tracker is unsure (its drift is then usually a wrong line’s)', () => {
+    const d = new DriftCorrection(30_000);
+    d.noteEstimate(est(1000, 0, 0.9)); // pinned: on the right line, no offset
+    d.noteEstimate(est(1100, 2 * PITCH, 0.4)); // unsure, two lines off
+    d.noteEstimate(est(1200, 2 * PITCH, 0.9, -1)); // no line at all
+    expect(d.offsetAt(1200)).toBe(0);
+    // The unsure estimates still count as reading: the held drift isn't dropped as stale.
+    expect(d.offsetAt(1200 + 30_000)).toBe(0);
+    d.noteEstimate(est(1300, PITCH, 0.7)); // pinned again: followed
+    expect(d.offsetAt(1300)).toBe(PITCH);
+    d.noteEstimate(est(40_000, -PITCH, 0.3)); // unsure, much later: the held drift is refreshed, not replaced
+    expect(d.offsetAt(40_000)).toBe(PITCH);
+  });
+
+  it('follows unpinned drifts until the first pinned one, and reset() starts that over', () => {
+    const d = new DriftCorrection(30_000);
+    d.noteEstimate(est(1000, 3 * PITCH, 0.4)); // a constant lighting offset, not yet pinned: followed
+    expect(d.offsetAt(1000)).toBe(3 * PITCH);
+    d.noteEstimate(est(1100, 3 * PITCH, 0.8));
+    d.noteEstimate(est(1200, 0, 0.3));
+    expect(d.offsetAt(1200)).toBe(3 * PITCH);
+    d.reset();
+    d.noteEstimate(est(1300, -PITCH, 0.3)); // after a reset, unpinned drifts are followed again
+    expect(d.offsetAt(1300)).toBe(-PITCH);
+  });
+});
+

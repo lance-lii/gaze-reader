@@ -32,6 +32,9 @@ const ICON_PATHS = {
   shield: '<path d="M12 3l7.5 3v5.5c0 4.6-3.2 8.2-7.5 9.5-4.3-1.3-7.5-4.9-7.5-9.5V6z"/><path d="M8.8 12.2l2.3 2.3 4.2-4.6"/>',
   chevronLeft: '<path d="M15 6l-6 6 6 6"/>',
   chevronRight: '<path d="M9 6l6 6-6 6"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/>',
+  record: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3.5" fill="currentColor"/>',
+  download: '<path d="M12 4v11M7.5 10.5L12 15l4.5-4.5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
 } as const;
 
 export type IconName = keyof typeof ICON_PATHS;
@@ -92,6 +95,7 @@ export class Topbar implements Mountable {
     pill: HTMLElement;
     pillLabel: HTMLElement;
     demoChip: HTMLElement;
+    recChip: HTMLElement;
     progress: HTMLElement;
     progressFill: HTMLElement;
     pause: HTMLButtonElement;
@@ -109,6 +113,9 @@ export class Topbar implements Mountable {
   private readonly hoverQuery: MediaQueryList | null;
   private author = '';
   private progressText = '';
+  private recording = false;
+  /** Whether the status alone keeps the bar's status area on screen (see pillAlwaysVisible). */
+  private persistBase = false;
   private offSettings: (() => void) | null = null;
 
   constructor(opts: TopbarOptions) {
@@ -137,6 +144,7 @@ export class Topbar implements Mountable {
             <span class="gr-pill__label">Camera off</span>
           </span>
           <span class="gr-demo-chip" hidden>${icon('sparkle')}<span class="gr-demo-chip__long">Demo: a simulated reader is reading</span><span class="gr-demo-chip__short" aria-hidden="true">Demo reader</span></span>
+          <span class="gr-demo-chip gr-rec-chip" role="status" title="Recording tracking diagnostics: numbers only, no video. Stop it in Settings › Advanced." hidden>${icon('record')}<span class="gr-demo-chip__long">Recording diagnostics</span><span class="gr-demo-chip__short" aria-hidden="true">Rec</span></span>
         </div>
         <div class="gr-topbar__end gr-topbar__fade">
           <fieldset class="gr-seg gr-topbar__source">
@@ -169,7 +177,8 @@ export class Topbar implements Mountable {
       meta: q('.gr-topbar__meta'),
       pill: q('.gr-pill'),
       pillLabel: q('.gr-pill__label'),
-      demoChip: q('.gr-demo-chip'),
+      demoChip: q('.gr-demo-chip:not(.gr-rec-chip)'),
+      recChip: q('.gr-rec-chip'),
       progress: q('.gr-topbar__progress'),
       progressFill: q('.gr-topbar__progress-fill'),
       pause: q('[data-cmd="toggle-autoscroll"]'),
@@ -216,7 +225,16 @@ export class Topbar implements Mountable {
     demoChip.hidden = !demo;
     this.el.dataset.demo = String(demo);
     // Privacy: whenever the camera is on, its indicator never hides.
-    this.el.dataset.persist = String(pillAlwaysVisible(s.state, s.kind, s.cameraOn));
+    this.persistBase = pillAlwaysVisible(s.state, s.kind, s.cameraOn);
+    this.el.dataset.persist = String(this.persistBase || this.recording);
+  }
+
+  /** Shows the "Recording diagnostics" chip (kept on screen, like the camera pill, while recording). */
+  setRecording(on: boolean): void {
+    this.recording = on;
+    this.ui.recChip.hidden = !on;
+    this.el.dataset.recording = String(on);
+    this.el.dataset.persist = String(this.persistBase || on);
   }
 
   /** Reflect settings the bar displays (source switch, pause state, recalibrate availability). */

@@ -7,6 +7,7 @@ import {
   FEATURE_INDEX,
   FEATURE_NAMES,
   frameQuality,
+  IRIS_CONTOUR,
   LANDMARK_COUNT,
   type BlendshapeLike,
   type FeatureName,
@@ -18,6 +19,10 @@ interface FaceSpec {
   iris?: { dx: number; dy: number };
   /** Lid aperture / eye width. */
   aperture?: number;
+  /** Both lids moved down by this many eye widths (the lid midpoint leaves the corner line). */
+  lidShift?: number;
+  /** Offset of the 4 iris-contour points (and only them) from where they belong, eye widths. */
+  contourShift?: { dx: number; dy: number };
   /** Whole-face rotation in the image, radians (counter-clockwise on screen). */
   roll?: number;
   /** Flip horizontally, as a mirrored camera image would. */
@@ -30,28 +35,49 @@ interface FaceSpec {
 }
 
 const EYE_W = 0.06;
+/** Iris radius / eye width. */
+const IRIS_R = 0.2;
 
 /**
  * A plausible 478-point face in isotropic units (image heights). Subject's
  * right eye sits at image-left, as in an unmirrored webcam frame.
  */
 function makeFace(spec: FaceSpec = {}): LandmarkLike[] {
-  const { iris = { dx: 0, dy: 0 }, aperture = 0.3, roll = 0, mirror = false, scale = 1, center = { x: 0.5, y: 0.5 }, aspect = 1 } = spec;
+  const {
+    iris = { dx: 0, dy: 0 },
+    aperture = 0.3,
+    lidShift = 0,
+    contourShift = { dx: 0, dy: 0 },
+    roll = 0,
+    mirror = false,
+    scale = 1,
+    center = { x: 0.5, y: 0.5 },
+    aspect = 1,
+  } = spec;
   const pts: { x: number; y: number }[] = [];
   for (let i = 0; i < LANDMARK_COUNT; i++) {
     const a = (i / LANDMARK_COUNT) * 2 * Math.PI;
     pts.push({ x: 0.14 * Math.cos(a), y: 0.02 + 0.2 * Math.sin(a) });
   }
-  const eye = (e: typeof EYE_LANDMARKS.right, cx: number, innerSign: number) => {
+  const eye = (e: typeof EYE_LANDMARKS.right, contour: readonly number[], cx: number, innerSign: number) => {
     const cy = -0.05;
     pts[e.inner] = { x: cx + innerSign * (EYE_W / 2), y: cy };
     pts[e.outer] = { x: cx - innerSign * (EYE_W / 2), y: cy };
-    pts[e.upper] = { x: cx, y: cy - (aperture * EYE_W) / 2 };
-    pts[e.lower] = { x: cx, y: cy + (aperture * EYE_W) / 2 };
-    pts[e.iris] = { x: cx + iris.dx * EYE_W, y: cy + iris.dy * EYE_W };
+    pts[e.upper] = { x: cx, y: cy + (lidShift - aperture / 2) * EYE_W };
+    pts[e.lower] = { x: cx, y: cy + (lidShift + aperture / 2) * EYE_W };
+    const ic = { x: cx + iris.dx * EYE_W, y: cy + iris.dy * EYE_W };
+    pts[e.iris] = ic;
+    // MediaPipe's contour order doesn't matter to the features: they only use the mean.
+    [0, 90, 180, 270].forEach((deg, k) => {
+      const a = (deg * Math.PI) / 180;
+      pts[contour[k]] = {
+        x: ic.x + (IRIS_R * Math.cos(a) + contourShift.dx) * EYE_W,
+        y: ic.y + (IRIS_R * Math.sin(a) + contourShift.dy) * EYE_W,
+      };
+    });
   };
-  eye(EYE_LANDMARKS.right, -0.06, +1); // inner corner toward the nose (+x)
-  eye(EYE_LANDMARKS.left, 0.06, -1);
+  eye(EYE_LANDMARKS.right, IRIS_CONTOUR.right, -0.06, +1); // inner corner toward the nose (+x)
+  eye(EYE_LANDMARKS.left, IRIS_CONTOUR.left, 0.06, -1);
   pts[EYE_LANDMARKS.chin] = { x: 0, y: 0.2 };
 
   const c = Math.cos(-roll); // screen CCW with y pointing down
@@ -103,6 +129,23 @@ describe('FEATURE_NAMES', () => {
       expect(FEATURE_NAMES).toContain(name);
     }
   });
+
+  it('is append-only: the 1.0 layout is still its prefix, the 5-point iris features follow', () => {
+    expect(FEATURE_NAMES.slice(0, 27)).toEqual([
+      'rightU', 'rightV', 'rightOpen', 'leftU', 'leftV', 'leftOpen', 'meanU', 'meanV', 'rightLidY', 'leftLidY',
+      'yaw', 'pitch', 'roll', 'tx', 'ty', 'tz', 'faceScale',
+      'eyeLookUpLeft', 'eyeLookUpRight', 'eyeLookDownLeft', 'eyeLookDownRight',
+      'eyeLookInLeft', 'eyeLookInRight', 'eyeLookOutLeft', 'eyeLookOutRight',
+      'eyeBlinkLeft', 'eyeBlinkRight',
+    ]);
+    expect(FEATURE_NAMES.slice(27)).toEqual(['rightU5', 'rightVc5', 'leftU5', 'leftVc5', 'meanU5', 'meanVc5']);
+  });
+
+  it('exports the iris contour next to each iris centre', () => {
+    expect(IRIS_CONTOUR.right).toEqual([469, 470, 471, 472]);
+    expect(IRIS_CONTOUR.left).toEqual([474, 475, 476, 477]);
+    expect(Math.max(...IRIS_CONTOUR.left)).toBe(LANDMARK_COUNT - 1);
+  });
 });
 
 describe('extractEyeFeatures', () => {
@@ -142,7 +185,10 @@ describe('extractEyeFeatures', () => {
 
   // makeFace applies the iris offset in the face's own frame, before rolling and
   // mirroring, so the same `iris` means the same eye pose in every variant.
-  const EYE_MEASURES = ['rightU', 'rightV', 'rightOpen', 'leftU', 'leftV', 'leftOpen', 'meanU', 'meanV', 'rightLidY', 'leftLidY'] as const;
+  const EYE_MEASURES = [
+    'rightU', 'rightV', 'rightOpen', 'leftU', 'leftV', 'leftOpen', 'meanU', 'meanV', 'rightLidY', 'leftLidY',
+    'rightU5', 'rightVc5', 'leftU5', 'leftVc5', 'meanU5', 'meanVc5',
+  ] as const;
 
   it('is invariant to mirroring and to head roll', () => {
     const pose = { iris: { dx: 0.12, dy: 0.07 }, aperture: 0.26 };
@@ -167,6 +213,55 @@ describe('extractEyeFeatures', () => {
     const naive = extractEyeFeatures(makeFace({ ...pose, aspect: 16 / 9 }), null, null);
     expect(naive).not.toBeNull();
     expect(Math.abs((naive?.vector[FEATURE_INDEX.rightV] ?? 0) - get(square, 'rightV'))).toBeGreaterThan(0.01);
+  });
+
+  it('measures the 5-point iris from the eye corners: it follows the iris and ignores the lids', () => {
+    const centred = extract();
+    for (const name of ['rightU5', 'leftU5', 'meanU5'] as const) expect(get(centred, name)).toBeCloseTo(0.5, 9);
+    for (const name of ['rightVc5', 'leftVc5', 'meanVc5'] as const) expect(get(centred, name)).toBeCloseTo(0, 9);
+
+    const across = [-0.3, 0, 0.3].map((dx) => extract({ iris: { dx, dy: 0 } }));
+    expectStrictlyDecreasing(across.map((f) => get(f, 'rightU5')));
+    expectStrictlyIncreasing(across.map((f) => get(f, 'leftU5')));
+    expectStrictlyIncreasing(across.map((f) => get(f, 'meanU5')));
+    expect(get(across[2], 'meanU5') - get(across[0], 'meanU5')).toBeCloseTo(0.6, 9);
+
+    const down = [-0.2, 0, 0.2].map((dy) => extract({ iris: { dx: 0, dy } }));
+    expectStrictlyIncreasing(down.map((f) => get(f, 'meanVc5')));
+    expect(get(down[2], 'rightVc5')).toBeCloseTo(0.2, 9);
+
+    // Lids lowered (a squint by the upper lid, a lid shadow) or narrowed: the lid-referenced v
+    // and the lid measures move, the corner-referenced ones don't.
+    const pose = { iris: { dx: 0.05, dy: 0.08 } };
+    const base = extract(pose);
+    for (const lids of [extract({ ...pose, lidShift: 0.04 }), extract({ ...pose, aperture: 0.22 }), extract({ ...pose, aperture: 0.2, lidShift: 0.04 })]) {
+      for (const name of ['rightU5', 'rightVc5', 'leftU5', 'leftVc5', 'meanU5', 'meanVc5'] as const) {
+        expect(get(lids, name)).toBeCloseTo(get(base, name), 12);
+      }
+    }
+    expect(get(extract({ ...pose, lidShift: 0.04 }), 'rightV')).toBeCloseTo(get(base, 'rightV') - 0.04, 9);
+  });
+
+  it('averages the iris centre with its 4 contour points', () => {
+    // Contour points displaced as a group by d eye widths move the 5-point centre by 4d/5.
+    const base = extract();
+    const shifted = extract({ contourShift: { dx: 0, dy: 0.05 } });
+    expect(get(shifted, 'rightVc5') - get(base, 'rightVc5')).toBeCloseTo(0.04, 9);
+    expect(get(shifted, 'rightV')).toBeCloseTo(get(base, 'rightV'), 12);
+    const sideways = extract({ contourShift: { dx: 0.05, dy: 0 } });
+    // Image-right is toward the right eye's inner corner.
+    expect(get(sideways, 'rightU5') - get(base, 'rightU5')).toBeCloseTo(-0.04, 9);
+    expect(get(sideways, 'leftU5') - get(base, 'leftU5')).toBeCloseTo(0.04, 9);
+  });
+
+  it('reports squint as the mean eyeSquint score (0 without blendshapes), outside the vector', () => {
+    expect(extract().squint).toBe(0);
+    expect(extract({}, blendshapes({ eyeBlinkLeft: 0.1 })).squint).toBe(0);
+    expect(extract({}, blendshapes({ eyeSquintLeft: 0.3, eyeSquintRight: 0.5 })).squint).toBeCloseTo(0.4, 12);
+    expect(extract({}, blendshapes({ eyeSquint_Right: 0.2 })).squint).toBeCloseTo(0.2, 12);
+    expect(extract({}, blendshapes({ eyeSquintLeft: 3, eyeSquintRight: Number.NaN })).squint).toBe(0.5);
+    const a = extract({}, blendshapes({ eyeSquintLeft: 0.9, eyeSquintRight: 0.9 }));
+    expect(a.vector).toEqual(extract({}, blendshapes({})).vector);
   });
 
   it('shrinks the lid aperture as the lids close', () => {

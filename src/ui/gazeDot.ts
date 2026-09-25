@@ -1,16 +1,75 @@
-import type { AppSettings, EventBus, GazeSample, Mountable, Unsubscribe } from '../types';
+import type { AppSettings, EventBus, GazeSample, LineEstimate, Mountable, Unsubscribe } from '../types';
 import { CSS_PREFIX, IGNORE_ATTR, Z } from '../core/constants';
+import { PINNED_MIN_PROBABILITY } from '../app/logic';
 
 /**
  * A small, soft, semi-transparent dot that follows the smoothed gaze.
  * Positioned with a compositor-only transform once per animation frame, so it
  * never triggers layout. Hidden while the gaze is invalid; pinned (dimmed) to
  * the edge while the gaze is off-screen.
+ *
+ * By default the dot shows the gaze *as the reading layer sees it*: the
+ * smoothed sample minus the vertical drift the line tracker has learned
+ * (`LineEstimate.driftY`, from 'line-estimate' events). Under a lighting change
+ * webcam gaze can sit lines away from the text; the tracker corrects for that,
+ * and a dot at the uncorrected position would contradict the page turns the
+ * reader sees. The debug overlay still shows the raw signal.
  */
 
 export interface GazeDotOptions {
   bus: EventBus;
   getSettings: () => AppSettings;
+  /** Subtract the line tracker's drift (default true). */
+  correctDrift?: boolean;
+}
+
+/**
+ * The reading layer's vertical drift, for showing gaze where the line tracker believes it is.
+ *
+ * Only a drift the tracker has pinned (a line with posterior ≥ PINNED_MIN_PROBABILITY) is trusted.
+ * While the tracker is unsure, its drift is usually the drift of a wrong line, and following it
+ * would put the dot 1.5+ lines from where the reader looks (measured: 3.7 % of reading fixations
+ * at noise 1.6, 93 % of them on the wrong line, 97 % unpinned). So after a reset the correction
+ * follows the tracker until its first pinned estimate, then holds the last pinned drift through
+ * unpinned stretches. (Holding 0 until the first pin instead made constant lighting offsets worse:
+ * −3 lines went from 1.8 % to 4.7 % of samples ≥ 1.5 lines off.)
+ *
+ * A drift not confirmed for `staleMs` (no estimate at all: the reader stopped reading) is dropped,
+ * and `reset()` forgets it (a new calibration starts the drift over).
+ */
+export class DriftCorrection {
+  private driftY = 0;
+  private at = Number.NEGATIVE_INFINITY;
+  /** A pinned estimate was seen since the last reset: unpinned drifts are no longer followed. */
+  private pinnedSeen = false;
+
+  constructor(private readonly staleMs = 30_000) {}
+
+  noteEstimate(e: Pick<LineEstimate, 't' | 'driftY' | 'probability' | 'lineIndex'> | null | undefined): void {
+    if (!e || !Number.isFinite(e.driftY) || !Number.isFinite(e.t)) return;
+    const pinned = e.lineIndex >= 0 && e.probability >= PINNED_MIN_PROBABILITY;
+    // Any estimate means the reader is still reading: staleness stays "stopped reading".
+    this.at = e.t;
+    if (pinned || !this.pinnedSeen) this.driftY = e.driftY;
+    this.pinnedSeen ||= pinned;
+  }
+
+  reset(): void {
+    this.driftY = 0;
+    this.at = Number.NEGATIVE_INFINITY;
+    this.pinnedSeen = false;
+  }
+
+  /** Drift (px, measured − true) to subtract from a sample taken at `t`; 0 when unknown or stale. */
+  offsetAt(t: number): number {
+    return Number.isFinite(t) && Math.abs(t - this.at) <= this.staleMs ? this.driftY : 0;
+  }
+
+  /** The sample with its vertical positions drift-corrected (the same object when there is nothing to correct). */
+  correct(s: GazeSample): GazeSample {
+    const d = this.offsetAt(s.t);
+    return d === 0 ? s : { ...s, y: s.y - d, rawY: s.rawY - d };
+  }
 }
 
 const P = CSS_PREFIX;
@@ -53,6 +112,7 @@ export class GazeDot implements Mountable {
   private hostVisible = true;
   private settingVisible: boolean;
   private latest: GazeSample | null = null;
+  private readonly drift: DriftCorrection | null;
   private raf: number | null = null;
   private destroyed = false;
   /**
@@ -68,6 +128,7 @@ export class GazeDot implements Mountable {
     this.bus = opts.bus;
     this.getSettings = opts.getSettings;
     this.settingVisible = readFlag(opts.getSettings);
+    this.drift = opts.correctDrift === false ? null : new DriftCorrection();
   }
 
   /** Whether the dot layer is currently shown (setting on and not hidden by the host). */
@@ -93,6 +154,11 @@ export class GazeDot implements Mountable {
       this.dot = dot;
       this.offs.push(
         this.bus.on('gaze', (s) => this.onGaze(s)),
+        this.bus.on('line-estimate', (e) => this.drift?.noteEstimate(e)),
+        // A new calibration starts the reading layer's drift over.
+        this.bus.on('calibration', ({ phase }) => {
+          if (phase === 'start') this.drift?.reset();
+        }),
         this.bus.on('settings-changed', ({ settings, changed }) => {
           if (changed.includes('showGazeDot')) {
             this.settingVisible = settings.showGazeDot;
@@ -139,7 +205,7 @@ export class GazeDot implements Mountable {
   }
 
   private onGaze(s: GazeSample): void {
-    this.latest = s;
+    this.latest = this.drift ? this.drift.correct(s) : s;
     this.schedule();
   }
 
