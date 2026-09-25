@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { buildArtifactHtml, checkArtifactHtml, escapeInlineScript, formatBytes } from '../scripts/artifact-html.mjs';
+import {
+  buildArtifactHtml,
+  checkArtifactHtml,
+  CONTROL_CHARS,
+  escapeControlChars,
+  escapeInlineScript,
+  formatBytes,
+} from '../scripts/artifact-html.mjs';
 
 const FULL_APP = 'https://lance-lii.github.io/gaze-reader/';
 
@@ -93,5 +100,50 @@ describe('formatBytes', () => {
     expect(formatBytes(512)).toBe('512 B');
     expect(formatBytes(2048)).toBe('2.0 KB');
     expect(formatBytes(3 * 1024 * 1024)).toBe('3.00 MB');
+  });
+});
+
+describe('escapeControlChars', () => {
+  const ESC = String.fromCharCode(0x1b);
+  const ETX = String.fromCharCode(0x03);
+  const EOT = String.fromCharCode(0x04);
+  const DEL = String.fromCharCode(0x7f);
+  const BS = String.fromCharCode(0x5c); // backslash
+  const TICK = '`';
+  // Evaluates an expression the way the browser will after escaping.
+  const run = (src: string): unknown => new Function('return (' + src + ');')();
+
+  it('keeps string and template literals meaning the same characters', () => {
+    const cases = [
+      '"a' + ESC + 'b"', // raw control char in a string
+      TICK + 'PK' + ETX + EOT + TICK, // in a template literal, like jszip's minified zip headers
+      '"' + BS + ESC + '"', // a backslash-escaped control char means the char itself
+      '"' + BS + BS + ESC + '"', // an escaped backslash followed by a raw control char
+      '"x' + DEL + '"',
+    ];
+    for (const src of cases) {
+      const escaped = escapeControlChars(src);
+      expect(CONTROL_CHARS.test(escaped)).toBe(false);
+      expect(run(escaped)).toEqual(run(src));
+    }
+  });
+
+  it('keeps regex literals matching the same text', () => {
+    const src = '/' + ESC + '[^' + ESC + ']*/';
+    const re = run(escapeControlChars(src)) as RegExp;
+    expect(re.test(ESC + '[31m')).toBe(true);
+    expect(re.test('plain')).toBe(false);
+  });
+
+  it('leaves tabs, newlines and ordinary text alone', () => {
+    const src = 'const a = "x\ty";\r\nconst b = ' + TICK + 'line\nline' + TICK + ';';
+    expect(escapeControlChars(src)).toBe(src);
+  });
+
+  it('is applied to the page\'s inline script', () => {
+    const js = 'const h=' + TICK + 'PK' + ETX + EOT + TICK + ';';
+    const html = buildArtifactHtml({ title: 'T', css: '', js, markup: '<div id="app"></div>' });
+    expect(CONTROL_CHARS.test(html)).toBe(false);
+    expect(html).toContain('PK' + BS + 'x03' + BS + 'x04');
   });
 });
