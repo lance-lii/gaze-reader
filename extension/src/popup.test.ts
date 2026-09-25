@@ -115,11 +115,75 @@ describe('popup', () => {
 
     toggle(document.querySelector<HTMLInputElement>('input[name="source"][value="webcam"]')!, true);
     await vi.advanceTimersByTimeAsync(0);
-    const forget = $('#calibration').querySelector('button')!;
-    expect(forget.textContent).toBe('Forget it');
+    const forget = $<HTMLButtonElement>('#calibration button');
+    expect(forget.textContent).toBe('Forget calibration');
+    forget.focus();
+    // The first click only arms it: "Forget it" reads like "dismiss", and there's no undo.
+    forget.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(c.storage.data.has(KEYS.calibration)).toBe(true);
+    expect(forget.textContent).toBe('Click again to forget');
+    // The 1 s poll re-renders without rebuilding the button, so focus stays put.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect($('#calibration button')).toBe(forget);
+    expect(document.activeElement).toBe(forget);
+
     forget.click();
     await vi.advanceTimersByTimeAsync(0);
     expect(c.storage.data.has(KEYS.calibration)).toBe(false);
-    expect($('#calibration').textContent).toMatch(/30-second calibration/);
+    expect($('#calibration').textContent).toMatch(/one-minute calibration/);
+    expect(document.activeElement).toBe($('#recalibrate'));
+  });
+
+  it('disarms "Forget calibration" after a few seconds, or when focus leaves it', async () => {
+    const c = installChrome();
+    c.storage.data.set(KEYS.calibration, { version: 1 });
+    await openPopup();
+    const forget = $<HTMLButtonElement>('#calibration button');
+    expect(forget.textContent).toBe('Forget calibration');
+
+    forget.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(forget.textContent).toBe('Click again to forget');
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(forget.textContent).toBe('Forget calibration');
+    forget.click(); // arms again, rather than forgetting
+    await vi.advanceTimersByTimeAsync(0);
+    expect(c.storage.data.has(KEYS.calibration)).toBe(true);
+    expect(forget.textContent).toBe('Click again to forget');
+
+    forget.dispatchEvent(new FocusEvent('blur'));
+    expect(forget.textContent).toBe('Forget calibration');
+    forget.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(c.storage.data.has(KEYS.calibration)).toBe(true);
+
+    // Forgotten from another popup while armed: a later calibration doesn't come back armed.
+    await c.storage.area.remove([KEYS.calibration]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect($('#calibration').textContent).toMatch(/one-minute calibration/);
+    await c.storage.area.set({ [KEYS.calibration]: { version: 1 } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect($<HTMLButtonElement>('#calibration button').textContent).toBe('Forget calibration');
+  });
+
+  it('stores how pages turn with the extension settings, and says when a page is in page mode', async () => {
+    const c = installChrome();
+    c.pageAnswers.push({ ...ON, pageMode: true });
+    await openPopup();
+    const choice = (v: string) => document.querySelector<HTMLInputElement>(`input[name="page-turn"][value="${v}"]`)!;
+    expect(choice('auto').checked).toBe(true);
+    expect($('#page-turn-hint').textContent).toMatch(/next-page key/);
+    expect($('#status').textContent).toBe('Reading along · page mode');
+
+    toggle(choice('keys'), true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(c.storage.data.get(KEYS.extSettings)).toEqual({ pageTurn: 'keys' });
+    expect($('#page-turn-hint').textContent).toMatch(/some sites ignore it/);
+
+    // Another window's popup changed it: this one follows.
+    await c.storage.area.set({ [KEYS.extSettings]: { pageTurn: 'scroll' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(choice('scroll').checked).toBe(true);
   });
 });

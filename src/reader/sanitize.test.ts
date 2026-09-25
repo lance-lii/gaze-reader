@@ -462,3 +462,16 @@ describe('sanitizeHtml — seeded fuzz', () => {
     for (let i = 0; i < 800; i++) checkString(gen(0));
   });
 });
+
+describe('href compaction', () => {
+  it('handles a huge run of spaces in an href quickly (regression: quadratic trim)', () => {
+    const start = performance.now();
+    sanitizeHtml(`<a href="a${' '.repeat(200_000)}b">x</a>`);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  it('still trims control characters and spaces around a URL', () => {
+    const ctl = String.fromCharCode(1);
+    expect(sanitizeHtml(`<a href="${ctl}  https://example.com/a  ${ctl}">x</a>`)).toContain('href="https://example.com/a"');
+  });
+});

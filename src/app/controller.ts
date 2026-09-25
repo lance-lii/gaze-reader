@@ -11,6 +11,7 @@
 import { CSS_PREFIX } from '../core/constants';
 import { createEventBus } from '../core/events';
 import { createSettingsStore, type SettingsStore } from '../core/settings';
+import { FULL_APP_URL, IS_ARTIFACT } from '../core/target';
 import type {
   AppSettings,
   Book,
@@ -28,7 +29,7 @@ import type {
 } from '../types';
 import { Buddy } from '../buddy/buddy';
 import { BUDDY_CLASS } from '../buddy/styles';
-import { clearCalibration, loadCalibration, saveCalibration } from '../gaze/calibrationModel';
+import { clearCalibration, currentChromeTop, loadCalibration, modelChromeTop, saveCalibration } from '../gaze/calibrationModel';
 import { CameraFeatureSource, preloadFaceLandmarker } from '../gaze/faceTracker';
 import { FEATURE_NAMES } from '../gaze/features';
 import { MouseGazeSource } from '../gaze/mouseGazeSource';
@@ -43,6 +44,7 @@ import { SimulatedReaderSource } from '../reading/simulatedReader';
 import { FixationDetector } from '../signal/fixations';
 import { CalibrationOverlay } from '../ui/calibrationOverlay';
 import { CameraPreview } from '../ui/cameraPreview';
+import { DEWEY_FULL_APP_LINE, FULL_APP_LABEL, WEBCAM_UNAVAILABLE_TEXT, WEBCAM_UNAVAILABLE_TITLE } from '../ui/fullApp';
 import { DebugOverlay } from '../ui/debugOverlay';
 import { GazeDot } from '../ui/gazeDot';
 import { HelpDialog } from '../ui/helpDialog';
@@ -59,6 +61,7 @@ import {
   TYPICAL_WPM,
   TrackingStateMachine,
   calibrationFitsViewport,
+  calibrationOriginFits,
   cameraErrorInfo,
   computeWpm,
   errorMessage,
@@ -78,6 +81,7 @@ import {
   type SourcePhase,
   type TrackingStatus,
 } from './logic';
+import { HostThemeWatcher } from './hostTheme';
 
 type Screen = 'library' | 'reader';
 
@@ -106,6 +110,8 @@ const ACTIVE_GAZE_WINDOW_MS = 5000;
 const ACTIVE_INPUT_WINDOW_MS = 60_000;
 const POOR_HINT_AFTER_MS = 8000;
 const PRELOAD_DELAY_MS = 2500;
+/** Artifact build: how long Dewey lets a new reader settle in before mentioning the full app. */
+const FULL_APP_MENTION_DELAY_MS = 20_000;
 
 const TYPOGRAPHY_KEYS: readonly (keyof AppSettings)[] = ['fontSizePx', 'lineHeight', 'fontFamily', 'columnWidthCh'];
 const OVERLAY_KEYS: readonly (keyof AppSettings)[] = ['showGazeDot', 'showDebugOverlay', 'showCameraPreview', 'buddyCorner', 'buddyEnabled'];
@@ -117,6 +123,11 @@ const MEASURE_PRIORITY: Readonly<Record<LayoutChangeReason, number>> = {
   'page-turn': 3,
   initial: 4,
 };
+
+/** Warms up the face tracker. The Artifact build has none: there it does nothing, and the loader tree-shakes away. */
+function preloadTracker(): void {
+  if (!IS_ARTIFACT) void preloadFaceLandmarker();
+}
 
 /** Named timeouts, so every pending timer can be found and cleared. */
 class Timers {
@@ -177,6 +188,8 @@ export class AppController {
   private readonly debug: DebugOverlay;
   private screen: Screen = 'library';
   private readonly darkQuery: MediaQueryList | null;
+  /** Artifact build only: the host frame's theme stamp, which "auto" follows. */
+  private readonly hostTheme: HostThemeWatcher | null;
 
   // Books & reading pipeline
   private readonly fixations = new FixationDetector();
@@ -191,6 +204,8 @@ export class AppController {
   private turning = false;
   /** Where the forward turn in flight is heading (from its `page-turn` event); null otherwise. */
   private turnTarget: number | null = null;
+  /** U pressed while a forward turn was still sliding: undo it as soon as it lands. */
+  private pendingUndo = false;
   private scrollSettling = false;
   private pipelineWasBlocked = false;
   private lastEstimateEmitAt = Number.NEGATIVE_INFINITY;
@@ -230,6 +245,8 @@ export class AppController {
   private progressRaf = 0;
   private dragDepth = 0;
   private greeted = false;
+  /** Artifact build: Dewey has mentioned (or is about to mention) the full app. */
+  private fullAppMentioned = false;
   private lastError = { key: '', at: 0 };
 
   constructor(root: HTMLElement) {
@@ -239,6 +256,12 @@ export class AppController {
     const getSettings = (): AppSettings => this.store.get();
     const settings = getSettings();
     this.darkQuery = typeof matchMedia === 'function' ? matchMedia('(prefers-color-scheme: dark)') : null;
+    // Before our first data-theme write: whatever is on <html> now is the Artifact host's stamp.
+    this.hostTheme = IS_ARTIFACT
+      ? new HostThemeWatcher(document.documentElement, () => {
+          if (!this.destroyed) this.applyTheme();
+        })
+      : null;
 
     root.replaceChildren();
     root.classList.add('gr-app');
@@ -342,6 +365,7 @@ export class AppController {
     if (this.progressRaf) cancelAnimationFrame(this.progressRaf);
     this.progressRaf = 0;
     this.unobserveContent();
+    this.hostTheme?.destroy();
     this.ac.abort();
     for (const off of this.unsubs.splice(0)) off();
     this.scroll?.destroy();
@@ -399,9 +423,10 @@ export class AppController {
 
   private applyTheme(): void {
     const s = this.store.get();
-    const theme = resolveTheme(s.theme, this.darkQuery?.matches ?? false);
+    const theme = resolveTheme(s.theme, this.darkQuery?.matches ?? false, this.hostTheme?.theme ?? null);
     const html = document.documentElement;
-    html.dataset.theme = theme;
+    if (this.hostTheme) this.hostTheme.write(theme);
+    else html.dataset.theme = theme;
     html.dataset.readingFont = s.fontFamily;
     html.style.colorScheme = theme === 'dark' ? 'dark' : 'light';
     const bg = getComputedStyle(html).getPropertyValue('--gr-bg').trim();
@@ -440,17 +465,29 @@ export class AppController {
     this.syncModalState();
     if (this.destroyed) return;
     if (!choice) {
+      this.focusLibraryIfLost();
       this.greetLibrary();
       return;
     }
-    if (choice === 'webcam') void preloadFaceLandmarker();
+    if (choice === 'webcam') preloadTracker();
     this.selectSource(choice);
     if (this.session) return;
     // Get them reading straight away, with the guide to how reading eyes work.
     await samplesReady;
     const first = this.samples?.[0];
     if (first && !this.session && !this.destroyed) await this.openSample(first.id);
-    else this.greetLibrary();
+    else {
+      this.focusLibraryIfLost();
+      this.greetLibrary();
+    }
+  }
+
+  /** A dialog that opened on page load has nowhere to hand focus back to; land on the library's primary action. */
+  private focusLibraryIfLost(): void {
+    if (this.screen !== 'library') return;
+    const a = document.activeElement;
+    // Checked before the browser's focus fixup, while activeElement may still be the now-hidden Skip or Next button.
+    if (!(a instanceof HTMLElement) || a === document.body || a.closest('[hidden]')) this.library.focusPrimary();
   }
 
   // ───────────────────────────────── Books ─────────────────────────────────
@@ -480,13 +517,15 @@ export class AppController {
   }
 
   private openFromFile(file: File): Promise<boolean> {
-    return this.openWith(`Opening “${file.name}”…`, () => loadBookFromFile(file));
+    return this.openWith(`Opening “${file.name}”…`, () => loadBookFromFile(file), 'file');
   }
 
   private openFromText(text: string, title: string | null): Promise<boolean> {
     // The loader detects the format (text, Markdown or HTML) and a title when none is given.
-    return this.openWith('Preparing your text…', async () =>
-      loadBookFromText(text, { ...(title ? { title } : {}), source: 'paste' }),
+    return this.openWith(
+      'Preparing your text…',
+      async () => loadBookFromText(text, { ...(title ? { title } : {}), source: 'paste' }),
+      'paste',
     );
   }
 
@@ -497,7 +536,7 @@ export class AppController {
     } catch {
       /* keep the raw text */
     }
-    return this.openWith(`Fetching from ${host}…`, () => loadBookFromUrl(url));
+    return this.openWith(`Fetching from ${host}…`, () => loadBookFromUrl(url), 'url');
   }
 
   private openSample(id: string): Promise<boolean> {
@@ -512,9 +551,14 @@ export class AppController {
     });
   }
 
-  /** Loads a book with a busy indicator; only the most recent request wins. */
-  private async openWith(label: string, load: () => Promise<Book>): Promise<boolean> {
+  /**
+   * Loads a book with a busy indicator; only the most recent request wins. `origin` names the
+   * library control that started it, so a failure is explained right there (and stays) instead
+   * of in a toast far from the form.
+   */
+  private async openWith(label: string, load: () => Promise<Book>, origin?: 'url' | 'paste' | 'file'): Promise<boolean> {
     const seq = ++this.openSeq;
+    const fromLibrary = this.screen === 'library';
     this.library.setBusy(label);
     const busyToast = this.screen === 'reader' ? this.toasts.show({ id: 'opening', message: label, durationMs: 0 }) : null;
     try {
@@ -526,7 +570,12 @@ export class AppController {
     } catch (err) {
       if (seq !== this.openSeq || this.destroyed) return false;
       console.warn('[app] could not open the book', err);
-      this.toasts.show({ id: 'open-failed', tone: 'error', title: 'Couldn’t open that book', message: errorMessage(err) });
+      if (origin && fromLibrary && this.screen === 'library') {
+        this.library.showOpenError(origin, errorMessage(err));
+      } else {
+        // Stays until dismissed: the explanation can be long, and nothing else holds it open.
+        this.toasts.show({ id: 'open-failed', tone: 'error', title: 'Couldn’t open that book', message: errorMessage(err), durationMs: 0 });
+      }
       return false;
     } finally {
       if (busyToast) this.toasts.dismiss(busyToast);
@@ -597,6 +646,9 @@ export class AppController {
   }
 
   private async removeBook(id: string, title: string): Promise<void> {
+    // Where the removed card sat, so keyboard focus stays in the list instead of jumping to the top.
+    const cards = [...this.library.el.querySelectorAll('.gr-card--book')];
+    const index = Math.max(0, cards.findIndex((c) => c.contains(document.activeElement)));
     let book: Book | null = null;
     let progress: ReadingPosition | null = null;
     try {
@@ -608,12 +660,14 @@ export class AppController {
       return;
     }
     await this.refreshRecent();
-    if (!(document.activeElement instanceof HTMLElement) || document.activeElement === document.body) this.library.focusPrimary();
+    if (!(document.activeElement instanceof HTMLElement) || document.activeElement === document.body) this.library.focusRecent(index);
     const saved = book;
     this.toasts.show({
       id: `removed:${id}`,
       message: `Removed “${title}” from this device.`,
       actions: saved ? [{ label: 'Undo', primary: true, run: () => void this.restoreBook(saved, progress) }] : [],
+      // Long enough for a keyboard or screen-reader user to reach Undo (WCAG 2.2.1).
+      durationMs: 20_000,
     });
   }
 
@@ -678,6 +732,7 @@ export class AppController {
     this.scroll?.destroy();
     this.scroll = null;
     this.turning = false;
+    this.pendingUndo = false;
     this.scrollSettling = false;
     this.reader.close();
     this.layout = null;
@@ -709,7 +764,7 @@ export class AppController {
     const s = this.store.get();
     const active = this.isActivelyReading(now);
     const dt = session.clock.tick(now, active);
-    session.meter.update(this.reader.progress());
+    session.meter.update(this.reader.progress(), session.clock.minutes);
     if (session.breaks.tick(dt, active, s.breakIntervalMin, s.breakReminders)) this.breakDue(session);
     if (now - session.lastProgressEmitAt >= PROGRESS_EVERY_MS) this.emitProgress(now);
     if (++this.heartbeatCount % 4 === 0) this.updateProgressUi();
@@ -729,7 +784,7 @@ export class AppController {
     this.bus.emit('book-progress', {
       fraction,
       wordsRead: Math.round(fraction * session.book.wordCount),
-      wpm: computeWpm(session.meter.wordsAdvanced, minutes),
+      wpm: computeWpm(session.meter.wordsAdvanced, session.meter.minutesAtLastAdvance),
       pagesTurned: this.scroll?.pagesTurned ?? 0,
       minutesReading: Math.round(minutes * 10) / 10,
     });
@@ -747,7 +802,7 @@ export class AppController {
     const session = this.session;
     if (!session) return;
     const fraction = this.reader.progress();
-    const wpm = computeWpm(session.meter.wordsAdvanced, session.clock.minutes) ?? TYPICAL_WPM;
+    const wpm = computeWpm(session.meter.wordsAdvanced, session.meter.minutesAtLastAdvance) ?? TYPICAL_WPM;
     const left = formatMinutes(minutesLeft(fraction, session.book.wordCount, wpm));
     this.topbar.setProgress(fraction, formatPercent(fraction), fraction >= 0.995 || !left ? '' : `${left} left`);
   }
@@ -808,7 +863,9 @@ export class AppController {
     if (!this.session || s.source !== this.sourceKind) return;
     this.bus.emit('gaze', s);
     this.tracking.push(s);
-    if (s.valid) this.lastValidGazeAt = s.t;
+    // A mouse source keeps emitting valid samples from a pointer left resting, so it is no proof
+    // anyone is there; real pointer movement counts as input instead (see bindDom).
+    if (s.valid && s.source !== 'mouse') this.lastValidGazeAt = s.t;
 
     if (this.pipelineBlocked()) {
       this.pipelineWasBlocked = true;
@@ -921,13 +978,17 @@ export class AppController {
       this.turning = false;
       this.turnTarget = null;
     }
+    const undoNext = this.pendingUndo;
+    this.pendingUndo = false;
     if (this.scroll !== scroll || !this.session) return;
     if (Math.abs(this.reader.scroller.scrollTop - startTop) < 1) {
       // Nothing moved, so the reading model is still right; just start the cooldown.
       this.pageEnd.notifyScrolled(performance.now());
-      return;
+    } else {
+      this.afterJump('turn', oldDocTop);
     }
-    this.afterJump('turn', oldDocTop);
+    // Same path as pressing U just after the turn landed; undoTurn sets `turning` synchronously.
+    if (undoNext) void this.undoTurn();
   }
 
   /** Every remaining line of the book is on screen (see textEndsOnScreen in logic.ts). */
@@ -966,7 +1027,14 @@ export class AppController {
   private async undoTurn(): Promise<void> {
     const scroll = this.scroll;
     const session = this.session;
-    if (!scroll || !session || this.turning) return;
+    if (!scroll || !session) return;
+    if (this.turning) {
+      // Pressed while a forward turn is still sliding: take it back as soon as it lands.
+      // (turnTarget is set only during a forward turn, so an undo or page-back animation
+      // still ignores it, and holding U can't queue several undos.)
+      if (this.turnTarget !== null) this.pendingUndo = true;
+      return;
+    }
     this.turning = true;
     let undone = false;
     try {
@@ -1047,7 +1115,20 @@ export class AppController {
     this.unobserveContent();
     if (typeof ResizeObserver === 'undefined') return;
     // Catches late font loads and typography changes that reflow the text.
-    this.contentObserver = new ResizeObserver(() => this.scheduleMeasure('content'));
+    let last: { width: number; height: number } | null = null;
+    this.contentObserver = new ResizeObserver((entries) => {
+      const box = entries[entries.length - 1]?.contentRect;
+      if (box) {
+        // A reflow (typography, window width, zoom, late fonts or images) moves the text, so
+        // stored undo offsets would land on unrelated text. Height-only window resizes don't
+        // change the content box, so they keep the history.
+        if (last && (Math.abs(box.width - last.width) > 0.5 || Math.abs(box.height - last.height) > 0.5)) {
+          this.scroll?.clearHistory();
+        }
+        last = { width: box.width, height: box.height };
+      }
+      this.scheduleMeasure('content');
+    });
     this.contentObserver.observe(this.reader.content);
   }
 
@@ -1106,6 +1187,10 @@ export class AppController {
 
   /** The user picked a source (top bar, toast action, onboarding). Re-picking the current one retries it. */
   private selectSource(kind: GazeSourceKind): void {
+    if (IS_ARTIFACT && kind === 'webcam') {
+      this.webcamUnavailable();
+      return;
+    }
     if (kind === 'webcam') this.webcamHold = null;
     const s = this.store.get();
     const patch: Partial<AppSettings> = {};
@@ -1114,7 +1199,7 @@ export class AppController {
     if (s.gazeSource !== kind) patch.gazeSource = kind;
     if (Object.keys(patch).length > 0) this.store.update(patch);
     if (patch.gazeSource === undefined) this.syncSource();
-    if (kind === 'webcam' && !this.session) void preloadFaceLandmarker();
+    if (kind === 'webcam' && !this.session) preloadTracker();
   }
 
   private async bringUp(kind: GazeSourceKind, gen: number): Promise<void> {
@@ -1173,6 +1258,8 @@ export class AppController {
 
   /** Stops whatever is running (or starting), including the camera and any calibration. */
   private teardownSource(): void {
+    // Its 'Refresh now' button belongs to the webcam session being torn down.
+    this.toasts.dismiss('refresh-calibration');
     this.offSample?.();
     this.offSample = null;
     this.source?.stop();
@@ -1194,6 +1281,9 @@ export class AppController {
    * webcam can't be used.
    */
   private async prepareWebcam(gen: number): Promise<CameraFeatureSource | null> {
+    // Unreachable in the Artifact build (the webcam can't be selected there); the early
+    // return also keeps the camera and face-tracker code out of that bundle.
+    if (IS_ARTIFACT) return null;
     const stale = (): boolean => gen !== this.sourceGen || this.destroyed;
     this.setPhase('starting');
     this.camera ??= new CameraFeatureSource();
@@ -1217,8 +1307,13 @@ export class AppController {
     if (!model || this.forceCalibration) {
       return (await this.calibrate('standard', gen)) ? camera : null;
     }
-    if (!calibrationFitsViewport(model.viewport, this.viewportSize())) {
-      this.bus.emit('buddy-say', { text: 'Your window changed size, so let’s do a quick 5-dot refresh.', priority: 'high', mood: 'thinking' });
+    const fit = this.calibrationFit(model);
+    if (fit !== 'fits') {
+      const text =
+        fit === 'size'
+          ? 'Your window changed size, so let’s do a quick 5-dot refresh.'
+          : 'Your window layout changed (fullscreen or toolbar), so let’s do a quick 5-dot refresh.';
+      this.bus.emit('buddy-say', { text, priority: 'high', mood: 'thinking' });
       return (await this.calibrate('quick', gen)) ? camera : null;
     }
     return camera;
@@ -1247,11 +1342,36 @@ export class AppController {
   private introduceSource(kind: GazeSourceKind): void {
     if (this.introduced.has(kind)) return;
     this.introduced.add(kind);
+    if (IS_ARTIFACT) this.mentionFullApp(FULL_APP_MENTION_DELAY_MS);
     if (kind === 'mouse') {
       this.bus.emit('buddy-say', { text: 'Point at the line you’re reading. I’ll turn the page at the bottom.', priority: 'high', mood: 'happy' });
     } else if (kind === 'simulated') {
       this.bus.emit('buddy-say', { text: 'Watch me read! When I reach the last line, the page turns itself.', priority: 'high', mood: 'excited' });
     }
+  }
+
+  /** Artifact build: the webcam was asked for (top bar, the C shortcut). Say why not, and where it works. */
+  private webcamUnavailable(): void {
+    if (!IS_ARTIFACT) return; // (lets the web build drop the body)
+    this.toasts.show({
+      id: 'webcam-unavailable',
+      title: WEBCAM_UNAVAILABLE_TITLE,
+      message: WEBCAM_UNAVAILABLE_TEXT,
+      links: [{ label: FULL_APP_LABEL, href: FULL_APP_URL }],
+      durationMs: 12_000,
+    });
+    this.mentionFullApp(0);
+  }
+
+  /** Artifact build: Dewey mentions the full version once per visit. */
+  private mentionFullApp(delayMs: number): void {
+    if (!IS_ARTIFACT || this.fullAppMentioned) return;
+    this.fullAppMentioned = true;
+    this.timers.set(
+      'full-app',
+      () => this.bus.emit('buddy-say', { text: DEWEY_FULL_APP_LINE, priority: 'normal', mood: 'happy' }),
+      delayMs,
+    );
   }
 
   private hidePreview(): void {
@@ -1371,6 +1491,10 @@ export class AppController {
   }
 
   private recalibrate(): void {
+    if (IS_ARTIFACT) {
+      this.webcamUnavailable();
+      return;
+    }
     this.forceCalibration = true;
     this.webcamHold = null;
     if (!this.session) {
@@ -1389,7 +1513,9 @@ export class AppController {
   private async recalibrateInPlace(mode: 'quick' | 'standard'): Promise<void> {
     const gen = this.sourceGen;
     const source = this.source;
-    if (!source || this.calibration) return;
+    // Only a live webcam session can be recalibrated in place: a stale 'Refresh now' toast
+    // clicked after switching to the mouse or demo must not stop that source.
+    if (!source || this.calibration || this.sourceKind !== 'webcam' || this.phase !== 'running' || !this.camera?.running) return;
     this.offSample?.();
     this.offSample = null;
     source.stop();
@@ -1427,17 +1553,32 @@ export class AppController {
   private schedulePreload(): void {
     if (this.store.get().gazeSource !== 'webcam') return;
     // Warm the face model while the reader browses, so opening a book is quick.
-    this.timers.set('preload', () => void preloadFaceLandmarker(), PRELOAD_DELAY_MS);
+    this.timers.set('preload', preloadTracker, PRELOAD_DELAY_MS);
+  }
+
+  /**
+   * Whether the saved calibration still lines up with the window: 'size' when the viewport
+   * changed size (or zoom), 'origin' when the viewport moved inside the window (fullscreen,
+   * toolbar or bookmarks bar), which shifts every prediction with the window origin unchanged.
+   */
+  private calibrationFit(model: GazeModel): 'fits' | 'size' | 'origin' {
+    if (!calibrationFitsViewport(model.viewport, this.viewportSize())) return 'size';
+    if (!calibrationOriginFits(modelChromeTop(model), currentChromeTop(), this.layout?.linePitch)) return 'origin';
+    return 'fits';
   }
 
   private maybeSuggestRefresh(): void {
     const model = this.model;
     if (!model || this.sourceKind !== 'webcam' || this.phase !== 'running') return;
-    if (calibrationFitsViewport(model.viewport, this.viewportSize())) return;
+    const fit = this.calibrationFit(model);
+    if (fit === 'fits') return;
     this.toasts.show({
       id: 'refresh-calibration',
-      title: 'Window size changed',
-      message: 'A quick 5-dot refresh keeps page turns accurate.',
+      title: fit === 'size' ? 'Window size changed' : 'Window layout changed',
+      message:
+        fit === 'size'
+          ? 'A quick 5-dot refresh keeps page turns accurate.'
+          : 'Fullscreen or a toolbar moved the page. A quick 5-dot refresh keeps page turns accurate.',
       actions: [{ label: 'Refresh now', primary: true, run: () => void this.recalibrateInPlace('quick') }],
     });
   }
@@ -1569,6 +1710,8 @@ export class AppController {
     const any = (keys: readonly (keyof AppSettings)[]): boolean => keys.some((k) => changed.includes(k));
     if (any(['theme', 'fontFamily'])) this.applyTheme();
     if (any(TYPOGRAPHY_KEYS)) {
+      // The text reflows: stored undo offsets would point at unrelated text.
+      this.scroll?.clearHistory();
       this.reader.applySettings(s);
       this.scheduleMeasure('content', 60);
     }
@@ -1623,7 +1766,7 @@ export class AppController {
     window.addEventListener('resize', this.onWindowResize, { signal, passive: true });
     document.addEventListener('visibilitychange', this.onVisibility, { signal });
     window.addEventListener('pagehide', () => this.savePositionNow(), { signal });
-    for (const type of ['pointerdown', 'wheel', 'touchstart'] as const) {
+    for (const type of ['pointerdown', 'pointermove', 'wheel', 'touchstart'] as const) {
       window.addEventListener(type, this.noteInput, { signal, passive: true });
     }
     window.addEventListener('dragenter', this.onDragEnter, { signal });

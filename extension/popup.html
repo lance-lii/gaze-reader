@@ -72,6 +72,22 @@
           </fieldset>
         </div>
 
+        <div class="row row--stack">
+          <span class="row-text">
+            <span class="row-title" id="page-turn-label">Turn pages by</span>
+            <span class="hint" id="page-turn-hint"></span>
+          </span>
+          <fieldset class="segmented segmented--fill" aria-labelledby="page-turn-label">
+            <label title="Scroll, or press the next-page key on book readers that don't scroll"
+              ><input type="radio" name="page-turn" value="auto" />Auto</label
+            >
+            <label title="Always scroll the page"><input type="radio" name="page-turn" value="scroll" />Scrolling</label>
+            <label title="Press → and Page Down for the page (some sites ignore this)"
+              ><input type="radio" name="page-turn" value="keys" />Next-page key</label
+            >
+          </fieldset>
+        </div>
+
         <label class="row" for="buddy">
           <span class="row-text">
             <span class="row-title">Dewey</span>

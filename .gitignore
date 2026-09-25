@@ -1,6 +1,8 @@
 node_modules/
 dist/
 dist-extension/
+dist-artifact/
 public/mediapipe/
 *.log
 .DS_Store
+release/

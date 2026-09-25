@@ -1,6 +1,8 @@
 import { IGNORE_ATTR, Z } from '../core/constants';
+import { IS_ARTIFACT } from '../core/target';
 import type { AppSettings, CommandName, EventBus, GazeSourceKind, Mountable, TrackingState } from '../types';
 import { pillAlwaysVisible, statusPill } from '../app/logic';
+import { WEBCAM_UNAVAILABLE_SHORT } from './fullApp';
 
 // ─────────────────────────────── Icon set ───────────────────────────────
 // Shared by the shell UI (top bar, library, panels, toasts). Stroke icons on a
@@ -63,8 +65,11 @@ const HIDE_AFTER_MS = 2600;
 /** Extra reveal margin below the bar, px. Small enough not to catch the first line of text in mouse mode. */
 const REVEAL_MARGIN_PX = 6;
 
-const SOURCES: readonly { kind: GazeSourceKind; label: string; icon: IconName; title: string }[] = [
-  { kind: 'webcam', label: 'Eyes', icon: 'eye', title: 'Follow my eyes (webcam)' },
+const SOURCES: readonly { kind: GazeSourceKind; label: string; icon: IconName; title: string; unavailable?: boolean }[] = [
+  // The Artifact build keeps the option visible (it's the point of the app), but it only explains where to find it.
+  IS_ARTIFACT
+    ? { kind: 'webcam', label: 'Eyes', icon: 'eye', title: `Follow my eyes (webcam). ${WEBCAM_UNAVAILABLE_SHORT}`, unavailable: true }
+    : { kind: 'webcam', label: 'Eyes', icon: 'eye', title: 'Follow my eyes (webcam)' },
   { kind: 'mouse', label: 'Mouse', icon: 'mouse', title: 'Follow my mouse pointer' },
   { kind: 'simulated', label: 'Demo', icon: 'sparkle', title: 'Watch a simulated reader' },
 ];
@@ -138,8 +143,8 @@ export class Topbar implements Mountable {
             <legend class="gr-sr-only">Follow</legend>
             ${SOURCES.map(
               (s) => `
-              <label class="gr-seg__opt" title="${s.title}">
-                <input type="radio" name="${id}-source" value="${s.kind}" class="gr-sr-only" aria-label="${s.title}" />
+              <label class="gr-seg__opt" title="${s.title}"${s.unavailable ? ' data-unavailable' : ''}>
+                <input type="radio" name="${id}-source" value="${s.kind}" class="gr-sr-only" aria-label="${s.title}"${s.unavailable ? ' aria-disabled="true"' : ''} />
                 <span class="gr-seg__face">${icon(s.icon)}<span class="gr-seg__text">${s.label}</span></span>
               </label>`,
             ).join('')}
@@ -271,9 +276,18 @@ export class Topbar implements Mountable {
       // `click`, not `change`: re-picking the checked source must reach the controller,
       // because that is how the reader retries a webcam that failed to start.
       // (Arrow-key selection also fires click on the newly checked radio.)
+      const unavailable = r.getAttribute('aria-disabled') === 'true';
       r.addEventListener(
         'click',
-        () => {
+        (e) => {
+          if (unavailable) {
+            // Keep the current source checked; the controller explains why this one can't start.
+            // (Not every engine re-checks the previous radio of a canceled click, so re-sync after it.)
+            e.preventDefault();
+            this.opts.onSelectSource(r.value as GazeSourceKind);
+            setTimeout(() => this.syncSettings(this.opts.getSettings()), 0);
+            return;
+          }
           if (r.checked) this.opts.onSelectSource(r.value as GazeSourceKind);
         },
         { signal },

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import JSZip from 'jszip';
-import { describe, expect, it } from 'vitest';
-import { parseEpub, resolveZipPath } from './epub';
+import { describe, expect, it, vi } from 'vitest';
+import { MAX_ENTRY_BYTES, parseEpub, resolveZipPath } from './epub';
 
 type Files = Record<string, string>;
 
@@ -212,6 +212,21 @@ describe('parseEpub — failures', () => {
     images['OEBPS/Text/ch2.xhtml'] = xhtml('<p>   </p>');
     await expect(parseEpub(await buildEpub(images))).rejects.toMatchObject({ code: 'empty' });
   });
+
+  it('refuses a small EPUB that inflates to an absurd size, before parsing it', async () => {
+    const files = epub3();
+    files['OEBPS/Text/ch2.xhtml'] = xhtml('a'.repeat(MAX_ENTRY_BYTES + 1));
+    const zip = new JSZip();
+    zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+    for (const [path, content] of Object.entries(files)) zip.file(path, content);
+    const data = await zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE', compressionOptions: { level: 1 } });
+    expect(data.byteLength).toBeLessThan(2 * 1024 * 1024); // a small file on disk
+    const parse = vi.spyOn(DOMParser.prototype, 'parseFromString');
+    await expect(parseEpub(data)).rejects.toMatchObject({ code: 'too-large' });
+    const bigParsed = parse.mock.calls.some(([markup]) => markup.length > MAX_ENTRY_BYTES);
+    expect(bigParsed).toBe(false);
+    parse.mockRestore();
+  }, 60_000);
 });
 
 describe('resolveZipPath', () => {

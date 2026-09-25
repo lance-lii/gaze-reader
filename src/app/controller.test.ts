@@ -343,4 +343,160 @@ describe('AppController', () => {
     // …and the clock really is running again.
     await until(() => states.at(-1)?.state === 'no-face', 'no-face after a real absence', 2500);
   });
+
+  it('explains a failed "Open from URL" next to the form, where it stays (regression: an 8 s toast)', async () => {
+    document.querySelector<HTMLButtonElement>('.gr-lib-url-toggle')!.click();
+    const form = document.querySelector<HTMLFormElement>('.gr-inline-form:not([hidden])')!;
+    const input = form.querySelector('input')!;
+    input.value = 'https://example.invalid/book.epub';
+    form.requestSubmit();
+    const error = form.querySelector<HTMLElement>('.gr-field__error')!;
+    await until(() => (error.textContent ?? '') !== '', 'the inline error');
+    expect(error.textContent).toMatch(/CORS/);
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(toastText()).not.toMatch(/Couldn’t open that book/);
+  });
+
+  it('queues U pressed while a forward turn is still sliding, and undoes it when it lands (regression)', async () => {
+    let land: (() => void) | null = null;
+    let animating = false;
+    vi.spyOn(ReaderView.prototype, 'measureLayout').mockImplementation(() => layout(false));
+    vi.spyOn(ScrollController.prototype, 'atEnd').mockReturnValue(false);
+    vi.spyOn(ScrollController.prototype, 'animating', 'get').mockImplementation(() => animating);
+    vi.spyOn(ScrollController.prototype, 'turnPage').mockImplementation(() => {
+      animating = true;
+      app.bus.emit('page-turn', { from: 0, to: 836, auto: true, reason: 'line-tracker', pageIndex: 1 });
+      return new Promise<void>((resolve) => {
+        land = () => {
+          animating = false;
+          resolve();
+        };
+      });
+    });
+    const undo = vi.spyOn(ScrollController.prototype, 'undo').mockResolvedValue(true);
+    await openPastedText();
+    const scroller = document.querySelector<HTMLElement>('.gr-reader')!;
+    const key = (k: string) => scroller.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+
+    key(' ');
+    key('u'); // mid-turn
+    key('u'); // held: still only one undo
+    expect(undo).not.toHaveBeenCalled();
+    land!();
+    await until(() => undo.mock.calls.length > 0, 'the queued undo');
+    await sleep(50);
+    expect(undo).toHaveBeenCalledTimes(1);
+    expect(toastText()).not.toMatch(/no page turn to undo/);
+  });
+
+  it('forgets undo positions when the text reflows (font size), instead of jumping to unrelated text', async () => {
+    await openPastedText();
+    const clear = vi.spyOn(ScrollController.prototype, 'clearHistory');
+    app.bus.emit('settings-patch', { fontSizePx: 26 });
+    expect(clear).toHaveBeenCalled();
+    const scroller = document.querySelector<HTMLElement>('.gr-reader')!;
+    scroller.dispatchEvent(new KeyboardEvent('keydown', { key: 'u', bubbles: true, cancelable: true }));
+    await until(() => /no page turn to undo/.test(toastText()), 'the nothing-to-undo toast');
+  });
+
+  it('stops counting reading time when a mouse pointer is left resting (regression)', async () => {
+    const realNow = performance.now.bind(performance);
+    let offset = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + offset);
+    const breaks = record(app, 'break-due');
+    await openPastedText();
+    const gaze = record(app, 'gaze');
+    moveMouse(400, 300);
+    await until(() => gaze.length > 3, 'mouse samples');
+    const minutes = (): number => {
+      const session = app['session'];
+      if (!session) throw new Error('no session');
+      return session.clock.minutes;
+    };
+    // A minute later with no input, while the resting pointer still yields valid samples.
+    offset += 61_000;
+    await sleep(400);
+    const before = minutes();
+    const samples = gaze.length;
+    await sleep(700);
+    expect(gaze.length).toBeGreaterThan(samples);
+    expect(minutes()).toBe(before);
+    expect(breaks).toHaveLength(0);
+    // Moving the pointer again counts as reading.
+    moveMouse(420, 320);
+    await sleep(600);
+    expect(minutes()).toBeGreaterThan(before);
+  });
+
+  it('lands focus on "Choose a file" when the first-run intro is skipped (it opened on page load)', async () => {
+    app.destroy();
+    localStorage.removeItem('gazeReader.onboarding.v1');
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    const started = app.start();
+    await until(() => [...document.querySelectorAll('button')].some((b) => b.textContent === 'Skip intro' && !b.closest('[hidden]')), 'the intro');
+    const skip = [...document.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent === 'Skip intro' && !b.closest('[hidden]'))!;
+    skip.click();
+    await started;
+    expect(document.activeElement).toBe(document.querySelector('.gr-lib-choose'));
+  });
+
+  it('a stale "Refresh now" toast can’t stop the mouse source the reader switched to (regression)', async () => {
+    app.destroy();
+    const width = window.innerWidth;
+    saved.model = {
+      predict: () => ({ x: 500, y: 400 }),
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      trainedAt: Date.now(),
+      toJSON: () => ({ version: 1 }),
+    };
+    let running = false;
+    let emitFrame: ((f: FeatureFrame) => void) | null = null;
+    vi.spyOn(CameraFeatureSource.prototype, 'start').mockImplementation(async () => {
+      running = true;
+    });
+    vi.spyOn(CameraFeatureSource.prototype, 'stop').mockImplementation(() => {
+      running = false;
+    });
+    vi.spyOn(CameraFeatureSource.prototype, 'running', 'get').mockImplementation(() => running);
+    vi.spyOn(CameraFeatureSource.prototype, 'video', 'get').mockReturnValue(null);
+    vi.spyOn(CameraFeatureSource.prototype, 'lastLandmarks', 'get').mockReturnValue(null);
+    vi.spyOn(CameraFeatureSource.prototype, 'onError').mockImplementation(() => () => undefined);
+    vi.spyOn(CameraFeatureSource.prototype, 'onFrame').mockImplementation((cb) => {
+      emitFrame = cb;
+      return () => {
+        emitFrame = null;
+      };
+    });
+    localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false }));
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    await app.start();
+    const states = record(app, 'tracking-state');
+    await openPastedText();
+    await until(() => emitFrame !== null, 'the webcam source to subscribe');
+    await until(() => states.at(-1)?.state !== undefined && states.at(-1)?.state !== 'off', 'the webcam to run');
+    try {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: Math.round(width * 0.6) });
+      window.dispatchEvent(new Event('resize'));
+      await until(() => /Window size changed/.test(toastText()), 'the refresh suggestion');
+      const refresh = [...document.querySelectorAll<HTMLButtonElement>('.gr-toast__actions button')].find((b) => b.textContent === 'Refresh now')!;
+      const gaze = record(app, 'gaze');
+      app.bus.emit('settings-patch', { gazeSource: 'mouse' });
+      expect(toastText()).not.toMatch(/Window size changed/); // withdrawn with the webcam session
+      refresh.click(); // a click that raced the dismissal
+      moveMouse(400, 300);
+      await until(() => gaze.some((g) => g.source === 'mouse'), 'mouse samples');
+      await sleep(100);
+      const count = gaze.length;
+      moveMouse(420, 310);
+      await until(() => gaze.length > count, 'more mouse samples');
+      expect(states.at(-1)?.state).not.toBe('off');
+      expect(document.querySelector('.gr-pill')!.textContent).not.toMatch(/Camera off/);
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
+    }
+  });
 });

@@ -140,7 +140,13 @@ function decodeFragment(fragment: string): string {
 
 /** ASCII tab/newline are removed anywhere by the URL parser; C0 controls and spaces are trimmed. */
 function compactUrl(raw: string): string {
-  return raw.replace(/[\t\n\r]/g, '').replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '');
+  const s = raw.replace(/[\t\n\r]/g, '');
+  // Loops, not an end-anchored regex: that backtracks quadratically on a long run of spaces.
+  let a = 0;
+  let e = s.length;
+  while (a < e && s.charCodeAt(a) <= 0x20) a++;
+  while (e > a && s.charCodeAt(e - 1) <= 0x20) e--;
+  return s.slice(a, e);
 }
 
 function isSameDocument(url: URL, base: URL): boolean {

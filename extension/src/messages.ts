@@ -97,6 +97,12 @@ export interface PageState {
   paused: boolean;
   fps: number | null;
   detail: string | null;
+  /**
+   * The page has no measurable text (a canvas or image reader), so Gaze Reader
+   * watches the bottom edge instead of the lines. Optional: older content
+   * scripts still running in a tab don't send it.
+   */
+  pageMode?: boolean;
 }
 
 // ─────────────────────────────────── Guards ──────────────────────────────────
@@ -266,7 +272,8 @@ export function isPageState(x: unknown): x is PageState {
     isBool(x.calibrated) &&
     isBool(x.paused) &&
     (x.fps === null || (isFiniteNum(x.fps) && x.fps >= 0)) &&
-    (x.detail === null || typeof x.detail === 'string')
+    (x.detail === null || typeof x.detail === 'string') &&
+    (x.pageMode === undefined || isBool(x.pageMode))
   );
 }
 
@@ -286,6 +293,16 @@ export const PAGE_OFF: Readonly<PageState> = Object.freeze({
   fps: null,
   detail: null,
 });
+
+/**
+ * Why a running camera stopped. Chrome ends the video track when the reader
+ * revokes (or resets) the camera permission, and the tracker can't tell that
+ * from another app taking the camera. The permission state can: without a
+ * grant the fix is the setup page, not "Try again".
+ */
+export function cameraLossCode(code: TrackerErrorCode, permission: PermissionState | 'unknown'): TrackerErrorCode {
+  return permission === 'denied' || permission === 'prompt' ? 'camera-denied' : code;
+}
 
 /** Best-effort extraction of a message from anything thrown. */
 export function errorMessage(err: unknown): string {

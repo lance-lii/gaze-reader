@@ -121,8 +121,26 @@ export function resolveZipPath(baseDir: string, href: string): string {
 
 // ─────────────────────────────── ZIP access ────────────────────────────────
 
+/**
+ * MAX_BOOK_BYTES limits the ZIP; a 2 MB EPUB can still inflate to 500 MB (deflate reaches
+ * ~1000:1), which would freeze and then crash the tab. These cap what is unpacked instead.
+ */
+export const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
+export const MAX_INFLATED_BYTES = 256 * 1024 * 1024;
+
+/** Public JSZip API (async() is built on it) that jszip's index.d.ts leaves out. */
+interface StreamableEntry {
+  internalStream(type: 'uint8array'): JSZip.JSZipStreamHelper<Uint8Array>;
+}
+
+function damagedEntry(cause: unknown): BookLoadError {
+  return new BookLoadError('parse', 'This file isn’t a readable EPUB (part of its ZIP container is damaged).', { cause });
+}
+
 class EpubArchive {
   private readonly lower = new Map<string, JSZip.JSZipObject>();
+  /** Bytes inflated so far for this book, across entries. */
+  private inflated = 0;
 
   constructor(private readonly zip: JSZip) {
     zip.forEach((path, file) => {
@@ -142,7 +160,53 @@ class EpubArchive {
   async text(path: string): Promise<string | null> {
     const file = this.entry(path);
     if (!file) return null;
-    return decodeText(await file.async('uint8array'));
+    return decodeText(await this.inflate(file));
+  }
+
+  /** Inflates one entry, stopping as soon as it (or the book so far) passes the caps. */
+  private inflate(file: JSZip.JSZipObject): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      let settled = false;
+      let stream: JSZip.JSZipStreamHelper<Uint8Array>;
+      try {
+        stream = (file as unknown as StreamableEntry).internalStream('uint8array');
+      } catch (err) {
+        reject(damagedEntry(err));
+        return;
+      }
+      stream
+        .on('data', (chunk) => {
+          if (settled) return;
+          size += chunk.byteLength;
+          this.inflated += chunk.byteLength;
+          if (size > MAX_ENTRY_BYTES || this.inflated > MAX_INFLATED_BYTES) {
+            settled = true;
+            stream.pause();
+            reject(new BookLoadError('too-large', 'This EPUB unpacks to far more text than a book holds, so Gaze Reader can’t open it.'));
+            return;
+          }
+          chunks.push(chunk);
+        })
+        .on('error', (err) => {
+          if (settled) return;
+          settled = true;
+          reject(damagedEntry(err));
+        })
+        .on('end', () => {
+          if (settled) return;
+          settled = true;
+          const out = new Uint8Array(size);
+          let offset = 0;
+          for (const c of chunks) {
+            out.set(c, offset);
+            offset += c.byteLength;
+          }
+          resolve(out);
+        })
+        .resume();
+    });
   }
 
   paths(): string[] {

@@ -323,6 +323,18 @@ describe('ScrollController — undo, back and teardown', () => {
     expect(await controller.undo()).toBe(false);
   });
 
+  it('forgets undo records after a reflow but keeps the session statistics', async () => {
+    const { scroller, controller } = setup({ scrollDurationMs: 0 });
+    scroller.setScroll(1000);
+    await controller.turnPage(null, -1, { auto: true, reason: 'glance-down' });
+    const after = scroller.scrollTop;
+    controller.clearHistory();
+    expect(controller.pagesTurned).toBe(1);
+    expect(await controller.undo()).toBe(false);
+    expect(scroller.scrollTop).toBe(after);
+    expect(controller.pagesTurned).toBe(1);
+  });
+
   it('keeps at most 20 turns to undo', async () => {
     const { controller } = setup({ scrollDurationMs: 0 }, { scrollHeight: 1_000_000 });
     for (let i = 0; i < 25; i++) await controller.turnPage(null, -1, { auto: true, reason: 'x' });

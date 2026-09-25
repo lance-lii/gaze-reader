@@ -69,8 +69,11 @@ async function check(): Promise<void> {
 }
 
 async function onPermissionState(state: PermissionState): Promise<void> {
-  if (state === 'granted') await granted();
-  else if (state === 'denied') show('denied');
+  if (state === 'granted') return granted();
+  // Revoked while this page is open: the next grant must be announced again, or the
+  // tabs waiting for it would never hear about it.
+  announcedGrant = false;
+  if (state === 'denied') show('denied');
   else show('prompt');
 }
 
@@ -144,7 +147,7 @@ function show(view: View, detail?: string): void {
       title = 'All set!';
       body =
         (returnTabId !== null
-          ? 'Head back to your page: Gaze Reader starts the camera and a quick calibration.'
+          ? 'Head back to your page: Gaze Reader starts the camera and a one-minute calibration.'
           : 'Turn Gaze Reader on from the toolbar button on any page you want to read.') + (detail ? ` ${detail}` : '');
       visible.add(ui.back);
       ui.back.textContent = back;

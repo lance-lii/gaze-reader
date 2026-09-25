@@ -1,6 +1,8 @@
 import { DEFAULT_SETTINGS } from '../core/settings';
+import { IS_ARTIFACT } from '../core/target';
 import type { AppSettings, EventBus, Mountable } from '../types';
 import { SETTINGS_GROUPS, resetPatch, type SettingControl } from '../app/logic';
+import { fullAppLinkHtml, WEBCAM_UNAVAILABLE_SHORT, WEBCAM_UNAVAILABLE_TEXT } from './fullApp';
 import { ModalLayer, dialogHeader } from './helpDialog';
 import { icon } from './topbar';
 
@@ -16,6 +18,14 @@ export interface SettingsPanelOptions {
 }
 
 type Updater = (s: AppSettings) => void;
+
+/** Artifact build: stands in for the calibration buttons and says where eye tracking lives. */
+function artifactTrackingNote(): HTMLElement {
+  const note = document.createElement('p');
+  note.className = 'gr-artifact-note';
+  note.innerHTML = `${WEBCAM_UNAVAILABLE_TEXT} ${fullAppLinkHtml()}`;
+  return note;
+}
 
 const CONFIRM_WINDOW_MS = 4000;
 
@@ -37,7 +47,8 @@ export class SettingsPanel implements Mountable {
   private readonly opts: SettingsPanelOptions;
   private readonly layer: ModalLayer;
   private readonly updaters: Updater[] = [];
-  private readonly forgetBtn: HTMLButtonElement;
+  /** Null in the Artifact build, which has no calibration to forget. */
+  private readonly forgetBtn: HTMLButtonElement | null;
   private readonly offSettings: () => void;
   private readonly confirmTimers = new Map<HTMLButtonElement, ReturnType<typeof setTimeout>>();
   private readonly statusTimers = new Map<HTMLElement, ReturnType<typeof setTimeout>>();
@@ -65,8 +76,12 @@ export class SettingsPanel implements Mountable {
       h.id = `${uid}-${group.id}`;
       h.textContent = group.title;
       section.appendChild(h);
-      for (const control of group.controls) section.appendChild(this.renderControl(control, uid));
-      if (group.id === 'tracking') section.appendChild(this.renderCalibrationActions());
+      for (const control of group.controls) {
+        // No camera in the Artifact build, so no camera preview either.
+        if (IS_ARTIFACT && control.key === 'showCameraPreview') continue;
+        section.appendChild(this.renderControl(control, uid));
+      }
+      if (group.id === 'tracking') section.appendChild(IS_ARTIFACT ? artifactTrackingNote() : this.renderCalibrationActions());
       body.appendChild(section);
     }
 
@@ -87,7 +102,7 @@ export class SettingsPanel implements Mountable {
     body.appendChild(footer);
     surface.appendChild(body);
 
-    this.forgetBtn = surface.querySelector<HTMLButtonElement>('.gr-settings__forget')!;
+    this.forgetBtn = surface.querySelector<HTMLButtonElement>('.gr-settings__forget');
     this.offSettings = opts.bus.on('settings-changed', ({ settings }) => this.update(settings));
     this.update(opts.getSettings());
   }
@@ -117,7 +132,7 @@ export class SettingsPanel implements Mountable {
   /** Re-sync every control from settings (does not emit events). */
   update(s: AppSettings): void {
     for (const u of this.updaters) u(s);
-    this.forgetBtn.disabled = !this.opts.hasSavedCalibration();
+    if (this.forgetBtn) this.forgetBtn.disabled = !this.opts.hasSavedCalibration();
   }
 
   destroy(): void {
@@ -253,6 +268,11 @@ export class SettingsPanel implements Mountable {
           input.name = id;
           input.value = String(o.value);
           input.className = 'gr-sr-only';
+          if (IS_ARTIFACT && c.key === 'gazeSource' && o.value === 'webcam') {
+            input.disabled = true;
+            opt.dataset.unavailable = '';
+            opt.title = WEBCAM_UNAVAILABLE_SHORT;
+          }
           input.addEventListener('change', () => {
             if (input.checked) bus.emit('settings-patch', patchOf(c.key, o.value));
           });

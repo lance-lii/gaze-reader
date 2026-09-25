@@ -14,6 +14,8 @@ export const KEYS = {
   calibration: 'gr.calibration.v1',
   /** Date.now() of the last time the setup page obtained camera permission. */
   cameraGrantedAt: 'gr.cameraGrantedAt',
+  /** Extension-only settings (not part of the app's AppSettings): see ExtSettings. */
+  extSettings: 'gr.ext.v1',
 } as const;
 
 export interface StorageAreaLike {
@@ -133,6 +135,52 @@ export function syncSettings(opts: {
     offBus();
     storage.onChanged.removeListener(onChange);
   };
+}
+
+// ───────────────────────── Extension-only settings ───────────────────────────
+
+/**
+ * How a page turn moves the page.
+ *  - `auto`: scroll, except in page mode (a canvas/image reader with no text
+ *    lines to measure) on a page that doesn't scroll, where the next-page key is sent;
+ *  - `scroll`: always scroll the page's main scroller;
+ *  - `keys`: always send ArrowRight + PageDown to the page, as if pressed.
+ */
+export type PageTurnMethod = 'auto' | 'scroll' | 'keys';
+export const PAGE_TURN_METHODS: readonly PageTurnMethod[] = ['auto', 'scroll', 'keys'];
+
+export function isPageTurnMethod(x: unknown): x is PageTurnMethod {
+  return typeof x === 'string' && (PAGE_TURN_METHODS as readonly string[]).includes(x);
+}
+
+/** Settings only the extension has. Stored under KEYS.extSettings, beside the shared AppSettings record. */
+export interface ExtSettings {
+  pageTurn: PageTurnMethod;
+}
+
+export const DEFAULT_EXT_SETTINGS: Readonly<ExtSettings> = Object.freeze({ pageTurn: 'auto' });
+
+/** Anything stored (or nothing) → valid ExtSettings; unknown values fall back to the defaults. */
+export function parseExtSettings(x: unknown): ExtSettings {
+  const r = x && typeof x === 'object' && !Array.isArray(x) ? (x as Record<string, unknown>) : {};
+  return { pageTurn: isPageTurnMethod(r.pageTurn) ? r.pageTurn : DEFAULT_EXT_SETTINGS.pageTurn };
+}
+
+export async function loadExtSettings(area: StorageAreaLike): Promise<ExtSettings> {
+  try {
+    return parseExtSettings((await area.get([KEYS.extSettings]))[KEYS.extSettings]);
+  } catch {
+    return { ...DEFAULT_EXT_SETTINGS };
+  }
+}
+
+export async function saveExtSettings(area: StorageAreaLike, settings: ExtSettings): Promise<boolean> {
+  try {
+    await area.set({ [KEYS.extSettings]: parseExtSettings(settings) });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ──────────────────────────────── Calibration ────────────────────────────────

@@ -359,8 +359,52 @@ describe('BlinkGate', () => {
     expect(gate.update(0, 0.6, 0.18)).toBe(true); // start of an episode: could be a blink
     expect(gate.update(500, 0.6, 0.18)).toBe(false); // sustained with open-enough lids → lowered lids
     expect(gate.update(533, 0.6, 0.04)).toBe(true); // lids shut despite a moderate score
-    expect(gate.update(566, 0.6, Number.NaN)).toBe(false); // aperture unknown → the score rule alone
+    expect(gate.update(566, 0.6, Number.NaN)).toBe(true); // lids reopening right after the shut frame: settling
+    expect(gate.update(600, 0.6, Number.NaN)).toBe(false); // aperture unknown → the score rule alone
+    expect(gate.update(633, 0.6)).toBe(false);
+    expect(gate.update(666, 0.3, 0.02)).toBe(false); // below the score threshold the aperture is not consulted
+  });
+
+  it('keeps lids hovering around the threshold valid (hysteresis)', () => {
+    const gate = new BlinkGate();
+    let valid = 0;
+    let total = 0;
+    let seed = 7;
+    const noise = (): number => {
+      seed = (seed * 16807) % 2147483647;
+      return (seed / 2147483647 - 0.5) * 0.12; // ±0.06
+    };
+    for (let i = 0, t = 0; t < 3400; i++, t += 33) {
+      const score = (i % 2 === 0 ? 0.47 : 0.53) + noise() * 0.5;
+      const dropped = gate.update(t, score);
+      if (t >= 400) {
+        total++;
+        if (!dropped) valid++;
+      }
+    }
+    expect(valid / total).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it('does not restart the blink drop for a short dip inside a lowered-lid episode', () => {
+    const gate = new BlinkGate();
+    expect(gate.update(0, 0.6)).toBe(true);
+    expect(gate.update(450, 0.6)).toBe(false);
+    expect(gate.update(483, 0.45)).toBe(false);
+    expect(gate.update(516, 0.45)).toBe(false);
+    expect(gate.update(549, 0.6)).toBe(false); // same episode, no new 400 ms drop
+    expect(gate.update(582, 0.3)).toBe(false);
+    expect(gate.update(615, 0.3)).toBe(false);
+    expect(gate.update(648, 0.6)).toBe(false); // open for < releaseMs: still the same episode
+    for (let t = 681; t <= 850; t += 33) gate.update(t, 0.2); // clearly open for ≥ 150 ms
+    expect(gate.update(900, 0.6)).toBe(true); // a fresh rise from open eyes may be a blink again
+  });
+
+  it('settles after a real blink inside a lowered-lid episode', () => {
+    const gate = new BlinkGate();
+    gate.update(0, 0.6);
+    expect(gate.update(500, 0.6)).toBe(false);
+    expect(gate.update(533, 0.9)).toBe(true); // blink while looking down
+    expect(gate.update(566, 0.7)).toBe(true); // lids reopening: not gaze yet
     expect(gate.update(600, 0.6)).toBe(false);
-    expect(gate.update(633, 0.3, 0.02)).toBe(false); // below the score threshold the aperture is not consulted
   });
 });

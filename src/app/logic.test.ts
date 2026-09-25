@@ -9,6 +9,7 @@ import {
   SHORTCUTS,
   TrackingStateMachine,
   calibrationFitsViewport,
+  calibrationOriginFits,
   cameraErrorInfo,
   computeWpm,
   errorMessage,
@@ -347,6 +348,40 @@ describe('reading time, progress and WPM', () => {
     expect(m.wordsAdvanced).toBeCloseTo(500);
   });
 
+  it('ProgressMeter holds the reading rate steady between page turns', () => {
+    const clock = new ReadingClock();
+    const m = new ProgressMeter(10_000);
+    let t = 0;
+    clock.tick(t, true);
+    m.update(0.1, clock.minutes);
+    const rate = () => computeWpm(m.wordsAdvanced, m.minutesAtLastAdvance);
+    // First page: 60 s of reading, then a turn adds 250 words.
+    for (let i = 0; i < 60; i++) {
+      t += 1000;
+      clock.tick(t, true);
+      m.update(0.1, clock.minutes);
+    }
+    t += 1000;
+    clock.tick(t, true);
+    m.update(0.125, clock.minutes);
+    const atTurn = rate();
+    expect(atTurn).not.toBeNull();
+    // Reading the next page: the clock runs on, the fraction doesn't change, the rate holds.
+    for (let i = 0; i < 45; i++) {
+      t += 1000;
+      clock.tick(t, true);
+      m.update(0.125, clock.minutes);
+      expect(rate()).toBe(atTurn);
+    }
+    // The next turn counts the time spent on that page.
+    t += 1000;
+    clock.tick(t, true);
+    m.update(0.15, clock.minutes);
+    expect(m.minutesAtLastAdvance).toBeCloseTo(clock.minutes, 9);
+    expect(rate()).toBe(Math.round(m.wordsAdvanced / clock.minutes));
+    expect(rate()).not.toBe(atTurn);
+  });
+
   it('ProgressMeter is safe with a zero word count', () => {
     const m = new ProgressMeter(0);
     m.update(0);
@@ -519,10 +554,35 @@ describe('small helpers', () => {
     expect(calibrationFitsViewport({ width: Number.NaN, height: 900 }, { width: 1440, height: 900 })).toBe(false);
   });
 
+  it('calibrationOriginFits flags a viewport that moved inside the window (fullscreen, toolbars)', () => {
+    expect(calibrationOriginFits(110, 110, 41.8)).toBe(true);
+    expect(calibrationOriginFits(110, 125, 41.8)).toBe(true); // within half a line
+    expect(calibrationOriginFits(110, 0, 41.8)).toBe(false); // F11: toolbar gone
+    expect(calibrationOriginFits(0, 110, 41.8)).toBe(false); // left fullscreen
+    expect(calibrationOriginFits(85, 115, 41.8)).toBe(false); // bookmarks bar ≈ 0.7 lines
+    expect(calibrationOriginFits(85, 115, 80)).toBe(true); // big text: still within half a line
+    // Unknown pitch: a fixed 20 px tolerance.
+    expect(calibrationOriginFits(85, 100, null)).toBe(true);
+    expect(calibrationOriginFits(85, 110)).toBe(false);
+    // Old models and iframes: nothing to compare.
+    expect(calibrationOriginFits(null, 0, 41.8)).toBe(true);
+    expect(calibrationOriginFits(undefined, 0, 41.8)).toBe(true);
+    expect(calibrationOriginFits(110, null, 41.8)).toBe(true);
+  });
+
   it('resolveTheme', () => {
     expect(resolveTheme('auto', true)).toBe('dark');
     expect(resolveTheme('auto', false)).toBe('light');
     expect(resolveTheme('sepia', true)).toBe('sepia');
+  });
+
+  it('resolveTheme lets auto follow a host stamp, never an explicit choice', () => {
+    expect(resolveTheme('auto', true, 'light')).toBe('light');
+    expect(resolveTheme('auto', false, 'dark')).toBe('dark');
+    expect(resolveTheme('auto', true, null)).toBe('dark');
+    expect(resolveTheme('sepia', false, 'dark')).toBe('sepia');
+    expect(resolveTheme('light', true, 'dark')).toBe('light');
+    expect(resolveTheme('dark', false, 'light')).toBe('dark');
   });
 
   it('previewCorner avoids Dewey', () => {
@@ -575,6 +635,12 @@ describe('small helpers', () => {
 
 describe('settings schema', () => {
   const controls = SETTINGS_GROUPS.flatMap((g) => g.controls);
+
+  it('names the auto-scroll toggle and the turn animation plainly', () => {
+    const byKey = (key: string) => controls.find((c) => c.key === key)!;
+    expect(byKey('autoScroll').label).toBe('Auto-scroll');
+    expect(byKey('scrollDurationMs').label.toLowerCase()).not.toContain('speed');
+  });
 
   it('binds every AppSettings field exactly once', () => {
     const keys = controls.map((c) => c.key).sort();

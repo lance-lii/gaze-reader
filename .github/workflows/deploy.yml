@@ -29,6 +29,8 @@ jobs:
       - run: npm run build
       # The Chrome extension shares most of its code with the app; make sure it still packages.
       - run: npm run build:ext
+      # The claude.ai Artifact build must keep passing its CSP and size checks.
+      - run: npm run build:artifact
       - uses: actions/configure-pages@v6
         if: github.event_name != 'pull_request'
       - uses: actions/upload-pages-artifact@v5

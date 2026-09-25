@@ -1,6 +1,8 @@
 import { IGNORE_ATTR, Z } from '../core/constants';
+import { IS_ARTIFACT } from '../core/target';
 import type { BookFormat, CommandName, Mountable } from '../types';
 import { formatMinutes, formatPercent, minutesLeft, normalizeUrl, relativeTime, TYPICAL_WPM } from '../app/logic';
+import { fullAppLinkHtml } from './fullApp';
 import { icon } from './topbar';
 
 /** A saved book as listed by `listBooks()` in src/reader/library.ts. */
@@ -92,6 +94,7 @@ export class LibraryScreen implements Mountable {
     urlInput: HTMLInputElement;
     pasteError: HTMLElement;
     urlError: HTMLElement;
+    fileError: HTMLElement;
     busy: HTMLElement;
     busyLabel: HTMLElement;
     recentSection: HTMLElement;
@@ -120,7 +123,11 @@ export class LibraryScreen implements Mountable {
           <p class="gr-hero__kicker">${icon('eye')}<span>Hands-free reading</span></p>
           <h1 class="gr-hero__title" id="${uid}-hero">Your eyes <span class="gr-hero__ink">turn the page.</span></h1>
           <p class="gr-hero__lead">Gaze Reader follows your eyes with your webcam and turns the page when you reach the bottom. Dewey, the little fellow in the corner, reads along.</p>
-          <p class="gr-privacy-note">${icon('shield')}<span>Everything runs on this device. Video never leaves your browser.</span></p>
+          ${
+            IS_ARTIFACT
+              ? `<p class="gr-privacy-note">${icon('sparkle')}<span>This embedded version can’t use your camera, so a demo reader or your mouse stands in for your eyes. For hands-free reading, ${fullAppLinkHtml('open the full app')}.</span></p>`
+              : `<p class="gr-privacy-note">${icon('shield')}<span>Everything runs on this device. Video never leaves your browser.</span></p>`
+          }
         </section>
 
         <section class="gr-open" aria-labelledby="${uid}-open">
@@ -136,6 +143,7 @@ export class LibraryScreen implements Mountable {
             </div>
             <input type="file" class="gr-sr-only" tabindex="-1" aria-hidden="true" accept="${ACCEPT}" />
             <div class="gr-drop__busy" hidden><span class="gr-spinner" aria-hidden="true"></span><span class="gr-drop__busy-label" role="status" aria-live="polite"></span></div>
+            <p class="gr-field__error gr-drop__error" id="${uid}-file-error" role="alert"></p>
           </div>
 
           <form class="gr-inline-form" id="${uid}-paste" hidden novalidate>
@@ -147,7 +155,7 @@ export class LibraryScreen implements Mountable {
               <span class="gr-field__label">Text</span>
               <textarea class="gr-input gr-input--area" name="text" rows="7" placeholder="Paste an article, a chapter, or your own writing."></textarea>
             </label>
-            <p class="gr-field__error" role="alert"></p>
+            <p class="gr-field__error" id="${uid}-paste-error" role="alert"></p>
             <div class="gr-inline-form__actions">
               <button type="submit" class="gr-btn gr-btn--primary">Start reading</button>
               <button type="button" class="gr-btn gr-btn--ghost" data-cancel>Cancel</button>
@@ -160,7 +168,7 @@ export class LibraryScreen implements Mountable {
               <input type="url" class="gr-input" name="url" inputmode="url" autocomplete="url" placeholder="https://example.com/book.epub" />
             </label>
             <p class="gr-field__hint">Works with text, Markdown, HTML, EPUB and PDF files on sites that allow downloads from other pages.</p>
-            <p class="gr-field__error" role="alert"></p>
+            <p class="gr-field__error" id="${uid}-url-error" role="alert"></p>
             <div class="gr-inline-form__actions">
               <button type="submit" class="gr-btn gr-btn--primary">Open</button>
               <button type="button" class="gr-btn gr-btn--ghost" data-cancel>Cancel</button>
@@ -206,6 +214,7 @@ export class LibraryScreen implements Mountable {
       urlInput: urlForm.querySelector('input')!,
       pasteError: pasteForm.querySelector('.gr-field__error')!,
       urlError: urlForm.querySelector('.gr-field__error')!,
+      fileError: q('.gr-drop__error'),
       busy: q('.gr-drop__busy'),
       busyLabel: q('.gr-drop__busy-label'),
       recentSection: shelves[0]!,
@@ -213,6 +222,8 @@ export class LibraryScreen implements Mountable {
       samplesList: q('.gr-cards--samples'),
       samplesStatus: q('.gr-shelf__status'),
     };
+    // Cross-origin fetches are blocked inside an Artifact frame, so opening a URL can't work there.
+    if (IS_ARTIFACT) this.ui.urlToggle.hidden = true;
     this.bindEvents();
     this.setSamples({ status: 'loading' });
   }
@@ -238,8 +249,33 @@ export class LibraryScreen implements Mountable {
     this.ui.choose.focus({ preventScroll: true });
   }
 
+  /** Focuses the recent card at `index` (clamped); falls back to the primary action when the shelf is empty. */
+  focusRecent(index: number): void {
+    const cards = this.ui.recentList.querySelectorAll<HTMLElement>('.gr-card__main');
+    const target = cards[Math.min(Math.max(0, index), cards.length - 1)];
+    if (target) target.focus({ preventScroll: false });
+    else this.focusPrimary();
+  }
+
+  /**
+   * Shows why an open failed next to the control that started it (the URL or paste form, or the
+   * drop zone for files), where it stays until the reader edits the field or tries again.
+   */
+  showOpenError(target: 'url' | 'paste' | 'file', message: string): void {
+    const ui = this.ui;
+    if (target === 'file') {
+      ui.fileError.textContent = message;
+      return;
+    }
+    const [error, field] = target === 'url' ? [ui.urlError, ui.urlInput] : [ui.pasteError, ui.pasteText];
+    error.textContent = message;
+    field.setAttribute('aria-invalid', 'true');
+    field.setAttribute('aria-describedby', error.id);
+  }
+
   setBusy(label: string | null): void {
     const busy = label !== null;
+    if (busy) this.ui.fileError.textContent = '';
     this.ui.busy.hidden = !busy;
     this.ui.busyLabel.textContent = label ?? '';
     this.el.toggleAttribute('aria-busy', busy);
@@ -435,7 +471,14 @@ export class LibraryScreen implements Mountable {
       },
       { signal },
     );
-    ui.pasteText.addEventListener('input', () => (ui.pasteError.textContent = ''), { signal });
+    ui.pasteText.addEventListener(
+      'input',
+      () => {
+        ui.pasteError.textContent = '';
+        ui.pasteText.removeAttribute('aria-invalid');
+      },
+      { signal },
+    );
 
     ui.urlForm.addEventListener(
       'submit',
@@ -452,7 +495,14 @@ export class LibraryScreen implements Mountable {
       },
       { signal },
     );
-    ui.urlInput.addEventListener('input', () => (ui.urlError.textContent = ''), { signal });
+    ui.urlInput.addEventListener(
+      'input',
+      () => {
+        ui.urlError.textContent = '';
+        ui.urlInput.removeAttribute('aria-invalid');
+      },
+      { signal },
+    );
   }
 
   /** Clears and collapses the inline forms (after a successful open). */
@@ -461,6 +511,9 @@ export class LibraryScreen implements Mountable {
     this.ui.urlForm.reset();
     this.ui.pasteError.textContent = '';
     this.ui.urlError.textContent = '';
+    this.ui.fileError.textContent = '';
+    this.ui.pasteText.removeAttribute('aria-invalid');
+    this.ui.urlInput.removeAttribute('aria-invalid');
     this.setFormOpen(this.ui.pasteToggle, this.ui.pasteForm, false);
     this.setFormOpen(this.ui.urlToggle, this.ui.urlForm, false);
   }

@@ -316,6 +316,20 @@ describe('PageEndDetector', () => {
     expect(off.run(3000, below, null)).toBeNull();
   });
 
+  it('ignores a look at the keyboard mid-page when the tracker is sure the reader is above', () => {
+    const lookDown = { x: 500, y: viewport.bottom + 0.5 * (viewport.bottom - viewport.top) };
+    // Mid-page: the tracker keeps line 8 with high confidence while the eyes are on the desk.
+    const mid = new Rig();
+    expect(mid.run(3000, lookDown, estimate(8, { p: 0.9, fix: 30 }))).toBeNull();
+    // The same look from the last two lines is a deliberate glance.
+    for (const at of [L, L - 1]) {
+      const rig = new Rig();
+      expect(rig.run(3000, lookDown, estimate(at, { p: 0.9, fix: 30 }))?.d.reason).toBe('glance-down');
+    }
+    // No estimate at all (the extension's page mode) still fires.
+    expect(new Rig().run(3000, lookDown, null)?.d.reason).toBe('glance-down');
+  });
+
   it('respects the cooldown after any scroll', () => {
     const rig = new Rig();
     rig.enter(L);

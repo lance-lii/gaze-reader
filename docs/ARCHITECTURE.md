@@ -5,7 +5,8 @@ the webcam while you read and **turns the page — scrolls — when you reach th
 **Dewey**, a tiny nerd avatar, sits in the corner reading along with you.
 
 Everything runs locally. Video never leaves the device. The only network fetch is the
-MediaPipe face-landmarker model file (data, ~3.6 MB, cached by the browser).
+MediaPipe face-landmarker model file (data, ~3.6 MB, cached by the browser; the web app has no
+offline mode, so the webcam needs a connection the first time it starts in a tab).
 
 ```
  camera ─► FaceLandmarker ─► EyeFeatures ─► GazeModel (ridge regression, calibrated)
@@ -168,7 +169,7 @@ export function deserializeGazeModel(json: SerializedGazeModel): GazeModel | nul
 export function saveCalibration(model: GazeModel): void;   // writeJSON('calibration.v1', …)
 export function loadCalibration(): GazeModel | null;
 export function clearCalibration(): void;
-export function qualityFromError(errorPx: number, viewportHeight: number): CalibrationQuality;
+export function qualityFromError(errorPx: number, viewportHeight: number, linePitchPx?: number): CalibrationQuality; // pitch default 41.8 px
 ```
 Model: standardize features (z-score from training data), expand with degree-2 terms for the
 strongest gaze features (iris u/v, lookUp/Down) plus linear head pose, then two independent ridge
@@ -546,3 +547,28 @@ boundaries:
   warning each time.
 * The extension keeps pause per tab and uses `Alt+Shift+<key>` shortcuts on web pages. It stores
   `extDevicePixelRatio` with the calibration so that one model works at any site zoom.
+* Extension **page mode** (`extension/src/pageMode.ts`) handles pages without measurable text
+  (canvas and image readers). `PageModeMonitor` switches a tab's session to page mode when fewer
+  than 3 readable lines (≥ 8 chars) have been measured in and within half a screen of the view for
+  2 s, and back as soon as 3 are in view. It polls on the session's 1 s tick while text is scarce.
+  In page mode the layout is `buildPseudoLayout`: evenly spaced pseudo-lines over the largest
+  canvas or image in view, or a central column. The PageEndDetector gets `estimate: null`, so only
+  glance-down and bottom-dwell can fire. Page turns follow the extension-only setting
+  `gr.ext.v1.pageTurn` (`auto | scroll | keys`, not part of `AppSettings`): `resolvePageTurn`
+  scrolls in text mode, and in page mode it scrolls when the scroller can move at least half a
+  screen. Otherwise `pressPageKeys` dispatches ArrowRight + PageDown (or ArrowLeft + PageUp)
+  keydown/keyup to the focused element. Those events are untrusted, so this is best effort. In
+  page mode, `findPageModeScroller` also considers the box around the page picture.
+  `PageState.pageMode` tells the popup.
+* When a running camera stops, the offscreen document checks the camera permission before
+  reporting why (`cameraLossCode`). Revoking the permission ends the track, which otherwise looks
+  like `camera-in-use`. The setup page announces a new grant again if the permission was revoked
+  while it was open.
+* A second build target, `artifact` (`npm run build:artifact`), runs the app inside a claude.ai
+  Artifact frame. `__GR_TARGET__` is a Vite `define` read only through `src/core/target.ts`
+  (`IS_ARTIFACT`), so each build tree-shakes the other's code. In the artifact build the MediaPipe
+  import, the camera bring-up and the preloads are dead code; `gazeSource` defaults to
+  `simulated` and `sanitizeSettings` refuses `webcam`; the pdf.js worker is a published file named
+  by a document-relative URL; and `HostThemeWatcher` (`src/app/hostTheme.ts`) lets "auto" follow
+  the host's `data-theme` stamp while telling it apart from the app's own writes.
+  `scripts/artifact-html.mjs` assembles and checks the content-only page.

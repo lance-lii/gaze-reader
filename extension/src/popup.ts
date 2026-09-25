@@ -7,11 +7,17 @@ import {
   KEYS,
   chromeLocalStorage,
   clearCalibrationJSON,
+  isPageTurnMethod,
   loadCalibrationJSON,
+  loadExtSettings,
   loadSettings,
   makeOrigin,
+  parseExtSettings,
+  saveExtSettings,
   syncSettings,
   watchKey,
+  type ExtSettings,
+  type PageTurnMethod,
 } from './extStorage';
 import {
   PAGE_OFF,
@@ -24,11 +30,19 @@ import {
 } from './messages';
 
 const POLL_MS = 1_000;
+/** How long "Click again to forget" waits for the second click. */
+const FORGET_CONFIRM_MS = 4_000;
 
 const SENSITIVITY_HINT: Record<Sensitivity, string> = {
   relaxed: 'Waits until you have clearly finished',
   balanced: 'Turns soon after your last line',
   eager: 'Turns the moment you reach the end',
+};
+
+const PAGE_TURN_HINT: Record<PageTurnMethod, string> = {
+  auto: "Scrolls, or presses the next-page key on book readers that don't scroll",
+  scroll: 'Always scrolls the page',
+  keys: 'Presses → and Page Down for the page (some sites ignore it)',
 };
 
 /** Pages Chrome never lets extensions script. */
@@ -60,6 +74,7 @@ async function main(): Promise<void> {
     notice: el<HTMLParagraphElement>('notice'),
     calibration: el<HTMLParagraphElement>('calibration'),
     sensitivityHint: el<HTMLSpanElement>('sensitivity-hint'),
+    pageTurnHint: el<HTMLSpanElement>('page-turn-hint'),
     buddy: el<HTMLInputElement>('buddy'),
     gazeDot: el<HTMLInputElement>('gaze-dot'),
     recalibrate: el<HTMLButtonElement>('recalibrate'),
@@ -76,6 +91,7 @@ async function main(): Promise<void> {
   syncSettings({ bus, store, storage, origin: makeOrigin('popup') });
 
   let calibrated = (await loadCalibrationJSON(storage.area)) !== null;
+  let ext: ExtSettings = await loadExtSettings(storage.area);
   let page: PageState = PAGE_OFF;
   let busy = false;
   /** Bumped by every on/off request, so a poll that was already in flight can't overwrite its answer. */
@@ -83,6 +99,41 @@ async function main(): Promise<void> {
   let notice: { text: string; tone: 'info' | 'error' } | null = restricted ? { text: restricted, tone: 'info' } : null;
 
   const patch = (p: Partial<AppSettings>) => bus.emit('settings-patch', p);
+
+  // "Forget calibration" wipes it in every tab, with no undo: the first click only arms it.
+  let forgetArmed = false;
+  let forgetTimer: ReturnType<typeof setTimeout> | undefined;
+  const disarmForget = (): void => {
+    clearTimeout(forgetTimer);
+    forgetArmed = false;
+  };
+  const forget = document.createElement('button');
+  forget.type = 'button';
+  forget.className = 'link';
+  forget.addEventListener('click', () => {
+    if (forgetArmed) {
+      disarmForget();
+      const hadFocus = document.activeElement === forget;
+      void clearCalibrationJSON(storage.area).then(() => {
+        calibrated = false;
+        render();
+        // The button just left the page; hand focus to the natural next step, not <body>.
+        if (hadFocus && !ui.recalibrate.disabled) ui.recalibrate.focus();
+      });
+      return;
+    }
+    forgetArmed = true;
+    forgetTimer = setTimeout(() => {
+      forgetArmed = false;
+      render();
+    }, FORGET_CONFIRM_MS);
+    render();
+  });
+  forget.addEventListener('blur', () => {
+    if (!forgetArmed) return;
+    disarmForget();
+    render();
+  });
 
   function render(): void {
     const s = store.get();
@@ -101,25 +152,19 @@ async function main(): Promise<void> {
     for (const r of radios('source')) r.checked = r.value === (webcam ? 'webcam' : 'mouse');
     for (const r of radios('sensitivity')) r.checked = r.value === s.sensitivity;
     ui.sensitivityHint.textContent = SENSITIVITY_HINT[s.sensitivity];
+    for (const r of radios('page-turn')) r.checked = r.value === ext.pageTurn;
+    ui.pageTurnHint.textContent = PAGE_TURN_HINT[ext.pageTurn];
     ui.buddy.checked = s.buddyEnabled;
     ui.gazeDot.checked = s.showGazeDot;
 
     ui.calibration.hidden = !webcam;
-    ui.calibration.replaceChildren();
+    if (!calibrated && forgetArmed) disarmForget(); // cleared elsewhere: don't come back armed
+    forget.textContent = forgetArmed ? 'Click again to forget' : 'Forget calibration';
     if (calibrated) {
-      const forget = document.createElement('button');
-      forget.type = 'button';
-      forget.className = 'link';
-      forget.textContent = 'Forget it';
-      forget.addEventListener('click', () => {
-        void clearCalibrationJSON(storage.area).then(() => {
-          calibrated = false;
-          render();
-        });
-      });
-      ui.calibration.append('Calibrated on this computer. ', forget);
+      // Kept across polls (not rebuilt), so keyboard focus stays on the button.
+      if (forget.parentElement !== ui.calibration) ui.calibration.replaceChildren('Calibrated on this computer. ', forget);
     } else {
-      ui.calibration.append("You'll do a 30-second calibration the first time.");
+      ui.calibration.replaceChildren("You'll do a one-minute calibration the first time.");
     }
 
     ui.recalibrate.disabled = busy || !webcam || restricted !== null || tabId === undefined;
@@ -182,6 +227,14 @@ async function main(): Promise<void> {
       if (r.checked && (r.value === 'relaxed' || r.value === 'balanced' || r.value === 'eager')) patch({ sensitivity: r.value });
     });
   }
+  for (const r of radios('page-turn')) {
+    r.addEventListener('change', () => {
+      if (!r.checked || !isPageTurnMethod(r.value)) return;
+      ext = { ...ext, pageTurn: r.value };
+      render();
+      void saveExtSettings(storage.area, ext);
+    });
+  }
   ui.buddy.addEventListener('change', () => patch({ buddyEnabled: ui.buddy.checked }));
   ui.gazeDot.addEventListener('change', () => patch({ showGazeDot: ui.gazeDot.checked }));
 
@@ -204,6 +257,10 @@ async function main(): Promise<void> {
   });
 
   bus.on('settings-changed', render);
+  watchKey(storage, KEYS.extSettings, (value) => {
+    ext = parseExtSettings(value);
+    render();
+  });
   watchKey(storage, KEYS.calibration, (value) => {
     calibrated = value !== undefined && value !== null;
     render();
@@ -224,6 +281,8 @@ function describePage(page: PageState, restricted: boolean): ['ok' | 'warn' | 'e
     case 'calibrating':
       return ['warn', 'Calibrating…'];
     case 'tracking':
+      // Page mode: no text lines to follow here, so the bottom edge turns the page.
+      if (page.pageMode) return ['ok', mouse ? 'Following your mouse · page mode' : 'Reading along · page mode'];
       if (mouse) return ['ok', 'Following your mouse'];
       return ['ok', page.fps ? `Reading along · ${Math.round(page.fps)} fps` : 'Reading along'];
     case 'no-face':

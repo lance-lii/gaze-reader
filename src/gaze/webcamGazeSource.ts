@@ -17,6 +17,13 @@ export interface BlinkGateOptions {
    * would pass as "lowered lids". Lowered lids measure ≈ 0.12–0.2, shut < 0.08.
    */
   closedOpenness: number;
+  /**
+   * Hysteresis: a lowered-lid episode ends only once the score has stayed below this
+   * for `releaseMs`. Scores between this and `threshold` neither end nor extend it, so
+   * lids hovering near 0.5 on the last lines don't restart the blink drop every frame.
+   */
+  releaseThreshold: number;
+  releaseMs: number;
 }
 
 export const DEFAULT_BLINK_GATE: Readonly<BlinkGateOptions> = Object.freeze({
@@ -25,6 +32,8 @@ export const DEFAULT_BLINK_GATE: Readonly<BlinkGateOptions> = Object.freeze({
   maxBlinkMs: 400,
   settleMs: 50,
   closedOpenness: 0.08,
+  releaseThreshold: 0.4,
+  releaseMs: 150,
 });
 
 /**
@@ -41,6 +50,10 @@ export class BlinkGate {
   private readonly opts: BlinkGateOptions;
   private episodeStart: number | null = null;
   private lastSuppressedAt: number | null = null;
+  /** Last frame dropped because the eyes were shut (not merely inside the 400 ms window). */
+  private lastShutAt: number | null = null;
+  /** Start of the current run of clearly open lids (score < releaseThreshold). */
+  private lowSince: number | null = null;
 
   constructor(opts: Partial<BlinkGateOptions> = {}) {
     this.opts = { ...DEFAULT_BLINK_GATE, ...opts };
@@ -51,26 +64,39 @@ export class BlinkGate {
    * @returns true if the frame at `t` should be treated as a blink (invalid).
    */
   update(t: number, blink: number, openness?: number): boolean {
-    const { threshold, closedThreshold, maxBlinkMs, settleMs, closedOpenness } = this.opts;
+    const { threshold, closedThreshold, maxBlinkMs, settleMs, closedOpenness, releaseThreshold, releaseMs } = this.opts;
     const score = Number.isFinite(blink) ? blink : 0;
 
     if (score > threshold) {
+      this.lowSince = null;
       this.episodeStart ??= t;
       const shut = score >= closedThreshold || (openness !== undefined && Number.isFinite(openness) && openness < closedOpenness);
+      if (shut) this.lastShutAt = t;
       if (shut || t - this.episodeStart < maxBlinkMs) {
         this.lastSuppressedAt = t;
         return true;
       }
-      return false;
+      // Lowered lids: the settle still applies after a real blink inside the episode,
+      // so the frames where the lids are reopening don't count as gaze.
+      return this.lastShutAt !== null && t - this.lastShutAt < settleMs;
     }
 
-    this.episodeStart = null;
+    if (score < releaseThreshold) {
+      this.lowSince ??= t;
+      // The episode ends only after the lids have been clearly open for a while.
+      if (t - this.lowSince >= releaseMs) this.episodeStart = null;
+    } else {
+      // Between releaseThreshold and threshold: neither ends nor extends the episode.
+      this.lowSince = null;
+    }
     return this.lastSuppressedAt !== null && t - this.lastSuppressedAt < settleMs;
   }
 
   reset(): void {
     this.episodeStart = null;
     this.lastSuppressedAt = null;
+    this.lastShutAt = null;
+    this.lowSince = null;
   }
 }
 

@@ -5,6 +5,7 @@
   },
   "include": [
     "./src",
+    "../src/build-target.d.ts",
     "../src/types.ts",
     "../src/core/constants.ts",
     "../src/core/events.ts",

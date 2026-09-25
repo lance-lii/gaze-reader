@@ -221,7 +221,7 @@ export function statusPill(state: TrackingState, kind: GazeSourceKind | null, ca
     case 'no-face':
       return { label: 'Looking for you', tone: 'warn', description: `${cam}Your face isn't visible to the camera.` };
     case 'poor':
-      return { label: 'Low confidence', tone: 'warn', description: `${cam}Tracking is unsure: try more light or sit a little closer.` };
+      return { label: 'Low confidence', tone: 'warn', description: `${cam}Tracking is unsure: try more light on your face, about an arm’s length from the screen.` };
     case 'starting':
       return kind === 'webcam'
         ? { label: 'Starting camera', tone: 'info', description: `${cam}Getting the camera and face model ready.` }
@@ -350,24 +350,41 @@ export class ReadingClock {
 export class ProgressMeter {
   private last: number | null = null;
   private advanced = 0;
+  private minutesAtAdvance = 0;
 
   constructor(
     private readonly wordCount: number,
     private readonly maxJumpWords = 900,
   ) {}
 
-  update(fraction: number): void {
+  /**
+   * @param minutes the reading clock's active minutes now. Recorded whenever words are added,
+   * so a rate can use words and time sampled at the same moments (see minutesAtLastAdvance).
+   */
+  update(fraction: number, minutes?: number): void {
     if (!Number.isFinite(fraction)) return;
     const f = clamp01(fraction);
     if (this.last !== null && Number.isFinite(this.wordCount) && this.wordCount > 0) {
       const words = (f - this.last) * this.wordCount;
-      if (words > 0 && words <= this.maxJumpWords) this.advanced += words;
+      if (words > 0 && words <= this.maxJumpWords) {
+        this.advanced += words;
+        if (minutes !== undefined && Number.isFinite(minutes)) this.minutesAtAdvance = minutes;
+      }
     }
     this.last = f;
   }
 
   get wordsAdvanced(): number {
     return this.advanced;
+  }
+
+  /**
+   * Active minutes at the last forward advance. Words only advance at page turns while the
+   * clock runs continuously, so dividing by the live clock would make the rate (and "N min
+   * left") drift through every page and jump at each turn.
+   */
+  get minutesAtLastAdvance(): number {
+    return this.minutesAtAdvance;
   }
 }
 
@@ -628,7 +645,7 @@ export function cameraErrorInfo(code: TrackerErrorCode): CameraErrorInfo {
     case 'model-load-failed':
       return {
         title: "Couldn't load the face model",
-        message: "It's downloaded once (about 4 MB) and then cached. Check your connection and try again.",
+        message: 'The webcam needs a connection the first time it starts in a tab (the model is about 4 MB; the browser caches it). Check your connection and try again.',
         buddyLine: "The face model didn't arrive. Maybe the network is napping?",
         retryable: true,
       };
@@ -660,12 +677,39 @@ export function calibrationFitsViewport(
   return ok(trained.width, current.width) && ok(trained.height, current.height);
 }
 
+/** Chrome-height change (CSS px) tolerated when the line pitch is unknown. */
+export const ORIGIN_TOLERANCE_PX = 20;
+
+/**
+ * The calibration maps gaze to screen px and assumes the viewport sits at the same place inside
+ * the window. Entering or leaving fullscreen, or toggling the bookmarks bar, moves it by the
+ * toolbar height with the window origin unchanged, which shifts every prediction by lines.
+ * False when the browser chrome above the viewport changed by more than half a line.
+ * Unknown values (old models, iframes) always fit.
+ */
+export function calibrationOriginFits(
+  trainedTop: number | null | undefined,
+  currentTop: number | null | undefined,
+  pitchPx?: number | null,
+): boolean {
+  if (trainedTop == null || currentTop == null) return true;
+  if (!Number.isFinite(trainedTop) || !Number.isFinite(currentTop)) return true;
+  const tolerance = pitchPx != null && Number.isFinite(pitchPx) && pitchPx > 0 ? 0.5 * pitchPx : ORIGIN_TOLERANCE_PX;
+  return Math.abs(currentTop - trainedTop) <= tolerance;
+}
+
 // ─────────────────────────────── Theme & layout ─────────────────────────────
 
 export type ResolvedTheme = 'light' | 'sepia' | 'dark';
 
-export function resolveTheme(theme: Theme, prefersDark: boolean): ResolvedTheme {
-  return theme === 'auto' ? (prefersDark ? 'dark' : 'light') : theme;
+/**
+ * The theme to paint. "auto" follows the host page's explicit choice when there
+ * is one (the Artifact frame stamps data-theme on the root), else the system.
+ * An explicit app choice always wins.
+ */
+export function resolveTheme(theme: Theme, prefersDark: boolean, hostTheme: 'light' | 'dark' | null = null): ResolvedTheme {
+  if (theme !== 'auto') return theme;
+  return hostTheme ?? (prefersDark ? 'dark' : 'light');
 }
 
 /** The camera preview sits in the bottom corner Dewey isn't using. */
@@ -806,7 +850,7 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
     id: 'turning',
     title: 'Page turning',
     controls: [
-      { kind: 'toggle', key: 'autoScroll', label: 'Turn pages automatically' },
+      { kind: 'toggle', key: 'autoScroll', label: 'Auto-scroll', hint: 'Turn the page when you reach the bottom. While reading, P pauses and resumes.' },
       {
         kind: 'choice',
         key: 'sensitivity',
@@ -832,7 +876,8 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
       {
         kind: 'range',
         key: 'scrollDurationMs',
-        label: 'Page-turn speed',
+        label: 'Page-turn animation',
+        hint: 'How long each turn takes to scroll. Instant jumps straight there.',
         min: 0,
         max: 1500,
         step: 50,

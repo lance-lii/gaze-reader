@@ -1,5 +1,6 @@
 import type { FaceLandmarkerOptions, FilesetResolver } from '@mediapipe/tasks-vision';
 import { FACE_LANDMARKER_MODEL_URL, MEDIAPIPE_WASM_DIR } from '../core/constants';
+import { IS_ARTIFACT } from '../core/target';
 import type { FeatureFrame, FeatureSource, Unsubscribe } from '../types';
 import {
   cameraSupportError,
@@ -11,6 +12,7 @@ import {
   type OpenCameraOptions,
 } from './camera';
 import { extractEyeFeatures, frameQuality, type BlendshapeLike, type LandmarkLike } from './features';
+import { blockMediapipeTelemetry } from './mediapipeTelemetry';
 
 export { TrackerError } from './camera';
 
@@ -167,8 +169,11 @@ export function createLandmarkerLoader(importVision: () => Promise<VisionModuleL
     } catch (err) {
       throw new TrackerError('model-load-failed', "Couldn't load the face-tracking runtime.", { cause: err });
     }
-    const make = (delegate: Delegate): Promise<FaceLandmarkerLike> =>
-      vision.FaceLandmarker.createFromOptions(fileset, landmarkerOptions(cfg.modelAssetPath, delegate));
+    const make = (delegate: Delegate): Promise<FaceLandmarkerLike> => {
+      // Covers injected loaders too: no landmarker is built without the telemetry guard.
+      if (!IS_ARTIFACT) blockMediapipeTelemetry();
+      return vision.FaceLandmarker.createFromOptions(fileset, landmarkerOptions(cfg.modelAssetPath, delegate));
+    };
 
     try {
       return new ManagedLandmarker(await make(cfg.delegate), cfg.delegate, () => make('CPU'));
@@ -205,7 +210,14 @@ export function createLandmarkerLoader(importVision: () => Promise<VisionModuleL
   };
 }
 
-const defaultLoader = createLandmarkerLoader(() => import('@mediapipe/tasks-vision'));
+// The Artifact build can't load MediaPipe (its CSP blocks the model and the WASM),
+// so it leaves the library out altogether: the constant branch tree-shakes the import.
+const defaultLoader = createLandmarkerLoader(() =>
+  IS_ARTIFACT
+    ? Promise.reject(new TrackerError('model-load-failed', 'Face tracking isn’t part of this version of Gaze Reader.'))
+    : // MediaPipe's built-in usage logging would POST to Google every minute; refuse it first.
+      (blockMediapipeTelemetry(), import('@mediapipe/tasks-vision')),
+);
 
 function defaultWasmBaseUrl(): string {
   const base = typeof document !== 'undefined' ? document.baseURI : globalThis.location?.href;

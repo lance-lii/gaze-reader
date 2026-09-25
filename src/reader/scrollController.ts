@@ -244,6 +244,15 @@ export class ScrollController {
   }
 
   /**
+   * Forgets undo records; call when the text reflows (font size, column width, window width),
+   * because their pixel offsets no longer point at the same text. Session statistics
+   * (pagesTurned, lastTurnAt) are kept.
+   */
+  clearHistory(): void {
+    this.undoStack.length = 0;
+  }
+
+  /**
    * Animated scroll to `top` (clamped). Resolves when the animation ends or is
    * interrupted — never rejects. Duration defaults to settings.scrollDurationMs.
    */
