@@ -15,6 +15,8 @@ export class RemoteTrackerError extends Error {
   }
 }
 
+export const DEFAULT_START_TIMEOUT_MS = 75_000;
+
 export type RemoteSourceState =
   | 'idle'
   /** Opening the port to the service worker. */
@@ -41,7 +43,11 @@ export interface RemoteFeatureSourceOptions {
   isContextValid?: () => boolean;
   /** Local clock. Default: performance.now. */
   now?: () => number;
-  /** start() rejects if the camera isn't running after this long. Default 60 s (first run downloads the model). */
+  /**
+   * start() rejects if the camera isn't running after this long. Default 75 s:
+   * the first run downloads the model, and the offscreen document's own 60 s
+   * model timeout should win the race, since its error says what went wrong.
+   */
   startTimeoutMs?: number;
   reconnectInitialMs?: number;
   reconnectMaxMs?: number;
@@ -139,7 +145,7 @@ export class RemoteFeatureSource implements FeatureSource {
     this.connectFn = opts.connect ?? (() => chrome.runtime.connect({ name: PORT_TAB }));
     this.isContextValid = opts.isContextValid ?? extensionContextValid;
     this.now = opts.now ?? (() => performance.now());
-    this.startTimeoutMs = opts.startTimeoutMs ?? 60_000;
+    this.startTimeoutMs = opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
     this.reconnectInitialMs = opts.reconnectInitialMs ?? 200;
     this.reconnectMaxMs = opts.reconnectMaxMs ?? 5_000;
     this.random = opts.random ?? Math.random;

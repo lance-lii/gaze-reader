@@ -20,6 +20,7 @@ import {
   lastFullyVisibleIndex,
   minutesLeft,
   normalizeUrl,
+  pillAlwaysVisible,
   previewCorner,
   relativeTime,
   resetPatch,
@@ -29,6 +30,7 @@ import {
   shortcutFor,
   shouldIgnoreShortcut,
   statusPill,
+  textEndsOnScreen,
   trackerErrorCode,
   type TrackingContext,
 } from './logic';
@@ -124,6 +126,22 @@ describe('TrackingStateMachine', () => {
     expect(m.evaluate(t, running()).state).toBe('tracking');
   });
 
+  it('does not flag a dip while the reader finishes a page (lowered lids), only a sustained one', () => {
+    const m = new TrackingStateMachine();
+    m.reset(0);
+    let t = feed(m, 0, 4000, true, 0.9);
+    // Reading the last two lines: the blink score rises and quality sags for a couple of seconds.
+    t = feed(m, t, t + 2000, true, 0.12);
+    expect(m.smoothedConfidence).toBeLessThan(0.3);
+    expect(m.evaluate(t, running()).state).toBe('tracking');
+    // The page turns, the eyes go back up, confidence recovers: it never showed.
+    t = feed(m, t, t + 1500, true, 0.9);
+    expect(m.evaluate(t, running()).state).toBe('tracking');
+    // Bad light is different: it stays low, and after a few seconds the reader hears about it.
+    t = feed(m, t, t + 4000, true, 0.12);
+    expect(m.evaluate(t, running()).state).toBe('poor');
+  });
+
   it('smooths confidence so a single bad frame does not flip the state', () => {
     const m = new TrackingStateMachine();
     m.reset(0);
@@ -193,6 +211,34 @@ describe('statusPill', () => {
     expect(statusPill('error', 'webcam', false).tone).toBe('bad');
     expect(statusPill('paused', 'webcam', true).tone).toBe('idle');
   });
+
+  it('only says "camera" while starting the webcam (regression)', () => {
+    expect(statusPill('starting', 'webcam', false).label).toBe('Starting camera');
+    for (const kind of ['mouse', 'simulated'] as const) {
+      const v = statusPill('starting', kind, false);
+      expect(v.label).toBe('Starting');
+      expect(`${v.label} ${v.description}`).not.toMatch(/camera/i);
+    }
+  });
+});
+
+describe('pillAlwaysVisible', () => {
+  it('keeps the pill up whenever the camera is on (privacy)', () => {
+    for (const s of ['tracking', 'no-face', 'poor', 'starting', 'calibrating', 'paused'] as const) {
+      expect(pillAlwaysVisible(s, 'webcam', true)).toBe(true);
+    }
+  });
+
+  it('keeps it up for the demo, and when pages are not turning (regression: paused in mouse mode)', () => {
+    expect(pillAlwaysVisible('tracking', 'simulated', false)).toBe(true);
+    expect(pillAlwaysVisible('paused', 'mouse', false)).toBe(true);
+    expect(pillAlwaysVisible('error', null, false)).toBe(true);
+  });
+
+  it('lets it hide with the bar otherwise', () => {
+    expect(pillAlwaysVisible('tracking', 'mouse', false)).toBe(false);
+    expect(pillAlwaysVisible('off', null, false)).toBe(false);
+  });
 });
 
 function line(i: number, docTop: number, fullyVisible = true): TextLine {
@@ -243,6 +289,25 @@ describe('resumeLineIndex', () => {
     const bad = [line(0, Number.NaN), line(1, 1300)];
     expect(resumeLineIndex(bad, 1200, Number.NaN)).toBe(1);
     expect(resumeLineIndex([line(0, 1200.5), line(1, 1240)], 1200, 0)).toBe(1);
+  });
+
+  it('textEndsOnScreen trusts the measured text bottom when it is known (regression: last page)', () => {
+    // Book text ends at y=700 in a reader whose viewport ends at y=900: nothing left to turn to.
+    expect(textEndsOnScreen(lines, 900, 700)).toBe(true);
+    expect(textEndsOnScreen(lines, 900, 900.5)).toBe(true);
+    // Text continues below the fold even though every *measured* line is visible.
+    expect(textEndsOnScreen(lines, 900, 1400)).toBe(false);
+    // Scrolled into the padding past the text: still the end.
+    expect(textEndsOnScreen([], 900, -200)).toBe(true);
+  });
+
+  it('textEndsOnScreen falls back to the layout when the text bottom is unknown', () => {
+    // The layout spans half a viewport below the fold, so a fully visible last line means the end.
+    expect(textEndsOnScreen(lines, 900, null)).toBe(true);
+    expect(textEndsOnScreen([...lines, line(5, 1320, false)], 900, null)).toBe(false);
+    expect(textEndsOnScreen([], 900, null)).toBe(false);
+    expect(textEndsOnScreen(lines, 900, Number.NaN)).toBe(true);
+    expect(textEndsOnScreen([line(0, 0, false)], Number.NaN, 100)).toBe(false);
   });
 
   it('finds first / last fully visible lines', () => {
@@ -474,6 +539,18 @@ describe('small helpers', () => {
     expect(normalizeUrl('data:text/plain,hi')).toBeNull();
     expect(normalizeUrl('not a url')).toBeNull();
     expect(normalizeUrl('')).toBeNull();
+  });
+
+  it('normalizeUrl reads "host:port" as a host, not a scheme (regression)', () => {
+    expect(normalizeUrl('example.com:8080/book.md')).toBe('https://example.com:8080/book.md');
+    // Local servers get http, which is what they almost always speak.
+    expect(normalizeUrl('localhost:5173/samples/a.md')).toBe('http://localhost:5173/samples/a.md');
+    expect(normalizeUrl('localhost/a.txt')).toBe('http://localhost/a.txt');
+    expect(normalizeUrl('127.0.0.1:8000/a.txt')).toBe('http://127.0.0.1:8000/a.txt');
+    // Still no way to smuggle a non-http scheme in.
+    expect(normalizeUrl('javascript:1')).toBeNull();
+    expect(normalizeUrl('mailto:dewey@example.com')).toBeNull();
+    expect(normalizeUrl('localhostile')).toBeNull();
   });
 
   it('formatPercent / formatMinutes / relativeTime', () => {

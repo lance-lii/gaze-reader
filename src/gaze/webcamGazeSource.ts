@@ -10,6 +10,13 @@ export interface BlinkGateOptions {
   maxBlinkMs: number;
   /** Frames right after a blink are suppressed too: the iris landmark lags the lid. */
   settleMs: number;
+  /**
+   * Lid aperture (EyeFeatures.openness, / eye width) below which the eyes count
+   * as closed while the blink score is above `threshold`. Some faces never
+   * reach `closedThreshold` with their eyes shut; without this a long closure
+   * would pass as "lowered lids". Lowered lids measure ≈ 0.12–0.2, shut < 0.08.
+   */
+  closedOpenness: number;
 }
 
 export const DEFAULT_BLINK_GATE: Readonly<BlinkGateOptions> = Object.freeze({
@@ -17,6 +24,7 @@ export const DEFAULT_BLINK_GATE: Readonly<BlinkGateOptions> = Object.freeze({
   closedThreshold: 0.85,
   maxBlinkMs: 400,
   settleMs: 50,
+  closedOpenness: 0.08,
 });
 
 /**
@@ -27,7 +35,7 @@ export const DEFAULT_BLINK_GATE: Readonly<BlinkGateOptions> = Object.freeze({
  * the gaze exactly when the reader reaches the last lines of the page, which is
  * when page turning needs it most. A blink is short (100–400 ms), so a
  * moderate score that persists is treated as lowered lids and let through,
- * while a near-closed score is always dropped.
+ * while a near-closed score or a collapsed lid aperture is always dropped.
  */
 export class BlinkGate {
   private readonly opts: BlinkGateOptions;
@@ -38,14 +46,18 @@ export class BlinkGate {
     this.opts = { ...DEFAULT_BLINK_GATE, ...opts };
   }
 
-  /** @returns true if the frame at `t` should be treated as a blink (invalid). */
-  update(t: number, blink: number): boolean {
-    const { threshold, closedThreshold, maxBlinkMs, settleMs } = this.opts;
+  /**
+   * @param openness lid aperture / eye width (EyeFeatures.openness); optional.
+   * @returns true if the frame at `t` should be treated as a blink (invalid).
+   */
+  update(t: number, blink: number, openness?: number): boolean {
+    const { threshold, closedThreshold, maxBlinkMs, settleMs, closedOpenness } = this.opts;
     const score = Number.isFinite(blink) ? blink : 0;
 
     if (score > threshold) {
       this.episodeStart ??= t;
-      if (score >= closedThreshold || t - this.episodeStart < maxBlinkMs) {
+      const shut = score >= closedThreshold || (openness !== undefined && Number.isFinite(openness) && openness < closedOpenness);
+      if (shut || t - this.episodeStart < maxBlinkMs) {
         this.lastSuppressedAt = t;
         return true;
       }
@@ -116,8 +128,9 @@ export class WebcamGazeSource implements GazeSource {
     this.getModel = opts.getModel;
     this.filter = new OneEuroFilter2D(opts.filter);
     this.blinkGate = new BlinkGate(opts.blink);
-    this.resetAfterInvalidMs = opts.resetAfterInvalidMs ?? 300;
-    this.maxOffscreen = opts.maxOffscreenViewports ?? 1;
+    // NaN would silently disable the reset, or reject every sample; Infinity is a valid "never".
+    this.resetAfterInvalidMs = nonNegativeOr(opts.resetAfterInvalidMs, 300);
+    this.maxOffscreen = nonNegativeOr(opts.maxOffscreenViewports, 1);
     this.now = opts.now ?? (() => performance.now());
   }
 
@@ -175,9 +188,14 @@ export class WebcamGazeSource implements GazeSource {
       this.blinkGate.reset();
       return null;
     }
-    if (this.blinkGate.update(t, f.blink)) return null;
+    if (this.blinkGate.update(t, f.blink, f.openness)) return null;
 
-    const model = this.getModel();
+    let model: GazeModel | null;
+    try {
+      model = this.getModel();
+    } catch {
+      model = null; // still exactly one (invalid) sample for this frame
+    }
     if (model !== this.lastModel) {
       // A new calibration maps features differently; don't smooth across it.
       this.lastModel = model;
@@ -234,6 +252,10 @@ export class WebcamGazeSource implements GazeSource {
       }
     }
   }
+}
+
+function nonNegativeOr(value: number | undefined, fallback: number): number {
+  return value !== undefined && value >= 0 ? value : fallback;
 }
 
 /** Where stale coordinates point before the first valid sample: the viewport center. */

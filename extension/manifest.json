@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Gaze Reader — eye-tracking auto-scroll",
   "short_name": "Gaze Reader",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Turns the page when your eyes reach the bottom. Webcam eye tracking that stays on your device, plus Dewey, a reading buddy.",
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "scripting", "storage", "offscreen"],

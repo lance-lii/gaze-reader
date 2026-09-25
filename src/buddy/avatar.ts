@@ -123,6 +123,8 @@ export function createAvatar(doc: Document, uid: string): AvatarParts {
     s('linearGradient', { id: id('cover'), x1: 0, y1: 0, x2: 0, y2: 1 }, [stop(0, '#a3434f'), stop(1, '#772e3a')]),
     s('linearGradient', { id: id('pageL'), x1: 0, y1: 0, x2: 1, y2: 0 }, [stop(0, '#fffdf7'), stop(1, '#ebdfc9')]),
     s('linearGradient', { id: id('pageR'), x1: 1, y1: 0, x2: 0, y2: 0 }, [stop(0, '#fffdf7'), stop(1, '#ebdfc9')]),
+    // The turning page is darker at the spine so the flip reads even at 120 px.
+    s('linearGradient', { id: id('pageFlip'), x1: 0, y1: 0, x2: 1, y2: 0 }, [stop(0, '#e6d8bb'), stop(0.55, '#f8f0de'), stop(1, '#fffaf0')]),
     // One tile = one colored diamond; the gaps between tiles form the second
     // diamond color, and the tile diagonals are the classic overcheck lines.
     s(
@@ -165,7 +167,7 @@ export function createAvatar(doc: Document, uid: string): AvatarParts {
     line('M60 119.8 L60 137.2', C.spine, 0.9),
     // The page that flips on every page turn (hidden until animated).
     s('g', { class: `${B}-flip` }, [
-      s('path', { d: RIGHT_PAGE, fill: '#fffaf0', stroke: C.pageEdge, 'stroke-width': 0.8, 'stroke-linejoin': 'round' }),
+      s('path', { d: RIGHT_PAGE, fill: url('pageFlip'), stroke: C.spine, 'stroke-width': 0.9, 'stroke-linejoin': 'round' }),
       ...pageLines('R', 3, false),
       s('path', { class: `${B}-flip-shade`, d: RIGHT_PAGE, fill: '#cdbd9f' }),
     ]),
@@ -289,8 +291,10 @@ export function createAvatar(doc: Document, uid: string): AvatarParts {
   const head = s('g', { class: `${B}-head` }, [
     // Hair volume behind the head, with side tufts.
     s('ellipse', { cx: 60, cy: 38, rx: 31, ry: 22, fill: url('hair') }),
-    inked('M33 50 C25 47 22.5 39 26 33 C27 38.5 30 41.5 34.5 42.5 Z', url('hair'), 1.4),
-    inked('M87 50 C95 47 97.5 39 94 33 C93 38.5 90 41.5 85.5 42.5 Z', url('hair'), 1.4),
+    // Messy flicks over the ears (one extra on the right: nobody's hair is symmetric).
+    inked('M31.5 41.5 C27.5 42 24.8 44.5 23.6 48.6 C26.6 47.4 29.6 47.9 32.6 50.6 Z', url('hair'), 1.4),
+    inked('M88.5 41.5 C92.5 42 95.2 44.5 96.4 48.6 C93.4 47.4 90.4 47.9 87.4 50.6 Z', url('hair'), 1.4),
+    inked('M88 31.5 C92 29.6 95.2 30.4 97.2 33 C94.2 33.1 91.6 34.2 89.6 36.4 Z', url('hair'), 1.3),
     // Ears.
     s('ellipse', { cx: 29.5, cy: 61, rx: 5, ry: 7, fill: url('skin'), stroke: C.ink, 'stroke-width': 1.5 }),
     s('ellipse', { cx: 90.5, cy: 61, rx: 5, ry: 7, fill: url('skin'), stroke: C.ink, 'stroke-width': 1.5 }),
@@ -321,11 +325,11 @@ export function createAvatar(doc: Document, uid: string): AvatarParts {
       line('M69 62.5 Q74 56 79 62.5', C.ink, 2.1),
     ]),
     glasses,
-    // Messy mop with a fringe of tufts.
+    // Messy mop; the fringe stays above the brows so they can do their job.
     inked(
-      'M29.5 52 C27 38 33 26 44 20.5 C51 17 57 16.5 62 16.5 C75 17 86 23 90 34 C92 40 91.5 46 90.5 52 ' +
-        'C88.5 47.5 86.5 44 83.5 41.5 L82 44.5 C79.5 40.5 75.5 38.5 71 38 L68.5 41.5 C65.5 38 60.5 37 55.5 38 ' +
-        'L52 41.5 C49 39 44 38.5 40 40.5 L36.5 45.5 C33.5 47 31 49.5 29.5 52 Z',
+      'M29.5 50 C27 37 33 25.5 44 20 C51 16.5 57 16 62 16 C75 16.5 86 22.5 90 33.5 C92 39.5 91.5 45 90.5 50 ' +
+        'C89 45 87 41.5 84.5 39.5 L83 41.5 C80.5 38 76.5 36 72 35.5 L70 38.5 C66.5 35 61 34 56 35 ' +
+        'L53 38.5 C50 36 45 35.5 41 37 L37.5 42 C33.5 44 31 46.5 29.5 50 Z',
       url('hair'),
       1.7,
     ),
@@ -335,8 +339,8 @@ export function createAvatar(doc: Document, uid: string): AvatarParts {
       inked('M57 18 C55 11 58.5 5.5 65.5 4.5 C62.5 7.5 61.5 11 63 17 Z', url('hair'), 1.5),
       inked('M63 17.5 C64 12.5 67.5 10 71 10.5 C68.5 12.5 67 15 67 18 Z', url('hair'), 1.3),
     ]),
-    line('M38.5 47 Q45 43.8 52.5 46', C.hairDark, 2.4, { class: `${B}-brow ${B}-brow--l` }),
-    line('M67.5 46 Q75 43.8 81.5 47', C.hairDark, 2.4, { class: `${B}-brow ${B}-brow--r` }),
+    line('M38.5 46.5 Q45 43.2 52.5 45.5', C.hairDark, 2.5, { class: `${B}-brow ${B}-brow--l` }),
+    line('M67.5 45.5 Q75 43.2 81.5 46.5', C.hairDark, 2.5, { class: `${B}-brow ${B}-brow--r` }),
   ]);
 
   // ── effects living inside the SVG ─────────────────────────────────────────

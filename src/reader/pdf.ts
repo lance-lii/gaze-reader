@@ -56,6 +56,13 @@ const median = (values: number[]): number => {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 };
 
+/** Math.max/min over a mapped array without spreading it (huge pages would overflow the stack). */
+function extremum<T>(items: readonly T[], value: (item: T) => number, pick: (a: number, b: number) => number, empty: number): number {
+  let out = empty;
+  for (const item of items) out = pick(out, value(item));
+  return out;
+}
+
 const percentile = (values: number[], q: number): number => {
   if (values.length === 0) return NaN;
   const s = [...values].sort((a, b) => a - b);
@@ -120,7 +127,7 @@ function pagePieces(page: PdfPageText): Piece[] {
       if (text) {
         pieces.push({
           x0: group[0].x,
-          x1: Math.max(...group.map((g) => g.x + g.width)),
+          x1: extremum(group, (g) => g.x + g.width, Math.max, -Infinity),
           y: row.y,
           size: row.size,
           text,
@@ -193,7 +200,7 @@ function pageLines(page: PdfPageText, pageIndex: number): Line[] {
   const left = pieces.filter((p) => p.x1 <= gutter);
   const right = pieces.filter((p) => p.x0 >= gutter);
   const spanning = pieces.filter((p) => p.x0 < gutter && p.x1 > gutter);
-  const columnTop = Math.min(...[...left, ...right].map((p) => p.y));
+  const columnTop = Math.min(extremum(left, (p) => p.y, Math.min, Infinity), extremum(right, (p) => p.y, Math.min, Infinity));
   return [
     ...mergePiecesIntoLines(spanning.filter((p) => p.y < columnTop), pageIndex, -1),
     ...mergePiecesIntoLines(left, pageIndex, 0),
@@ -202,7 +209,13 @@ function pageLines(page: PdfPageText, pageIndex: number): Line[] {
   ];
 }
 
-const BARE_PAGE_NUMBER = /^(?:page\s+)?(?:\d{1,4}|[ivxlcdm]{1,7})(?:\s*(?:of|\/)\s*\d{1,4})?$|^[-–—]\s*\d{1,4}\s*[-–—]$/i;
+/**
+ * A folio: "12", "Page 12 of 300", "– 12 –", or front-matter Roman numerals — only
+ * well-formed ones, so a lone word such as "civil", "mild" or "vivid" at the edge of a
+ * page is never mistaken for a page number.
+ */
+const BARE_PAGE_NUMBER =
+  /^(?:page\s+)?(?:\d{1,4}|(?=[ivxl])(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3}))(?:\s*(?:of|\/)\s*\d{1,4})?$|^[-–—]\s*\d{1,4}\s*[-–—]$/i;
 
 /**
  * Removes running heads/feet and page numbers. Candidates are the top/bottom two
@@ -262,8 +275,8 @@ function dropRunningHeads(pagesLines: Line[][], pages: readonly PdfPageText[]): 
 }
 
 function joinLineText(a: string, b: string): string {
-  if (/\p{L}[-­]$/u.test(a) && /^\p{Ll}/u.test(b)) return a.slice(0, -1) + b; // "recon-" + "struction"
-  if (/­$/.test(a)) return a.slice(0, -1) + b;
+  if (/\p{L}[-\u00ad]$/u.test(a) && /^\p{Ll}/u.test(b)) return a.slice(0, -1) + b; // "recon-" + "struction"
+  if (/\u00ad$/.test(a)) return a.slice(0, -1) + b;
   if (/[—–/]$/.test(a) || /^[—–]/.test(b)) return a + b;
   return `${a} ${b}`;
 }
@@ -357,7 +370,7 @@ export function reconstructBlocks(pages: readonly PdfPageText[]): PdfBlock[] {
   const blocks: PdfBlock[] = [];
   for (const group of groups) {
     const text = group.map((l) => l.text).reduce(joinLineText);
-    const size = Math.max(...group.map((l) => l.size));
+    const size = extremum(group, (l) => l.size, Math.max, 0);
     const larger = size >= m.body * 1.18 && text.length <= 200;
     const chapterLine = group.length === 1 && matchChapterLine(text) !== null;
     if (larger || chapterLine) {

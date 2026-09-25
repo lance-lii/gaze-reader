@@ -31,13 +31,21 @@ function install(): ContentHandle {
   let queue: Promise<void> = Promise.resolve();
   let shutDown = false;
 
+  // The runtime *this* copy was born with. After an extension reload its id
+  // disappears, whatever the global `chrome` refers to by then.
+  const runtime = chrome.runtime;
   const storage = chromeLocalStorage();
 
-  const notifyServiceWorker = (enabled: boolean) => {
+  /** Fire-and-forget. sendMessage throws synchronously once the extension context is gone. */
+  const tell = (msg: RuntimeRequest) => {
     if (!extensionContextValid()) return;
-    const msg: RuntimeRequest = { type: 'page-status', enabled };
-    chrome.runtime.sendMessage(msg).catch(() => undefined);
+    try {
+      chrome.runtime.sendMessage(msg).catch(() => undefined);
+    } catch {
+      /* extension reloaded mid-call */
+    }
   };
+  const notifyServiceWorker = (enabled: boolean) => tell({ type: 'page-status', enabled });
 
   /** Brings the session in line with `wanted`. Serialized, so rapid on/off/on can't interleave. */
   const reconcile = (): Promise<void> => {
@@ -48,10 +56,7 @@ function install(): ContentHandle {
             storage,
             connectPort: () => chrome.runtime.connect({ name: PORT_TAB }),
             isContextValid: extensionContextValid,
-            openSetup: () => {
-              const msg: RuntimeRequest = { type: 'open-setup' };
-              chrome.runtime.sendMessage(msg).catch(() => undefined);
-            },
+            openSetup: () => tell({ type: 'open-setup' }),
             onEnded: (reason) => {
               wanted = false;
               void reconcile();
@@ -99,22 +104,27 @@ function install(): ContentHandle {
     }
   };
 
+  // Coming back from the back/forward cache counts as a navigation, which
+  // clears the toolbar badge, but this page's session is still running.
+  const onPageShow = (e: PageTransitionEvent) => {
+    if (e.persisted && session) notifyServiceWorker(true);
+  };
+
   function shutdown(): void {
     if (shutDown) return;
     shutDown = true;
     wanted = false;
     void reconcile();
+    window.removeEventListener('pageshow', onPageShow);
     try {
-      chrome.runtime.onMessage.removeListener(onMessage);
+      runtime.onMessage.removeListener(onMessage);
     } catch {
       /* context already gone */
     }
   }
 
-  chrome.runtime.onMessage.addListener(onMessage);
-  // Check the runtime object *this* copy was born with: once its extension
-  // context is invalidated, its id disappears, whatever `chrome` means later.
-  const runtime = chrome.runtime;
+  runtime.onMessage.addListener(onMessage);
+  window.addEventListener('pageshow', onPageShow);
   const isAlive = () => {
     try {
       return !shutDown && typeof runtime.id === 'string';

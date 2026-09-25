@@ -4,6 +4,7 @@ import type { FeatureFrame, FeatureSource, Unsubscribe } from '../types';
 import {
   cameraSupportError,
   openCamera,
+  settleWithin,
   toTrackerError,
   TrackerError,
   type CameraHandle,
@@ -79,8 +80,9 @@ class ManagedLandmarker implements LandmarkerHandle {
 
   detect(input: TexImageSource, timeMs: number): FaceResultLike {
     if (this.closed) throw new Error('The face landmarker has been closed.');
-    const rounded = Number.isFinite(timeMs) ? Math.round(timeMs) : -Infinity;
-    const ts = Math.max(rounded, this.lastTimestamp + 1);
+    const wanted = Number.isFinite(timeMs) ? Math.round(timeMs) : 0;
+    // Never hand MediaPipe a non-finite or negative time, even on the first call.
+    const ts = Math.max(wanted, this.lastTimestamp + 1, 0);
     this.lastTimestamp = ts;
     try {
       const result = this.inner.detectForVideo(input, ts);
@@ -225,12 +227,19 @@ export function loadFaceLandmarker(cfg: LandmarkerConfig): Promise<LandmarkerHan
 
 /**
  * Starts downloading and compiling the model ahead of time (e.g. while the
- * onboarding screen explains the camera) so start() is quick. Never rejects.
+ * onboarding screen explains the camera) so start() is quick. Never rejects or
+ * throws; resolves false if the model can't be loaded.
  */
 export function preloadFaceLandmarker(
   opts: Pick<CameraFeatureSourceOptions, 'wasmBaseUrl' | 'modelAssetPath' | 'delegate'> = {},
 ): Promise<boolean> {
-  return defaultLoader.load(resolveLandmarkerConfig(opts)).then(
+  let cfg: LandmarkerConfig;
+  try {
+    cfg = resolveLandmarkerConfig(opts);
+  } catch {
+    return Promise.resolve(false); // no usable base URL for the default WASM path (e.g. about:blank)
+  }
+  return defaultLoader.load(cfg).then(
     () => true,
     () => false,
   );
@@ -250,6 +259,9 @@ const WATCHDOG_IDLE_MS = 250;
 const DRIVER_STALL_MS = 500;
 const MODEL_LOAD_TIMEOUT_MS = 60_000;
 const FPS_ALPHA = 0.1;
+/** Frame-interval bounds for the fps estimate: a 240 Hz ceiling, and one stall can't dominate it for long. */
+const MIN_FRAME_INTERVAL_MS = 1000 / 240;
+const MAX_FRAME_INTERVAL_MS = 1000;
 
 type Cancel = () => void;
 
@@ -313,9 +325,15 @@ type TrackProcessorCtor = new (init: { track: MediaStreamTrack; maxBufferSize?: 
 
 /**
  * Pulls frames straight from the track (Chromium's MediaStreamTrackProcessor),
- * independent of rendering. Returns null when unsupported.
+ * independent of rendering. Returns null when unsupported. `onStreamEnd` runs
+ * if the stream closes or errors on its own (not after cancel), so the caller
+ * can fall back to another driver.
  */
-function driveByTrackProcessor(track: MediaStreamTrack, onFrame: (frame: VideoFrame) => void): Cancel | null {
+function driveByTrackProcessor(
+  track: MediaStreamTrack,
+  onFrame: (frame: VideoFrame) => void,
+  onStreamEnd: () => void,
+): Cancel | null {
   const Ctor = (globalThis as unknown as { MediaStreamTrackProcessor?: unknown }).MediaStreamTrackProcessor;
   if (typeof Ctor !== 'function') return null;
   let reader: ReadableStreamDefaultReader<VideoFrame>;
@@ -331,9 +349,9 @@ function driveByTrackProcessor(track: MediaStreamTrack, onFrame: (frame: VideoFr
       try {
         chunk = await reader.read();
       } catch {
-        return;
+        break;
       }
-      if (chunk.done) return;
+      if (chunk.done) break;
       const frame = chunk.value;
       try {
         if (active) onFrame(frame);
@@ -342,6 +360,7 @@ function driveByTrackProcessor(track: MediaStreamTrack, onFrame: (frame: VideoFr
         frame.close();
       }
     }
+    if (active) onStreamEnd();
   })();
   return () => {
     active = false;
@@ -354,38 +373,7 @@ function isExtensionPage(): boolean {
   return /^(chrome|moz|safari-web)-extension:$/.test(protocol);
 }
 
-/** Settles with `p`, or rejects on timeout or abort — whichever comes first — leaving no timer behind. */
-function settleWithin<T>(p: Promise<T>, ms: number, onTimeout: () => Error, signal: AbortSignal): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const done = (): void => {
-      clearTimeout(timer);
-      signal.removeEventListener('abort', onAbort);
-    };
-    const onAbort = (): void => {
-      done();
-      reject(new DOMException('Camera start was cancelled.', 'AbortError'));
-    };
-    const timer = setTimeout(() => {
-      done();
-      reject(onTimeout());
-    }, ms);
-    if (signal.aborted) {
-      onAbort();
-      return;
-    }
-    signal.addEventListener('abort', onAbort);
-    p.then(
-      (value) => {
-        done();
-        resolve(value);
-      },
-      (err: unknown) => {
-        done();
-        reject(err);
-      },
-    );
-  });
-}
+const CAMERA_ENDED_MESSAGE = 'The camera stopped sending video. It may have been unplugged or taken by another app.';
 
 // ───────────────────────────── CameraFeatureSource ─────────────────────────────
 
@@ -443,7 +431,11 @@ export class CameraFeatureSource implements FeatureSource {
   private pendingCamera: CameraHandle | null = null;
   private session: Session | null = null;
 
-  private fpsEma = 0;
+  /**
+   * EMA of the interval between processed frames, ms. Averaging intervals (not
+   * instantaneous rates, whose mean is inflated by jitter) keeps fps unbiased.
+   */
+  private frameIntervalEma = 0;
   private lastFrameAt: number | null = null;
   private landmarks: readonly LandmarkLike[] | null = null;
   private error: TrackerError | null = null;
@@ -469,10 +461,10 @@ export class CameraFeatureSource implements FeatureSource {
 
   /** Processed frames per second (EMA); decays toward 0 if frames stop arriving. */
   get fps(): number {
-    if (!this.session || this.lastFrameAt === null || this.fpsEma <= 0) return 0;
+    if (!this.session || this.lastFrameAt === null || !(this.frameIntervalEma > 0)) return 0;
+    const fps = 1000 / this.frameIntervalEma;
     const since = this.deps.now() - this.lastFrameAt;
-    const expected = 1000 / this.fpsEma;
-    return since > 2 * expected ? Math.min(this.fpsEma, 1000 / since) : this.fpsEma;
+    return since > 2 * this.frameIntervalEma ? Math.min(fps, 1000 / since) : fps;
   }
 
   /** Landmarks of the latest frame with a face (normalized image coords), for preview overlays. */
@@ -540,7 +532,7 @@ export class CameraFeatureSource implements FeatureSource {
       }
       s.camera.stop();
     }
-    this.fpsEma = 0;
+    this.frameIntervalEma = 0;
     this.lastFrameAt = null;
     this.landmarks = null;
     this.frameErrorLogged = false;
@@ -548,19 +540,37 @@ export class CameraFeatureSource implements FeatureSource {
 
   private async doStart(gen: number): Promise<void> {
     this.error = null;
+    // stop() aborts this: it releases a camera granted after the stop (an open
+    // permission prompt itself can't be withdrawn) and ends the model wait.
+    const abort = new AbortController();
+    this.startAbort = abort;
+    const settle = (): void => {
+      if (this.startAbort === abort) this.startAbort = null;
+    };
+
     // With the real camera, fail fast here rather than downloading the model for nothing.
     const unsupported = this.deps.openCamera === openCamera ? cameraSupportError() : null;
-    if (unsupported) throw this.fail(unsupported);
+    if (unsupported) {
+      settle();
+      throw this.fail(unsupported);
+    }
 
     // The model download is the slow part; overlap it with the permission prompt.
-    const model = this.deps.loadLandmarker(resolveLandmarkerConfig(this.opts));
+    let model: Promise<LandmarkerHandle>;
+    try {
+      model = this.deps.loadLandmarker(resolveLandmarkerConfig(this.opts));
+    } catch (err) {
+      settle();
+      throw this.fail(new TrackerError('model-load-failed', undefined, { cause: err }));
+    }
     model.catch(() => undefined); // awaited below; don't flag it if the camera fails first
 
     let camera: CameraHandle;
     try {
-      camera = await this.deps.openCamera({ video: this.opts.video, constraints: this.opts.constraints });
+      camera = await this.deps.openCamera({ video: this.opts.video, constraints: this.opts.constraints, signal: abort.signal });
     } catch (err) {
       if (gen !== this.generation) return;
+      settle();
       throw this.fail(toTrackerError(err));
     }
     if (gen !== this.generation) {
@@ -569,11 +579,14 @@ export class CameraFeatureSource implements FeatureSource {
     }
     this.pendingCamera = camera;
 
-    // Only the model wait is cancellable: an open permission prompt can't be withdrawn.
-    const abort = new AbortController();
-    this.startAbort = abort;
+    // A camera unplugged during the (possibly long) model download would
+    // otherwise start a session that never delivers a frame or an error.
+    const track = camera.track;
+    const onEnded = (): void => abort.abort(new TrackerError('camera-in-use', CAMERA_ENDED_MESSAGE));
+    track.addEventListener('ended', onEnded);
     let landmarker: LandmarkerHandle;
     try {
+      if (track.readyState === 'ended') onEnded();
       landmarker = await settleWithin(
         model,
         MODEL_LOAD_TIMEOUT_MS,
@@ -584,15 +597,17 @@ export class CameraFeatureSource implements FeatureSource {
       camera.stop();
       if (gen !== this.generation) return;
       this.pendingCamera = null;
-      this.startAbort = null;
+      settle();
       throw this.fail(err instanceof TrackerError ? err : new TrackerError('model-load-failed', undefined, { cause: err }));
+    } finally {
+      track.removeEventListener('ended', onEnded);
     }
     if (gen !== this.generation) {
       camera.stop();
       return;
     }
     this.pendingCamera = null;
-    this.startAbort = null;
+    settle();
     this.beginSession(camera, landmarker);
   }
 
@@ -611,18 +626,29 @@ export class CameraFeatureSource implements FeatureSource {
 
     const background = this.opts.backgroundProcessing ?? isExtensionPage();
     if (background) {
-      const cancel = driveByTrackProcessor(camera.track, (frame) => this.processFrame(s, frame));
+      const cancel = driveByTrackProcessor(
+        camera.track,
+        (frame) => this.processFrame(s, frame),
+        // The processor gave out while the session lives on: keep frames coming from the video element.
+        () => {
+          if (this.session === s) this.driveFromVideo(s);
+        },
+      );
       if (cancel) {
         s.cancels.push(cancel);
         return;
       }
     }
+    this.driveFromVideo(s);
+  }
 
+  private driveFromVideo(s: Session): void {
     const tick = (): void => {
       s.lastDriverTickAt = this.deps.now();
       this.processFrame(s);
     };
-    const video = camera.video;
+    s.lastDriverTickAt = this.deps.now();
+    const video = s.camera.video;
     s.cancels.push(
       typeof video.requestVideoFrameCallback === 'function' ? driveByVideoFrames(video, tick) : driveByAnimationFrames(tick),
       driveByWatchdog(
@@ -688,8 +714,9 @@ export class CameraFeatureSource implements FeatureSource {
     if (this.lastFrameAt !== null) {
       const dt = t - this.lastFrameAt;
       if (dt > 0) {
-        const instant = Math.min(1000 / dt, 240);
-        this.fpsEma = this.fpsEma > 0 ? this.fpsEma + FPS_ALPHA * (instant - this.fpsEma) : instant;
+        const interval = Math.min(Math.max(dt, MIN_FRAME_INTERVAL_MS), MAX_FRAME_INTERVAL_MS);
+        const ema = this.frameIntervalEma;
+        this.frameIntervalEma = ema > 0 ? ema + FPS_ALPHA * (interval - ema) : interval;
       }
     }
     this.lastFrameAt = t;
@@ -697,9 +724,7 @@ export class CameraFeatureSource implements FeatureSource {
 
   private handleTrackEnded(s: Session): void {
     if (this.session !== s) return;
-    const err = this.fail(
-      new TrackerError('camera-in-use', 'The camera stopped sending video. It may have been unplugged or taken by another app.'),
-    );
+    const err = this.fail(new TrackerError('camera-in-use', CAMERA_ENDED_MESSAGE));
     this.emit(NO_FACE(this.deps.now()));
     this.stop();
     for (const cb of [...this.errorListeners]) {

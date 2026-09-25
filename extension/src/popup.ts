@@ -78,6 +78,8 @@ async function main(): Promise<void> {
   let calibrated = (await loadCalibrationJSON(storage.area)) !== null;
   let page: PageState = PAGE_OFF;
   let busy = false;
+  /** Bumped by every on/off request, so a poll that was already in flight can't overwrite its answer. */
+  let pageEpoch = 0;
   let notice: { text: string; tone: 'info' | 'error' } | null = restricted ? { text: restricted, tone: 'info' } : null;
 
   const patch = (p: Partial<AppSettings>) => bus.emit('settings-patch', p);
@@ -126,19 +128,24 @@ async function main(): Promise<void> {
 
   async function refreshPage(): Promise<void> {
     if (tabId === undefined || restricted || busy) return;
+    const epoch = pageEpoch;
     const request: PageRequest = { type: 'page-query' };
+    let next: PageState;
     try {
       const state: unknown = await chrome.tabs.sendMessage(tabId, request, { frameId: 0 });
-      page = isPageState(state) ? state : PAGE_OFF;
+      next = isPageState(state) ? state : PAGE_OFF;
     } catch {
-      page = PAGE_OFF; // no content script: Gaze Reader is off here
+      next = PAGE_OFF; // no content script: Gaze Reader is off here
     }
+    if (epoch !== pageEpoch || busy) return;
+    page = next;
     render();
   }
 
   async function setEnabled(enabled: boolean): Promise<boolean> {
     if (tabId === undefined) return false;
     busy = true;
+    pageEpoch++;
     render();
     let ok = false;
     try {

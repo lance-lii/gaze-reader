@@ -48,7 +48,7 @@ export function collapseWhitespace(s: string): string {
 }
 
 const CJK_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/gu;
-const WORD = /[\p{L}\p{N}\p{M}]+(?:['’.\-‐][\p{L}\p{N}\p{M}]+)*/gu;
+const WORD = /[\p{L}\p{N}\p{M}]+(?:['’.\-\u2010][\p{L}\p{N}\p{M}]+)*/gu;
 
 /**
  * Counts words the way a reader would: "don't", "well-known", "e.g." and "3.14"
@@ -125,24 +125,35 @@ export function smartenPunctuation(input: string): string {
     .replace(/(^|[^-])-{2,3}(?!-)/g, '$1—')
     .replace(/\.\s?\.\s?\./g, '…');
   let out = '';
+  // The last character written, kept aside: indexing the growing string would flatten it on
+  // every quote mark, which is quadratic for a long paragraph.
+  let prev = '';
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (c !== '"' && c !== "'") {
       out += c;
+      prev = c;
       continue;
     }
-    const prev = i > 0 ? s[i - 1] : '';
+    // Context is the previous *output* character: a quote we just closed is not an opening context.
     const next = i + 1 < s.length ? s[i + 1] : '';
-    const opensHere = (prev === '' || OPENING_CONTEXT.test(prev)) && next !== '' && !/\s/.test(next);
+    const nextIsWord = /[\p{L}\p{N}]/u.test(next);
+    let opens: boolean;
+    if (prev === '' || OPENING_CONTEXT.test(prev)) opens = next !== '' && !/\s/.test(next);
+    else if (/[\p{L}\p{N}.,!?;:)\]}’”…]/u.test(prev)) opens = false;
+    else opens = nextIsWord; // after a symbol such as "=" or "/"
+    let q: string;
     if (c === '"') {
-      out += opensHere ? '“' : '”';
-      continue;
+      q = opens ? '“' : '”';
+    } else {
+      const after = s.slice(i + 1, i + 8);
+      if (/[\p{L}\p{N}]/u.test(prev)) q = '’'; // don't, dogs', 1990's
+      else if (/^\d\d(?:s|\b)/.test(after)) q = '’'; // '90s
+      else if (opens && /^(?:tis|twas|twere|em|cause|til|n)\b/i.test(after)) q = '’'; // 'tis, rock 'n' roll
+      else q = opens ? '‘' : '’';
     }
-    const after = s.slice(i + 1, i + 8);
-    if (/[\p{L}\p{N}]/u.test(prev)) out += '’'; // don't, dogs', 1990's
-    else if (/^\d\d(?:s|\b)/.test(after)) out += '’'; // '90s
-    else if (opensHere && /^(?:tis|twas|twere|em|cause|til|n)\b/i.test(after)) out += '’'; // 'tis, rock 'n' roll
-    else out += opensHere ? '‘' : '’';
+    out += q;
+    prev = q;
   }
   return out;
 }
@@ -158,13 +169,19 @@ export function tameShouting(s: string): string {
   if (letters.length < 4 || letters !== letters.toUpperCase()) return s;
   const words = s.toLowerCase().split(/(\s+)/);
   const lastWord = words.length - 1;
+  let previous = '';
   return words
     .map((w, i) => {
       if (/^\s+$/.test(w) || !w) return w;
-      const upper = w.toUpperCase();
-      if (/^[ivxlcdm]+[.,:;]?$/i.test(w) && /^[IVXLCDM]{2,}/.test(upper)) return upper; // roman numerals
-      if (i !== 0 && i !== lastWord && SMALL_WORDS.has(w.replace(/[^\p{L}]/gu, ''))) return w;
-      return w.replace(/\p{L}/u, (ch) => ch.toUpperCase());
+      const before = previous;
+      previous = w;
+      const bare = w.replace(/[.,:;!?]+$/, '');
+      if (bare.length >= 2 && ROMAN_WORD_RE.test(bare)) return w.toUpperCase(); // "VIII", not "Viii"
+      // A subtitle starts after a colon or dash, or after the old "; or," ("Moby-Dick; or, The Whale").
+      const startsSubtitle = /[:.!?—–]$/.test(before) || before === 'or,';
+      if (i !== 0 && i !== lastWord && !startsSubtitle && SMALL_WORDS.has(w.replace(/[^\p{L}]/gu, ''))) return w;
+      // First letter, and the first letter after a hyphen or dash ("Moby-Dick").
+      return w.replace(/(^|[-–—])([^\p{L}]*)(\p{L})/gu, (_m, sep: string, pre: string, ch: string) => sep + pre + ch.toUpperCase());
     })
     .join('');
 }
@@ -344,7 +361,17 @@ interface TextBlock {
 type TextUnit =
   | { kind: 'title'; text: string }
   | { kind: 'byline'; text: string }
-  | { kind: 'heading'; lines: string[]; keyword: string | null; numberOnly: boolean; level: 1 | 2 }
+  | {
+      kind: 'heading';
+      lines: string[];
+      keyword: string | null;
+      /** "chapter iv" — identifies the heading independent of its title text. */
+      label: string;
+      numberOnly: boolean;
+      level: 1 | 2;
+      /** Blank lines above the heading in the source. */
+      gap: number;
+    }
   | { kind: 'para'; text: string }
   | { kind: 'verse'; lines: string[] }
   | { kind: 'break' }
@@ -359,15 +386,18 @@ const HEADING_KEYWORDS =
 /** A well-formed Roman numeral (so "mild" or "mix" never count as numbers). */
 const ROMAN = '(?=[ivxlcdm])m{0,4}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})';
 const NUMBER_TOKEN = `(?:\\d{1,4}|${ROMAN}|(?:the\\s+)?(?:${NUMBER_WORDS})(?:[-\\s](?:${NUMBER_WORDS}))*)`;
-const CHAPTER_ONLY_RE = new RegExp(`^(${HEADING_KEYWORDS})\\s+${NUMBER_TOKEN}[.:]?$`, 'i');
-const CHAPTER_TITLED_RE = new RegExp(`^(${HEADING_KEYWORDS})\\s+${NUMBER_TOKEN}\\b\\s*([.:—–-]?)\\s*(\\S.*)$`, 'i');
+const CHAPTER_ONLY_RE = new RegExp(`^(${HEADING_KEYWORDS})\\s+(${NUMBER_TOKEN})[.:]?$`, 'i');
+const CHAPTER_TITLED_RE = new RegExp(`^(${HEADING_KEYWORDS})\\s+(${NUMBER_TOKEN})\\b\\s*([.:—–-]?)\\s*(\\S.*)$`, 'i');
 const STANDALONE_RE =
   /^(?:prologue|epilogue|preface|foreword|introduction|afterword|appendix(?:\s+[a-z0-9]{1,4})?|interlude|postscript|conclusion|contents|table of contents|acknowledge?ments|dedication|author[’']?s note|glossary|bibliography|finis|the end)[.:!]?$/i;
 const NUMERAL_RE = new RegExp(`^(?:${ROMAN.toUpperCase()}|\\d{1,3})\\.?$`);
+const ROMAN_WORD_RE = new RegExp(`^${ROMAN}$`, 'i');
 
 export interface ChapterLineMatch {
   /** "chapter", "book", "part", …; "numeral" for a bare number; "standalone" for PROLOGUE, CONTENTS, … */
   keyword: string;
+  /** Keyword plus number, lowercased ("chapter iv"): the same for "CHAPTER IV." and "Chapter IV: Storm". */
+  label: string;
   /** True when the line is only the label ("CHAPTER IV.") with no title of its own. */
   numberOnly: boolean;
 }
@@ -380,30 +410,50 @@ export interface ChapterLineMatch {
 export function matchChapterLine(line: string): ChapterLineMatch | null {
   const t = collapseWhitespace(line);
   if (!t || t.length > 90) return null;
+  const labelOf = (m: RegExpExecArray): { keyword: string; label: string } => {
+    const keyword = m[1].toLowerCase().replace(/\.$/, '');
+    return { keyword, label: `${keyword} ${m[2].toLowerCase().replace(/\s+/g, ' ')}` };
+  };
   let m = CHAPTER_ONLY_RE.exec(t);
-  if (m) return { keyword: m[1].toLowerCase().replace(/\.$/, ''), numberOnly: true };
+  if (m) return { ...labelOf(m), numberOnly: true };
   m = CHAPTER_TITLED_RE.exec(t);
   if (m) {
-    const separator = m[2];
-    const rest = m[3];
+    const separator = m[3];
+    const rest = m[4];
     const shouty = t === t.toUpperCase() && t !== t.toLowerCase();
     const words = rest.split(/\s+/);
     const capitalized = words.filter((w) => /^[\p{Lu}"“‘'(]/u.test(w)).length;
     const titleLike = /^[\p{Lu}"“‘'(]/u.test(rest) && !/[,;]$/.test(rest) && rest.length <= 70;
     const titleCase = capitalized / words.length >= 0.5 && !/[.!?]$/.test(rest);
-    if (titleLike && (separator || shouty || titleCase)) {
-      return { keyword: m[1].toLowerCase().replace(/\.$/, ''), numberOnly: false };
-    }
+    if (titleLike && (separator || shouty || titleCase)) return { ...labelOf(m), numberOnly: false };
     return null;
   }
-  if (STANDALONE_RE.test(t)) return { keyword: 'standalone', numberOnly: false };
-  if (NUMERAL_RE.test(t)) return { keyword: 'numeral', numberOnly: true };
+  const lower = t.toLowerCase().replace(/[.:!]$/, '');
+  if (STANDALONE_RE.test(t)) return { keyword: 'standalone', label: lower, numberOnly: false };
+  if (NUMERAL_RE.test(t)) return { keyword: 'numeral', label: lower, numberOnly: true };
   return null;
 }
 
 function indentOf(line: string): number {
   const m = /^[ \t]*/.exec(line);
   return m ? m[0].replace(/\t/g, '    ').length : 0;
+}
+
+/**
+ * Math.min without spreading: a text with one paragraph per line and no blank lines
+ * is a single block of 100 000+ lines, which would overflow the call stack.
+ */
+function minOf(values: readonly number[]): number {
+  let min = Infinity;
+  for (const v of values) if (v < min) min = v;
+  return min;
+}
+
+/** The smallest indentation among `lines`. */
+function minIndent(lines: readonly string[]): number {
+  let min = Infinity;
+  for (const l of lines) min = Math.min(min, indentOf(l));
+  return min;
 }
 
 function quantile(values: number[], q: number): number {
@@ -434,7 +484,7 @@ export function stripGutenberg(text: string): GutenbergInfo {
   const endCandidates = [GUTENBERG_END.exec(body), GUTENBERG_END_LINE.exec(body)]
     .filter((m): m is RegExpExecArray => m !== null)
     .map((m) => m.index);
-  if (endCandidates.length) body = body.slice(0, Math.min(...endCandidates));
+  if (endCandidates.length) body = body.slice(0, minOf(endCandidates));
 
   const field = (name: string): string | null => {
     const m = new RegExp(`^${name}:[ \\t]*(.+(?:\\n[ \\t]+\\S.*)*)`, 'im').exec(header);
@@ -450,11 +500,11 @@ export function stripGutenberg(text: string): GutenbergInfo {
 
 function normalizeText(raw: string): string {
   return raw
-    .replace(/^﻿/, '')
+    .replace(/^\ufeff/, '')
     .replace(/\r\n?/g, '\n')
     .replace(/\f/g, '\n\n')
     .replace(/[\u0000-\u0008\u000B\u000E-\u001F\u007F]/g, '')
-    .replace(/[  ]/g, '\n');
+    .replace(/[\u2028\u2029]/g, '\n');
 }
 
 function splitBlocks(text: string): TextBlock[] {
@@ -499,39 +549,42 @@ function classifyHeading(block: TextBlock, wrap: number): TextUnit | null {
   const lines = block.lines.map((l) => collapseWhitespace(l));
   if (lines.length > 3 || lines.some((l) => l.length > 90)) return null;
   const first = lines[0];
+  const gap = block.blankBefore;
   const chapter = matchChapterLine(first);
   if (chapter) {
     const rest = lines.slice(1);
     if (rest.some((l) => l.length > Math.min(70, wrap * 0.85))) return null;
-    return { kind: 'heading', lines, keyword: chapter.keyword, numberOnly: chapter.numberOnly && rest.length === 0, level: 2 };
+    const numberOnly = chapter.numberOnly && rest.length === 0;
+    return { kind: 'heading', lines, keyword: chapter.keyword, label: chapter.label, numberOnly, level: 2, gap };
   }
   if (lines.length !== 1) return null;
   const letters = first.replace(/[^\p{L}]/gu, '');
   const words = first.split(/\s+/).length;
   if (letters.length < 2 || words > 10 || first.length > 60 || OPENING_QUOTE_OR_DASH.test(first)) return null;
   if (/[,;]$/.test(first)) return null;
+  const label = first.toLowerCase();
   const allCaps = letters === letters.toUpperCase() && letters !== letters.toLowerCase();
-  if (allCaps) return { kind: 'heading', lines, keyword: null, numberOnly: false, level: 2 };
+  if (allCaps) return { kind: 'heading', lines, keyword: null, label, numberOnly: false, level: 2, gap };
   // A short title-like line set apart the way Gutenberg sets chapter titles (3+ blank lines above).
   if (block.blankBefore >= 3 && block.blankAfter >= 1 && /^\p{Lu}/u.test(first) && !/[.,;:]$/.test(first)) {
-    return { kind: 'heading', lines, keyword: null, numberOnly: false, level: 2 };
+    return { kind: 'heading', lines, keyword: null, label, numberOnly: false, level: 2, gap };
   }
   return null;
 }
 
 function joinWrapped(lines: string[]): string {
-  let out = '';
+  // Tests look at the previous *line*, never at the growing paragraph: an end-anchored
+  // regex over the accumulated string rescans all of it for every line (quadratic).
+  const parts: string[] = [];
+  let prev = '';
   for (const raw of lines) {
     const line = raw.trim();
-    if (!out) {
-      out = line;
-    } else if (/[\p{L}]-$/u.test(out) || /[—–]$/.test(out) || /^[—–]/.test(line)) {
-      out += line; // "well-\nknown", "word—\nword"
-    } else {
-      out += ' ' + line;
-    }
+    if (!line) continue;
+    if (parts.length > 0 && !(/\p{L}-$/u.test(prev) || /[—–]$/.test(prev) || /^[—–]/.test(line))) parts.push(' ');
+    parts.push(line); // glued: "well-\nknown", "word—\nword"
+    prev = line;
   }
-  return out;
+  return parts.join('');
 }
 
 interface TextStats {
@@ -567,12 +620,12 @@ function proseUnits(block: TextBlock, stats: TextStats): TextUnit[] {
     if (trimmed.every((l) => OPENING_QUOTE_OR_DASH.test(l))) {
       return trimmed.map((text) => ({ kind: 'para', text }) as TextUnit); // dialogue, one line per speaker
     }
-    const base = Math.min(...lines.map(indentOf));
-    return [{ kind: 'verse', lines: lines.map((l) => ' '.repeat(Math.min(12, indentOf(l) - base)) + l.trim()) }];
+    const base = minIndent(lines);
+    return [{ kind: 'verse', lines: lines.map((l) => '\u00a0'.repeat(Math.min(12, indentOf(l) - base)) + l.trim()) }];
   }
   if (stats.unwrapped) return trimmed.map((text) => ({ kind: 'para', text }) as TextUnit);
 
-  const base = Math.min(...lines.map(indentOf));
+  const base = minIndent(lines);
   const hasBaseLine = lines.some((l) => indentOf(l) <= base);
   const groups: string[][] = [[lines[0]]];
   for (let i = 1; i < lines.length; i++) {
@@ -590,7 +643,7 @@ function proseUnits(block: TextBlock, stats: TextStats): TextUnit[] {
 
 function classifyBlocks(blocks: TextBlock[], stats: TextStats): TextUnit[] {
   const typicalIndent = quantile(
-    blocks.filter((b) => b.lines.length >= 2).map((b) => Math.min(...b.lines.map(indentOf))),
+    blocks.filter((b) => b.lines.length >= 2).map((b) => minIndent(b.lines)),
     0.5,
   );
   const units: TextUnit[] = [];
@@ -606,19 +659,25 @@ function classifyBlocks(blocks: TextBlock[], stats: TextStats): TextUnit[] {
       units.push(heading);
       continue;
     }
-    const minIndent = Math.min(...block.lines.map(indentOf));
+    const blockIndent = minIndent(block.lines);
     const quoted =
-      minIndent >= 2 &&
+      blockIndent >= 2 &&
       !(Number.isFinite(typicalIndent) && typicalIndent >= 2) &&
       (block.lines.length >= 2 || !stats.firstLineIndentStyle);
     const inner = proseUnits(block, stats);
     if (quoted) units.push({ kind: 'quote', units: inner });
-    else units.push(...inner);
+    else for (const u of inner) units.push(u); // no spread: one block can hold 100 000+ paragraphs
   }
   return units;
 }
 
-/** A run of ≥ 3 headings sharing a keyword is a table of contents, not a series of empty chapters. */
+type HeadingUnit = Extract<TextUnit, { kind: 'heading' }>;
+
+/**
+ * A run of ≥ 3 headings sharing a keyword is a table of contents, not a series of
+ * empty chapters. The run stops at a wide gap (the real chapter that follows a TOC
+ * sits under 3+ blank lines) or when an entry repeats ("Chapter I" listed, then begun).
+ */
 function demoteTocRuns(units: TextUnit[]): TextUnit[] {
   const out: TextUnit[] = [];
   let i = 0;
@@ -629,16 +688,22 @@ function demoteTocRuns(units: TextUnit[]): TextUnit[] {
       i++;
       continue;
     }
-    let j = i;
-    while (j < units.length && units[j].kind === 'heading') j++;
-    const run = units.slice(i, j) as Extract<TextUnit, { kind: 'heading' }>[];
+    const run: HeadingUnit[] = [];
+    const seen = new Set<string>();
+    for (let j = i; j < units.length; j++) {
+      const h = units[j];
+      if (h.kind !== 'heading' || (run.length > 0 && (h.gap >= 3 || seen.has(h.label)))) break;
+      run.push(h);
+      seen.add(h.label);
+    }
+    const j = i + run.length;
     const keywordCounts = new Map<string, number>();
     for (const h of run) {
       if (h.keyword && h.keyword !== 'standalone') keywordCounts.set(h.keyword, (keywordCounts.get(h.keyword) ?? 0) + 1);
     }
     const isToc = run.length >= 3 && [...keywordCounts.values()].some((n) => n >= 2);
     if (!isToc) {
-      out.push(...run);
+      for (const h of run) out.push(h);
     } else {
       let k = 0;
       if (/contents/i.test(run[0].lines.join(' '))) out.push(run[k++]);
@@ -736,7 +801,7 @@ function parsePlainText(raw: string): ParsedText {
     }
   }
 
-  const headings = units.filter((u): u is Extract<TextUnit, { kind: 'heading' }> => u.kind === 'heading');
+  const headings = units.filter((u): u is HeadingUnit => u.kind === 'heading');
   const hasChapters = headings.some((h) => h.keyword === 'chapter' || h.keyword === 'numeral');
   const partsExist = hasChapters && headings.some((h) => /^(book|part|volume|vol)$/.test(h.keyword ?? ''));
   if (partsExist) {
@@ -830,6 +895,13 @@ function frontMatter(text: string): { body: string; meta: Record<string, string>
 
 type Slots = string[];
 
+/** http(s), mailto and relative/fragment links only — so markdownToHtml is safe even before sanitizing. */
+function isSafeMarkdownUrl(url: string): boolean {
+  const compact = url.replace(/[\u0000-\u0020]+/g, '');
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(compact);
+  return !scheme || /^(?:https?|mailto)$/i.test(scheme[1]);
+}
+
 function renderInlineInto(src: string, slots: Slots): string {
   const slot = (html: string): string => `\u0000${slots.push(html) - 1}\u0000`;
   let s = src;
@@ -845,9 +917,11 @@ function renderInlineInto(src: string, slots: Slots): string {
   s = s.replace(
     /\[((?:[^[\]]|\[[^[\]]*\])*)\]\(\s*<?([^\s()<>]*(?:\([^\s()]*\)[^\s()<>]*)*)>?(?:\s+(?:"([^"]*)"|'([^']*)'))?\s*\)/g,
     (_m, text: string, url: string, t1?: string, t2?: string) => {
+      const inner = renderInlineInto(text, slots);
+      if (!isSafeMarkdownUrl(url)) return slot(inner);
       const title = t1 ?? t2;
       const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-      return slot(`<a href="${escapeHtml(url)}"${titleAttr}>${renderInlineInto(text, slots)}</a>`);
+      return slot(`<a href="${escapeHtml(url)}"${titleAttr}>${inner}</a>`);
     },
   );
 
@@ -873,7 +947,7 @@ function renderInline(src: string): string {
   return html;
 }
 
-function parseList(lines: string[], start: number): { html: string; next: number } {
+function parseList(lines: string[], start: number, depth: number): { html: string; next: number } {
   const first = LIST_RE.exec(lines[start]) as RegExpExecArray;
   const ordered = /\d/.test(first[2]);
   const startNumber = ordered ? Number.parseInt(first[2], 10) : 1;
@@ -930,11 +1004,19 @@ function parseList(lines: string[], start: number): { html: string; next: number
 
   const tag = ordered ? 'ol' : 'ul';
   const startAttr = ordered && startNumber !== 1 ? ` start="${startNumber}"` : '';
-  const body = items.map((item) => `<li>${renderMdBlocks(item, !loose)}</li>`).join('');
+  const body = items.map((item) => `<li>${renderMdBlocks(item, !loose, depth + 1)}</li>`).join('');
   return { html: `<${tag}${startAttr}>${body}</${tag}>`, next: i };
 }
 
-function renderMdBlocks(lines: string[], tight: boolean): string {
+/**
+ * Blockquotes and lists nest at most this deep; deeper markers stay literal text. Real
+ * books never come close, and a pasted "> > > …" × 20 000 must not overflow the stack
+ * (or re-slice every line once per level).
+ */
+const MAX_MD_DEPTH = 16;
+
+function renderMdBlocks(lines: string[], tight: boolean, depth = 0): string {
+  const nests = depth < MAX_MD_DEPTH;
   const out: string[] = [];
   let i = 0;
   while (i < lines.length) {
@@ -975,7 +1057,7 @@ function renderMdBlocks(lines: string[], tight: boolean): string {
       continue;
     }
 
-    if (QUOTE_RE.test(line)) {
+    if (nests && QUOTE_RE.test(line)) {
       const inner: string[] = [];
       while (i < lines.length) {
         const l = lines[i];
@@ -985,12 +1067,12 @@ function renderMdBlocks(lines: string[], tight: boolean): string {
         else break;
         i++;
       }
-      out.push(`<blockquote>${renderMdBlocks(inner, false)}</blockquote>`);
+      out.push(`<blockquote>${renderMdBlocks(inner, false, depth + 1)}</blockquote>`);
       continue;
     }
 
-    if (isListStart(line)) {
-      const list = parseList(lines, i);
+    if (nests && isListStart(line)) {
+      const list = parseList(lines, i, depth);
       out.push(list.html);
       i = list.next;
       continue;
@@ -1007,7 +1089,7 @@ function renderMdBlocks(lines: string[], tight: boolean): string {
       continue;
     }
 
-    const para: string[] = [line.trim()];
+    const para: string[] = [line.replace(/^[ \t]+/, '')]; // trailing spaces may be a hard line break
     i++;
     let setext = 0;
     while (i < lines.length && !isBlank(lines[i])) {
@@ -1021,11 +1103,11 @@ function renderMdBlocks(lines: string[], tight: boolean): string {
       para.push(lines[i].replace(/^[ \t]+/, ''));
       i++;
     }
-    const text = para.join('\n');
+    const text = para.join('\n').replace(/[ \t]+$/, '');
     if (setext) out.push(`<h${setext}>${renderInline(text)}</h${setext}>`);
     else out.push(tight ? renderInline(text) : `<p>${renderInline(text)}</p>`);
   }
-  return out.join('\n');
+  return out.join(tight ? '' : '\n');
 }
 
 /**
@@ -1124,8 +1206,10 @@ export function extractMainContent(doc: Document): Element {
 
 /** Removes navigation, sharing widgets, comment threads and the like from inside the chosen content. */
 function stripBoilerplate(root: Element): void {
+  // Project Gutenberg's licence blocks are boilerplate however long they are (in a short book, longer than the book).
   const junk = root.querySelectorAll(
-    'nav, aside, form, [role="navigation"], [role="complementary"], [role="search"], [aria-hidden="true"], [hidden]',
+    'nav, aside, form, [role="navigation"], [role="complementary"], [role="search"], [aria-hidden="true"], [hidden], ' +
+      '#pg-header, #pg-footer, .pg-boilerplate',
   );
   for (const el of Array.from(junk)) el.remove();
   const rootText = collapseWhitespace(root.textContent ?? '').length;
@@ -1265,13 +1349,31 @@ function startsWithBytes(bytes: Uint8Array, ascii: string, offset = 0): boolean 
   return true;
 }
 
+/** Bytes that never occur in text files: NUL and most C0 controls (UTF-16 files are BOM-marked). */
+function looksBinary(probe: Uint8Array): boolean {
+  if ((probe[0] === 0xff && probe[1] === 0xfe) || (probe[0] === 0xfe && probe[1] === 0xff)) return false;
+  let controls = 0;
+  for (let i = 0; i < probe.length; i++) {
+    const b = probe[i];
+    if (b === 0) return true;
+    if (b < 0x09 || (b > 0x0d && b < 0x20 && b !== 0x1b)) controls++;
+  }
+  return controls > probe.length * 0.02;
+}
+
 /** Decides how to parse a file from its magic bytes, extension and MIME type (in that order of trust). */
 function sniffKind(bytes: Uint8Array, name: string, mime: string): SourceKind {
   const ext = extensionOf(name);
   const type = mime.split(';')[0].trim().toLowerCase();
   const head = String.fromCharCode(...bytes.subarray(0, 1024));
 
-  if (head.includes('%PDF-')) return 'pdf';
+  // A PDF starts with "%PDF-"; readers tolerate junk before it within the first KB. Text that
+  // merely *mentions* "%PDF-1.7" (notes about the format) must stay text, so a signature that
+  // isn't at the very start only counts when the name, type or binary content agree.
+  const pdfAt = head.indexOf('%PDF-');
+  if (pdfAt === 0 || (pdfAt > 0 && (ext === 'pdf' || type === 'application/pdf' || looksBinary(bytes.subarray(0, 4096))))) {
+    return 'pdf';
+  }
   if (startsWithBytes(bytes, 'PK\u0003\u0004')) {
     if (startsWithBytes(bytes, 'mimetypeapplication/epub+zip', 30) || ext === 'epub' || type === 'application/epub+zip') {
       return 'epub';
@@ -1300,7 +1402,7 @@ function sniffKind(bytes: Uint8Array, name: string, mime: string): SourceKind {
 
 /** Best guess at what a blob of text is. */
 export function detectTextFormat(text: string): 'txt' | 'md' | 'html' {
-  const head = text.slice(0, 4000).replace(/^﻿/, '').trimStart();
+  const head = text.slice(0, 4000).replace(/^\ufeff/, '').trimStart();
   if (/^(?:<\?xml[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*<(?:!doctype\s+html|html[\s>])/i.test(head)) return 'html';
   if (/^<(?:p|div|article|section|main|body|h[1-6])[\s>]/i.test(head) && /<\/(?:p|div|h[1-6]|article|section)>/i.test(head)) {
     return 'html';
@@ -1384,6 +1486,11 @@ async function parseBytes(
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  // A view over a whole buffer is handed on as is: copying a 200 MB PDF here (and again in
+  // parsePdf, which must copy because pdf.js detaches its input) would triple peak memory.
+  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength && bytes.buffer instanceof ArrayBuffer) {
+    return bytes.buffer;
+  }
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   return copy.buffer;
@@ -1438,9 +1545,13 @@ export function loadBookFromText(
 function normalizeUserUrl(input: string): URL {
   const trimmed = input.trim();
   if (!trimmed) throw new BookLoadError('invalid-url', 'Paste the address of a book or article first.');
-  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(trimmed);
-  const looksLikeDomain = /^[\w-]+(?:\.[\w-]+)+(?::\d+)?(?:[/?#]|$)/.test(trimmed);
-  const candidate = !hasScheme && looksLikeDomain ? `https://${trimmed}` : trimmed;
+  // "localhost:8080/book.txt" is a host and port, not a URL with the scheme "localhost:".
+  const hostWithPort = /^[\w-]+(?:\.[\w-]+)*:\d{1,5}(?:[/?#]|$)/.test(trimmed);
+  const hasScheme = !hostWithPort && /^[a-z][a-z0-9+.-]*:/i.test(trimmed);
+  const looksLikeDomain = hostWithPort || /^[\w-]+(?:\.[\w-]+)+(?::\d+)?(?:[/?#]|$)/.test(trimmed);
+  // Local development servers speak plain http; everything else gets https.
+  const local = /^(?:localhost|127(?:\.\d{1,3}){3})(?:[:/?#]|$)/i.test(trimmed);
+  const candidate = !hasScheme && looksLikeDomain ? `${local ? 'http' : 'https'}://${trimmed}` : trimmed;
   let url: URL;
   try {
     const base = typeof document !== 'undefined' ? document.baseURI : undefined;
@@ -1476,14 +1587,56 @@ interface FetchedBytes {
   finalUrl: string;
 }
 
+/**
+ * Reads a response body chunk by chunk so the size cap applies while downloading
+ * (servers don't always send Content-Length) and `onProgress` can keep an idle
+ * timer alive: a big book on a slow connection is fine as long as data keeps coming.
+ */
+async function readBody(res: Response, onProgress: () => void): Promise<Uint8Array> {
+  const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
+  if (!reader) {
+    const buffer = await res.arrayBuffer();
+    if (buffer.byteLength > MAX_BOOK_BYTES) throw tooLarge(buffer.byteLength);
+    return new Uint8Array(buffer);
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > MAX_BOOK_BYTES) {
+      void reader.cancel().catch(() => undefined);
+      throw tooLarge(total);
+    }
+    chunks.push(value);
+    onProgress();
+  }
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
 async function fetchBytes(url: string, timeoutMs: number, signal?: AbortSignal): Promise<FetchedBytes> {
   if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
   const controller = new AbortController();
   let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // An idle timeout: re-armed whenever data arrives, so only a stalled connection trips it.
+  const armTimer = (): void => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  };
+  armTimer();
   const forwardAbort = (): void => controller.abort();
   signal?.addEventListener('abort', forwardAbort, { once: true });
 
@@ -1510,17 +1663,23 @@ async function fetchBytes(url: string, timeoutMs: number, signal?: AbortSignal):
     } catch (err) {
       throw mapError(err);
     }
-    if (!res.ok) throw httpError(res.status);
+    if (!res.ok) {
+      void res.body?.cancel().catch(() => undefined);
+      throw httpError(res.status);
+    }
     const declared = Number(res.headers.get('content-length'));
-    if (Number.isFinite(declared) && declared > MAX_BOOK_BYTES) throw tooLarge(declared);
-    let buffer: ArrayBuffer;
+    if (Number.isFinite(declared) && declared > MAX_BOOK_BYTES) {
+      void res.body?.cancel().catch(() => undefined);
+      throw tooLarge(declared);
+    }
+    armTimer();
+    let bytes: Uint8Array;
     try {
-      buffer = await res.arrayBuffer();
+      bytes = await readBody(res, armTimer);
     } catch (err) {
       throw mapError(err);
     }
-    if (buffer.byteLength > MAX_BOOK_BYTES) throw tooLarge(buffer.byteLength);
-    return { bytes: new Uint8Array(buffer), contentType: res.headers.get('content-type') ?? '', finalUrl: res.url || url };
+    return { bytes, contentType: res.headers.get('content-type') ?? '', finalUrl: res.url || url };
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', forwardAbort);

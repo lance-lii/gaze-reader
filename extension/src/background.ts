@@ -29,6 +29,7 @@ const SETUP_PAGE = 'setup.html';
 const CONTENT_SCRIPT = 'content.js';
 const TOGGLE_COMMAND = 'toggle-gaze-reader';
 const EXTENSION_ORIGIN = chrome.runtime.getURL('');
+const START_FAILED = "Gaze Reader couldn't start on this page. Reloading the page may help.";
 
 // ───────────────────────────── Offscreen document ────────────────────────────
 
@@ -81,7 +82,12 @@ async function openSetup(returnTabId: number | null): Promise<void> {
     if (open.windowId >= 0) await chrome.windows.update(open.windowId, { focused: true });
     return;
   }
-  await chrome.tabs.create(returnTabId === null ? { url } : { url, openerTabId: returnTabId });
+  // Right next to the page it is for. An opener must be in the same window as
+  // the new tab (tabs.create fails otherwise), and the focused window may be another one.
+  const opener = returnTabId === null ? null : await chrome.tabs.get(returnTabId).catch(() => null);
+  await chrome.tabs.create(
+    opener?.id === undefined ? { url } : { url, openerTabId: opener.id, windowId: opener.windowId, index: opener.index + 1 },
+  );
 }
 
 // ──────────────────────────────── The hub ────────────────────────────────────
@@ -174,11 +180,15 @@ async function handleRequest(msg: RuntimeRequest, sender: chrome.runtime.Message
   switch (msg.type) {
     case 'set-tab-enabled': {
       if (!fromExtensionPage(sender)) return { ok: false, error: 'Not allowed.' };
+      let state: PageState;
       try {
-        return { ok: true, state: await setTabEnabled(msg.tabId, msg.enabled) };
+        state = await setTabEnabled(msg.tabId, msg.enabled);
       } catch (err) {
         return { ok: false, error: friendlyInjectionError(err) };
       }
+      // The content script ran but its session failed to start (details are in the page's console).
+      if (msg.enabled && !state.enabled) return { ok: false, error: START_FAILED };
+      return { ok: true, state };
     }
     case 'camera-permission-granted': {
       if (!fromExtensionPage(sender)) return { ok: false, error: 'Not allowed.' };
@@ -213,10 +223,24 @@ chrome.commands.onCommand.addListener((command, tab) => {
     .catch((err: unknown) => console.info('[gaze-reader] toggle failed:', friendlyInjectionError(err)));
 });
 
-// A full navigation discards the content script, so the tab is no longer "ON".
+// Chrome resets a tab's own badge when it loads a new document. Single-page
+// apps navigate without one (and report 'loading' anyway) while the content
+// script and its session carry on, so never clear blindly: when a load
+// finishes, ask the page whether it is still on.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === 'loading') void setBadge(tabId, false);
+  if (changeInfo.status === 'complete') void refreshBadge(tabId);
 });
+
+async function refreshBadge(tabId: number): Promise<void> {
+  let text: string;
+  try {
+    text = await chrome.action.getBadgeText({ tabId });
+  } catch {
+    return; // the tab is gone
+  }
+  if (!text) return;
+  await setBadge(tabId, (await queryPage(tabId)).enabled);
+}
 
 // The setup page records a grant in storage too (content scripts watch it); mirror it here.
 chrome.storage.onChanged.addListener((changes, area) => {

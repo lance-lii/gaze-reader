@@ -88,6 +88,13 @@ describe('bubbleMaxWidth', () => {
     const wl = bubbleMaxWidth({ corner: 'top-left', anchor: anchorLeft, viewportWidth: 400, columnCenterX: 200 });
     expect(16 + wl).toBeLessThanOrEqual(200 - 24);
   });
+  it('stays in a roomy margin instead of overlapping the text', () => {
+    const base = { corner: 'bottom-right', anchor: anchorRight, viewportWidth: 1200, columnCenterX: 600 } as const;
+    expect(bubbleMaxWidth({ ...base, columnEdgeX: 950 })).toBe(1184 - 958);
+    // A cramped margin isn't worth a skinny bubble: overlap the text edge (never the center).
+    expect(bubbleMaxWidth({ ...base, columnEdgeX: 1050 })).toBe(260);
+  });
+
   it('never shrinks below a readable minimum and survives bad input', () => {
     expect(bubbleMaxWidth({ corner: 'bottom-right', anchor: anchorRight, viewportWidth: 1200, columnCenterX: 1170 })).toBe(120);
     expect(bubbleMaxWidth({ corner: 'bottom-left', anchor: { left: Number.NaN, top: 0, right: 0, bottom: 0 }, viewportWidth: 0, columnCenterX: null })).toBe(260);
@@ -190,8 +197,10 @@ function keepReading(s: Setup, ms: number): void {
   }
 }
 
-function pointer(type: string, target: EventTarget, x: number, y: number): void {
-  target.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, pointerId: 7, isPrimary: true, button: 0, clientX: x, clientY: y }));
+function pointer(type: string, target: EventTarget, x: number, y: number, extra: PointerEventInit = {}): void {
+  target.dispatchEvent(
+    new PointerEvent(type, { bubbles: true, cancelable: true, composed: true, pointerId: 7, isPrimary: true, button: 0, clientX: x, clientY: y, ...extra }),
+  );
 }
 
 describe('Buddy', () => {
@@ -383,6 +392,25 @@ describe('Buddy', () => {
       expect(s.said()).toBe('waiting for a pause');
     });
 
+    it('drops a held app line once it is stale instead of saying it much later (regression)', () => {
+      const s = make();
+      keepReading(s, 1_500);
+      s.buddy.say('Paused. I’ll wait right here.');
+      keepReading(s, 25_000);
+      gaze(s.bus, 1010, 700); // a pause, long after the fact
+      vi.advanceTimersByTime(2_000);
+      expect(s.said()).toBeNull();
+      // Dewey’s own remarks may still wait for a page turn.
+      s.bus.emit('book-progress', { fraction: 0.1, wordsRead: 0, wpm: null, pagesTurned: 0, minutesReading: 1 });
+      keepReading(s, 1_500);
+      s.bus.emit('book-progress', { fraction: 0.3, wordsRead: 0, wpm: null, pagesTurned: 0, minutesReading: 2 });
+      keepReading(s, 25_000);
+      expect(s.said()).toBeNull();
+      s.bus.emit('page-turn', { from: 0, to: 700, auto: true, reason: 'line-tracker', pageIndex: 1 });
+      vi.advanceTimersByTime(600);
+      expect(QUIPS.milestone25).toContain(s.said());
+    });
+
     it('speaks high priority even mid-line', () => {
       const s = make();
       keepReading(s, 1_500);
@@ -413,6 +441,26 @@ describe('Buddy', () => {
       s.bus.emit('book-progress', { fraction: 0.62, wordsRead: 0, wpm: null, pagesTurned: 1, minutesReading: 1 });
       vi.advanceTimersByTime(1_000);
       expect(s.said()).toBeNull();
+    });
+
+    it('saves the milestone applause once the book is finished (regression)', () => {
+      const s = make();
+      s.bus.emit('book-progress', { fraction: 0.6, wordsRead: 0, wpm: null, pagesTurned: 8, minutesReading: 30 });
+      s.bus.emit('book-finished', { title: 'Done', minutesReading: 31, pagesTurned: 12 });
+      expect(QUIPS.bookFinished).toContain(s.said());
+      vi.advanceTimersByTime(10_000);
+      // The last progress report trails in after the finale (it crosses 75 % and 10 pages).
+      s.bus.emit('book-progress', { fraction: 1, wordsRead: 0, wpm: null, pagesTurned: 12, minutesReading: 31 });
+      for (let t = 0; t < 60_000; t += 250) {
+        expect(s.said()).toBeNull();
+        vi.advanceTimersByTime(250);
+      }
+      // A new book starts the milestones over.
+      s.bus.emit('book-opened', { id: 'n', title: 'Next', author: null, wordCount: 10, resumed: false });
+      vi.advanceTimersByTime(10_000);
+      s.bus.emit('book-progress', { fraction: 0, wordsRead: 0, wpm: null, pagesTurned: 0, minutesReading: 0 });
+      s.bus.emit('book-progress', { fraction: 0.3, wordsRead: 0, wpm: null, pagesTurned: 1, minutesReading: 1 });
+      expect(QUIPS.milestone25).toContain(s.said());
     });
 
     it('celebrates every ten pages', () => {
@@ -545,6 +593,20 @@ describe('Buddy', () => {
       expect(s.mood()).toBe('reading'); // …then back to reading along
     });
 
+    it('wakes up to speak instead of talking in his sleep (regression)', () => {
+      const s = make();
+      vi.advanceTimersByTime(SLEEP_AFTER_MS + 1_000);
+      expect(s.mood()).toBe('sleepy');
+      s.bus.emit('buddy-say', { text: 'Your window changed size.', priority: 'high' });
+      expect(s.said()).toBe('Your window changed size.');
+      expect(s.mood()).not.toBe('sleepy');
+      // He dozes off again only after another quiet minute.
+      vi.advanceTimersByTime(SLEEP_AFTER_MS - 5_000);
+      expect(s.mood()).not.toBe('sleepy');
+      vi.advanceTimersByTime(6_000);
+      expect(s.mood()).toBe('sleepy');
+    });
+
     it('celebrates when the book is finished (with confetti) and settles down after', () => {
       const s = make();
       s.bus.emit('book-finished', { title: 'Done', minutesReading: 90, pagesTurned: 120 });
@@ -570,6 +632,31 @@ describe('Buddy', () => {
       expect(s.mood()).toBe('sleepy');
     });
 
+    it('a held mood survives a spoken line with another mood and comes back after it (regression)', () => {
+      const s = make();
+      s.buddy.setMood('thinking', Number.POSITIVE_INFINITY);
+      s.buddy.say('Eureka!', { priority: 'high', mood: 'excited' });
+      expect(s.mood()).toBe('excited'); // the reaction plays over the hold…
+      vi.advanceTimersByTime(speechDurationMs('Eureka!') + 100);
+      expect(s.said()).toBeNull();
+      expect(s.mood()).toBe('thinking'); // …and the hold returns (it used to be lost)
+      s.bus.emit('book-opened', { id: 'b', title: 'T', author: null, wordCount: 10, resumed: false });
+      vi.advanceTimersByTime(30_000);
+      expect(s.mood()).toBe('thinking');
+      s.buddy.setMood('idle', 0);
+      expect(s.mood()).not.toBe('thinking');
+    });
+
+    it('setMood shows at once even while a spoken line has a mood of its own', () => {
+      const s = make();
+      s.buddy.say('Hello there, reader!', { priority: 'high', mood: 'happy' });
+      expect(s.mood()).toBe('happy');
+      s.buddy.setMood('worried', 2_000);
+      expect(s.mood()).toBe('worried');
+      vi.advanceTimersByTime(2_100);
+      expect(s.mood()).not.toBe('worried');
+    });
+
     it('coaches through calibration and steps behind the overlay while targets show', () => {
       const s = make();
       s.bus.emit('calibration', { phase: 'start' });
@@ -584,6 +671,70 @@ describe('Buddy', () => {
       });
       expect(QUIPS.calibrationGood).toContain(s.said());
       expect(s.mood()).toBe('excited');
+    });
+
+    it('does not hold calibration coaching as if the reader were mid-line (regression)', () => {
+      const s = make();
+      // A recalibration: the old model still yields valid gaze on the text column.
+      keepReading(s, 1_500);
+      s.bus.emit('calibration', { phase: 'start' });
+      expect(QUIPS.calibrationStart).toContain(s.said());
+      vi.advanceTimersByTime(9_000);
+      keepReading(s, 1_500);
+      s.bus.emit('calibration', { phase: 'positioning' });
+      expect(QUIPS.calibrationPositioning).toContain(s.said());
+    });
+
+    it('gives the dot tip once, not again when the first dot is retried, paused or resumed (regression)', () => {
+      const s = make();
+      s.bus.emit('calibration', { phase: 'point', index: 0, total: 13 });
+      const tip = s.said();
+      expect(QUIPS.calibrationPoint).toContain(tip);
+      vi.advanceTimersByTime(10_000);
+      expect(s.said()).toBeNull();
+      for (const message of ['face-lost', 'resumed', 'retry']) {
+        s.bus.emit('calibration', { phase: 'point', index: 0, total: 13, message });
+        expect(s.said(), message).toBeNull();
+      }
+    });
+
+    it('steps back down if calibration ends without its closing event (regression)', () => {
+      const s = make();
+      s.bus.emit('tracking-state', { state: 'calibrating' });
+      s.bus.emit('calibration', { phase: 'start' });
+      s.bus.emit('calibration', { phase: 'positioning' });
+      expect(s.root.classList.contains('gr-buddy--above')).toBe(true);
+      s.bus.emit('tracking-state', { state: 'tracking' });
+      expect(s.root.classList.contains('gr-buddy--above')).toBe(false);
+      expect(s.mood()).not.toBe('happy');
+    });
+
+    it('stays quiet about "there you are" when the worried line could not be said (regression)', () => {
+      const s = make();
+      /** One lost-face episode; it ends either quietly (tracking paused) or with the face found again. */
+      const episode = (end: 'paused' | 'tracking'): { lost: string | null; back: string | null } => {
+        s.bus.emit('tracking-state', { state: 'no-face' });
+        vi.advanceTimersByTime(WORRY_AFTER_MS + 10);
+        const lost = s.said();
+        vi.advanceTimersByTime(5_000);
+        s.bus.emit('tracking-state', { state: end });
+        vi.advanceTimersByTime(1_300);
+        const back = s.said();
+        s.bus.emit('tracking-state', { state: 'tracking' });
+        vi.advanceTimersByTime(3_000);
+        return { lost, back };
+      };
+      const n = QUIPS.trackingLost?.length ?? 0;
+      for (let i = 0; i < n; i++) {
+        const { lost, back } = episode('paused');
+        expect(QUIPS.trackingLost).toContain(lost);
+        expect(back).toBeNull(); // paused on purpose: no fuss
+      }
+      // Every worried line was said in the last two minutes, so this episode is silent…
+      const { lost, back } = episode('tracking');
+      expect(lost).toBeNull();
+      // …and a cheery "found you!" answering nothing would make no sense.
+      expect(back).toBeNull();
     });
   });
 
@@ -616,6 +767,20 @@ describe('Buddy', () => {
       vi.advanceTimersByTime(500);
       const [x2 = 0] = pos();
       expect(Math.abs(x2 - (x0 ?? 0))).toBeLessThan(0.5);
+    });
+
+    it('drifts home within ~0.5 s when the gaze stream simply stops', () => {
+      const s = make();
+      const pupil = s.q('.gr-buddy-pupil');
+      const x = () => Number((pupil.getAttribute('transform') ?? '').match(/translate\(([-\d.]+)/)?.[1]);
+      const home = x();
+      for (let i = 0; i < 10; i++) {
+        gaze(s.bus, 5_000, 0);
+        vi.advanceTimersByTime(30);
+      }
+      expect(x()).toBeGreaterThan(home + 2);
+      vi.advanceTimersByTime(900); // no more samples at all
+      expect(Math.abs(x() - home)).toBeLessThan(0.3);
     });
 
     it('lookAt overrides gaze following until cleared', () => {
@@ -752,6 +917,16 @@ describe('Buddy', () => {
       expect(s.pop().hidden).toBe(true);
     });
 
+    it('Tab closes the menu and lets focus move on from Dewey (menu-button pattern)', () => {
+      const s = make();
+      s.btn().click();
+      const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+      document.activeElement?.dispatchEvent(tab);
+      expect(s.pop().hidden).toBe(true);
+      expect(document.activeElement).toBe(s.btn());
+      expect(tab.defaultPrevented).toBe(false);
+    });
+
     it('holds speech while open and resumes after', () => {
       const s = make();
       s.btn().click();
@@ -799,6 +974,72 @@ describe('Buddy', () => {
       expect(s.emitted.some((e) => e.type === 'settings-patch')).toBe(false);
     });
 
+    it('still sees the release when the host page stops its propagation (regression)', () => {
+      const s = make();
+      vi.spyOn(s.root, 'getBoundingClientRect').mockReturnValue(rect(888, 602));
+      const swallow = (e: Event) => e.stopPropagation();
+      document.addEventListener('pointerup', swallow);
+      try {
+        const char = s.q('.gr-buddy-char');
+        pointer('pointerdown', char, 950, 680);
+        pointer('pointermove', char, 120, 90);
+        pointer('pointerup', char, 120, 90);
+        expect(s.root.classList.contains('gr-buddy--dragging')).toBe(false);
+        expect(s.store.get().buddyCorner).toBe('top-left');
+      } finally {
+        document.removeEventListener('pointerup', swallow);
+      }
+    });
+
+    it('a mouse release it never saw ends the drag instead of gluing Dewey to the cursor (regression)', () => {
+      const s = make();
+      vi.spyOn(s.root, 'getBoundingClientRect').mockReturnValue(rect(888, 602));
+      const mouse = (buttons: number): PointerEventInit => ({ pointerType: 'mouse', buttons });
+      const char = s.q('.gr-buddy-char');
+      pointer('pointerdown', char, 950, 680, mouse(1));
+      pointer('pointermove', document.body, 120, 90, mouse(1));
+      expect(s.root.classList.contains('gr-buddy--dragging')).toBe(true);
+      // The button came up outside the window; the next move has no button pressed.
+      pointer('pointermove', document.body, 300, 500, mouse(0));
+      expect(s.root.classList.contains('gr-buddy--dragging')).toBe(false);
+      expect(s.store.get().buddyCorner).toBe('top-left');
+      pointer('pointermove', document.body, 900, 700, mouse(0));
+      expect(s.root.style.transform).toBe('');
+      expect(s.root.classList.contains('gr-buddy--top-left')).toBe(true);
+    });
+
+    it('a new press settles a drag whose release was lost, then drags normally (regression)', () => {
+      const s = make();
+      vi.spyOn(s.root, 'getBoundingClientRect').mockReturnValue(rect(888, 602));
+      const char = s.q('.gr-buddy-char');
+      pointer('pointerdown', char, 950, 680);
+      pointer('pointermove', char, 120, 90);
+      expect(s.root.classList.contains('gr-buddy--dragging')).toBe(true);
+      // No pointerup ever arrives. Before the fix, Dewey ignored every later press.
+      pointer('pointerdown', char, 950, 680);
+      expect(s.root.classList.contains('gr-buddy--dragging')).toBe(false);
+      expect(s.root.style.transform).toBe('');
+      expect(s.emitted.some((e) => e.type === 'settings-patch')).toBe(false);
+      pointer('pointermove', char, 100, 700);
+      pointer('pointerup', char, 100, 700);
+      expect(s.store.get().buddyCorner).toBe('bottom-left');
+    });
+
+    it('hidden mid-drag, he comes back in his corner rather than where the drag left him (regression)', () => {
+      const s = make();
+      vi.spyOn(s.root, 'getBoundingClientRect').mockReturnValue(rect(888, 602));
+      const char = s.q('.gr-buddy-char');
+      pointer('pointerdown', char, 950, 680);
+      pointer('pointermove', char, 500, 300);
+      expect(s.root.style.transform).toMatch(/translate3d/);
+      s.store.update({ buddyEnabled: false });
+      s.store.update({ buddyEnabled: true });
+      expect(s.root.hidden).toBe(false);
+      expect(s.root.style.transform).toBe('');
+      expect(s.root.classList.contains('gr-buddy--dragging')).toBe(false);
+      expect(s.store.get().buddyCorner).toBe('bottom-right');
+    });
+
     it('dropping in the same corner does not patch settings', () => {
       const s = make();
       vi.spyOn(s.root, 'getBoundingClientRect').mockReturnValue(rect(888, 602));
@@ -830,9 +1071,15 @@ describe('Buddy', () => {
       expect(document.querySelector('.gr-buddy')).toBeNull();
       expect(document.querySelectorAll('style[data-gr-style="buddy"]')).toHaveLength(0);
       expect(vi.getTimerCount()).toBe(0);
-      const added = add.mock.calls.map(([type, fn]) => `${type}:${String(fn)}`);
-      const removed = new Set(remove.mock.calls.map(([type, fn]) => `${type}:${String(fn)}`));
-      for (const a of added) expect(removed.has(a)).toBe(true);
+      // A listener only goes away when it is removed with the same capture flag it was added with.
+      const capture = (o: boolean | AddEventListenerOptions | EventListenerOptions | undefined) =>
+        o === true || (typeof o === 'object' && o.capture === true);
+      const key = ([type, fn, o]: readonly [string, unknown, (boolean | AddEventListenerOptions)?]) =>
+        `${type}:${String(fn)}:${capture(o)}`;
+      const added = add.mock.calls.map(key);
+      const removed = new Set(remove.mock.calls.map(key));
+      expect(added.some((a) => a.startsWith('pointerup:') && a.endsWith(':true'))).toBe(true);
+      for (const a of added) expect(removed.has(a), a).toBe(true);
 
       // The bus no longer reaches Dewey.
       s.bus.emit('buddy-say', { text: 'hello?', priority: 'high' });

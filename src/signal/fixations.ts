@@ -12,12 +12,25 @@ export interface FixationOptions {
   minDurationMs: number;
   /** Tracking gaps (invalid samples / missing frames) longer than this end the current fixation. */
   maxGapMs: number;
+  /**
+   * A dwell longer than this is reported as consecutive fixations, so consumers
+   * keep getting updates while the reader stares (lingering at the end of a
+   * page) or re-fixates within a few characters (a short last line). Reading
+   * fixations are shorter than this. Infinity disables it.
+   */
+  maxDurationMs?: number;
 }
 
+/**
+ * Tuned on the simulator (One Euro-smoothed gaze at 30 Hz, noise 0.5–1 line):
+ * 80 px keeps noisy fixations whole while mostly separating forward saccades
+ * (~85 px on a 62-character column); 60 px split noise, 90 px merged too much.
+ */
 export const DEFAULT_FIXATION_OPTIONS: Readonly<FixationOptions> = Object.freeze({
-  maxDispersionPx: 72,
+  maxDispersionPx: 80,
   minDurationMs: 80,
   maxGapMs: 150,
+  maxDurationMs: 600,
 });
 
 export interface FixationUpdate {
@@ -36,7 +49,7 @@ interface Pt {
 const finite = (v: number): boolean => Number.isFinite(v);
 
 export class FixationDetector {
-  private readonly opts: FixationOptions;
+  private readonly opts: Required<FixationOptions>;
   /**
    * Candidate samples, kept only until the window qualifies as a fixation (the
    * I-DT start slides forward over them). A qualified fixation is summarized
@@ -68,14 +81,20 @@ export class FixationDetector {
     const d = DEFAULT_FIXATION_OPTIONS;
     const pick = (v: number | undefined, fallback: number, min: number): number =>
       v !== undefined && Number.isFinite(v) && v >= min ? v : fallback;
+    const minDurationMs = pick(opts.minDurationMs, d.minDurationMs, 0);
+    const maxDuration = opts.maxDurationMs;
     this.opts = {
       maxDispersionPx: pick(opts.maxDispersionPx, d.maxDispersionPx, 1),
-      minDurationMs: pick(opts.minDurationMs, d.minDurationMs, 0),
+      minDurationMs,
       maxGapMs: pick(opts.maxGapMs, d.maxGapMs, 0),
+      maxDurationMs: Math.max(
+        2 * minDurationMs,
+        maxDuration !== undefined && !Number.isNaN(maxDuration) && maxDuration > 0 ? maxDuration : d.maxDurationMs!,
+      ),
     };
   }
 
-  get options(): Readonly<FixationOptions> {
+  get options(): Readonly<Required<FixationOptions>> {
     return this.opts;
   }
 
@@ -102,14 +121,14 @@ export class FixationDetector {
       const pending = this.pending;
       this.pending = null;
       if (this.fits(p)) {
-        this.add(p); // `pending` was a lone outlier
+        completed = this.extend(p); // `pending` was a lone outlier
       } else {
         completed = this.finish();
         this.addCandidate(pending);
         this.addCandidate(p);
       }
     } else if (this.fits(p)) {
-      this.add(p);
+      completed = this.extend(p);
     } else {
       this.pending = p;
     }
@@ -167,6 +186,17 @@ export class FixationDetector {
     const rx = Math.max(this.maxX, p.x) - Math.min(this.minX, p.x);
     const ry = Math.max(this.maxY, p.y) - Math.min(this.minY, p.y);
     return Math.max(rx, ry) <= this.opts.maxDispersionPx;
+  }
+
+  /** Adds a sample to the qualified fixation, or starts the next one if it has lasted long enough. */
+  private extend(p: Pt): Fixation | null {
+    if (p.t - this.startT <= this.opts.maxDurationMs) {
+      this.add(p);
+      return null;
+    }
+    const done = this.finish();
+    this.addCandidate(p);
+    return done;
   }
 
   private add(p: Pt): void {
@@ -231,6 +261,8 @@ const JUMP_DY_LINES = 2.5;
 const MAX_FORWARD_COL = 0.6;
 const MAX_REGRESSION_COL = 1.0;
 const SWEEP_MIN_DX_COL = 0.4;
+/** Longer than the column (plus margin) can't be a line-to-line sweep: it came from off the text. */
+const SWEEP_MAX_DX_COL = 1.2;
 const SWEEP_START_COL = 0.5;
 const SWEEP_LAND_COL = 0.4;
 const SWEEP_MAX_RISE_LINES = 0.5;
@@ -295,7 +327,7 @@ function isReturnSweep(
   g: SaccadeGeometry,
   line: TextLine | null,
 ): boolean {
-  if (dy < -SWEEP_MAX_RISE_LINES * g.pitch) return false;
+  if (dy < -SWEEP_MAX_RISE_LINES * g.pitch || -dx > SWEEP_MAX_DX_COL * g.colWidth) return false;
   if (-dx >= SWEEP_MIN_DX_COL * g.colWidth) {
     if (!g.hasColumn) return true;
     if (prev.x >= g.colLeft + SWEEP_START_COL * g.colWidth && next.x <= g.colLeft + SWEEP_LAND_COL * g.colWidth) {

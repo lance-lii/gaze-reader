@@ -295,6 +295,9 @@ export class SettingsPanel implements Mountable {
     const forget = this.button('Forget calibration', 'gr-btn--ghost gr-settings__forget', () => {
       this.opts.onForgetCalibration();
       this.update(this.opts.getSettings());
+      // The button just disabled itself; a disabled element drops focus to <body>,
+      // outside the drawer's focus trap. Hand it to the natural next step instead.
+      if (forget.disabled) recal.focus({ preventScroll: true });
       this.flash(status, 'Calibration forgotten. You’ll calibrate again next time you use your eyes.');
     }, 'trash');
     this.confirmable(forget, 'Click again to forget');

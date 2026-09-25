@@ -53,9 +53,18 @@ const DOM_ERROR_CODES: Readonly<Record<string, TrackerErrorCode>> = {
   AbortError: 'camera-in-use', // Firefox: "Starting videoinput failed"
 };
 
-/** Maps a getUserMedia / camera failure to a TrackerError (TrackerErrors pass through). */
+/**
+ * Maps a getUserMedia / camera failure to a TrackerError. TrackerErrors pass
+ * through, and error-like objects that already carry a TrackerErrorCode (e.g.
+ * after structured cloning) keep it.
+ */
 export function toTrackerError(err: unknown): TrackerError {
   if (err instanceof TrackerError) return err;
+  const carried = trackerErrorCode(err);
+  if (carried !== 'unknown') {
+    const message = (err as { message?: unknown }).message;
+    return new TrackerError(carried, typeof message === 'string' && message ? message : undefined, { cause: err });
+  }
   const name = err && typeof err === 'object' && 'name' in err ? String((err as { name: unknown }).name) : '';
   const code = DOM_ERROR_CODES[name];
   if (code) return new TrackerError(code, undefined, { cause: err });
@@ -75,8 +84,15 @@ export interface OpenCameraOptions {
   video?: HTMLVideoElement | null;
   /** Merged over DEFAULT_VIDEO_CONSTRAINTS. */
   constraints?: MediaTrackConstraints;
-  /** How long to wait for the first video metadata before giving up. Default 10 s. */
+  /** How long to wait for the first video metadata, and then for playback, before giving up. Default 10 s. */
   startTimeoutMs?: number;
+  /**
+   * Cancels the attempt. An open permission prompt can't be withdrawn, but a
+   * camera granted after the abort is released at once and the element is left
+   * untouched. The promise then rejects with the signal's reason (an AbortError
+   * DOMException by default) rather than a TrackerError.
+   */
+  signal?: AbortSignal;
 }
 
 export interface CameraHandle {
@@ -126,31 +142,83 @@ function prepareVideo(video: HTMLVideoElement): void {
   video.disablePictureInPicture = true;
 }
 
+/** What an aborted operation rejects with: the signal's reason, else a standard AbortError. */
+export function abortReason(signal: AbortSignal | undefined): unknown {
+  const reason: unknown = signal?.reason;
+  return reason ?? new DOMException('The operation was cancelled.', 'AbortError');
+}
+
+/**
+ * Settles like `p`, or rejects with `onTimeout()` after `ms`, or with the abort
+ * reason as soon as `signal` aborts — whichever comes first — leaving no timer
+ * or listener behind. `p`'s eventual rejection is always handled.
+ */
+export function settleWithin<T>(p: Promise<T>, ms: number, onTimeout: () => Error, signal?: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const onAbort = (): void => {
+      finish();
+      reject(abortReason(signal));
+    };
+    p.then(
+      (value) => {
+        finish();
+        resolve(value);
+      },
+      (err: unknown) => {
+        finish();
+        reject(err);
+      },
+    );
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    timer = setTimeout(() => {
+      finish();
+      reject(onTimeout());
+    }, ms);
+    signal?.addEventListener('abort', onAbort);
+  });
+}
+
 const HAVE_METADATA = 1;
 
-function waitForMetadata(video: HTMLVideoElement, timeoutMs: number): Promise<void> {
+function waitForMetadata(video: HTMLVideoElement, timeoutMs: number, signal: AbortSignal | undefined): Promise<void> {
   if (video.readyState >= HAVE_METADATA && video.videoWidth > 0) return Promise.resolve();
-  return new Promise<void>((resolve, reject) => {
-    const cleanup = (): void => {
-      clearTimeout(timer);
+  let removeListeners = (): void => undefined;
+  const loaded = new Promise<void>((resolve, reject) => {
+    const onLoaded = (): void => resolve();
+    const onError = (): void =>
+      reject(new TrackerError('unknown', "The camera video couldn't be decoded.", { cause: video.error }));
+    video.addEventListener('loadedmetadata', onLoaded);
+    video.addEventListener('error', onError);
+    removeListeners = () => {
       video.removeEventListener('loadedmetadata', onLoaded);
       video.removeEventListener('error', onError);
     };
-    const onLoaded = (): void => {
-      cleanup();
-      resolve();
-    };
-    const onError = (): void => {
-      cleanup();
-      reject(new TrackerError('unknown', "The camera video couldn't be decoded.", { cause: video.error }));
-    };
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new TrackerError('camera-in-use', "The camera didn't start sending video. It may be in use by another app."));
-    }, timeoutMs);
-    video.addEventListener('loadedmetadata', onLoaded);
-    video.addEventListener('error', onError);
   });
+  return settleWithin(
+    loaded,
+    timeoutMs,
+    () => new TrackerError('camera-in-use', "The camera didn't start sending video. It may be in use by another app."),
+    signal,
+  ).finally(removeListeners);
+}
+
+function playWithin(video: HTMLVideoElement, timeoutMs: number, signal: AbortSignal | undefined): Promise<void> {
+  const playing = Promise.resolve()
+    .then(() => video.play())
+    .catch((err: unknown) => {
+      // Muted inline video is always allowed to autoplay, so this is rare; it is
+      // not a permission problem with the camera itself.
+      throw new TrackerError('unknown', `The browser refused to play the camera video (${describe(err)}).`, { cause: err });
+    });
+  return settleWithin(playing, timeoutMs, () => new TrackerError('unknown', "The camera video didn't start playing."), signal);
 }
 
 function mediaDevicesOrNull(): MediaDevices | null {
@@ -167,12 +235,15 @@ export function cameraSupportError(): TrackerError | null {
 }
 
 /**
- * Asks for the front camera and starts playing it. Rejects with a TrackerError.
- * The caller must stop() the handle; nothing else releases the camera.
+ * Asks for the front camera and starts playing it. Rejects with a TrackerError
+ * (or the abort reason, see `signal`). The caller must stop() the handle;
+ * nothing else releases the camera.
  */
 export async function openCamera(opts: OpenCameraOptions = {}): Promise<CameraHandle> {
+  const { signal } = opts;
   const mediaDevices = mediaDevicesOrNull();
   if (!mediaDevices || globalThis.isSecureContext === false) throw new TrackerError('insecure-context');
+  if (signal?.aborted) throw abortReason(signal);
 
   let stream: MediaStream;
   try {
@@ -181,17 +252,33 @@ export async function openCamera(opts: OpenCameraOptions = {}): Promise<CameraHa
       audio: false,
     });
   } catch (err) {
+    if (signal?.aborted) throw abortReason(signal);
     throw toTrackerError(err);
+  }
+  const stopTracks = (): void => {
+    for (const t of stream.getTracks()) t.stop();
+  };
+  // Granted after the caller gave up: turn the camera light straight back off,
+  // and don't touch a (possibly shared) video element.
+  if (signal?.aborted) {
+    stopTracks();
+    throw abortReason(signal);
   }
 
   const track = stream.getVideoTracks()[0];
   if (!track) {
-    for (const t of stream.getTracks()) t.stop();
+    stopTracks();
     throw new TrackerError('no-camera');
   }
 
   const ownsVideo = !opts.video;
-  const video = opts.video ?? createHiddenVideo();
+  let video: HTMLVideoElement;
+  try {
+    video = opts.video ?? createHiddenVideo();
+  } catch (err) {
+    stopTracks();
+    throw toTrackerError(err);
+  }
   let stopped = false;
   const handle: CameraHandle = {
     stream,
@@ -211,22 +298,16 @@ export async function openCamera(opts: OpenCameraOptions = {}): Promise<CameraHa
     },
   };
 
+  const timeoutMs = opts.startTimeoutMs ?? 10_000;
   try {
     prepareVideo(video);
     video.srcObject = stream;
-    await waitForMetadata(video, opts.startTimeoutMs ?? 10_000);
-    try {
-      await video.play();
-    } catch (err) {
-      // Muted inline video is always allowed to autoplay, so this is rare; it is
-      // not a permission problem with the camera itself.
-      throw new TrackerError('unknown', `The browser refused to play the camera video (${describe(err)}).`, {
-        cause: err,
-      });
-    }
+    await waitForMetadata(video, timeoutMs, signal);
+    await playWithin(video, timeoutMs, signal);
     return handle;
   } catch (err) {
     handle.stop();
+    if (signal?.aborted) throw abortReason(signal);
     throw toTrackerError(err);
   }
 }

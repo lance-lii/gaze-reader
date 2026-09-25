@@ -195,6 +195,41 @@ describe('trainGazeModel', () => {
     expect(() => trainGazeModel(collect(GRID.slice(0, 2), 20, 52))).toThrow(/at least 3/);
   });
 
+  it('refuses feature names that do not match the vector (every reload would reject the model)', () => {
+    const samples = collect(GRID, 10, 53);
+    const names = Array.from({ length: FEATURE_COUNT - 1 }, (_, i) => `f${i}`);
+    expect(() => trainGazeModel(samples, { viewport: VIEWPORT, featureNames: names })).toThrow(RangeError);
+    expect(() => trainGazeModel(samples, { viewport: VIEWPORT, featureNames: [...names, 'last'] })).not.toThrow();
+  });
+
+  it('keeps lowered-lid samples (looking low on the screen) when the caller raises maxBlink', () => {
+    // Blink scores rise when the reader looks at the bottom row; the overlay's
+    // blink gate has already told these apart from real blinks.
+    const lowered = (s: CalibrationSample): CalibrationSample =>
+      s.target.y > VIEWPORT.height * 0.8 ? { ...s, features: { ...s.features, blink: 0.65 } } : s;
+    const samples = collect(GRID, 20, 54).map(lowered);
+
+    const strict = trainGazeModel(samples, { viewport: VIEWPORT });
+    expect(strict.diagnostics.droppedInvalid).toBe(3 * 20);
+    expect(strict.diagnostics.targets).toBe(GRID.length - 3);
+
+    const lenient = trainGazeModel(samples, { viewport: VIEWPORT, maxBlink: 0.85 });
+    expect(lenient.diagnostics.droppedInvalid).toBe(0);
+    expect(lenient.diagnostics.targets).toBe(GRID.length);
+    // Real blinks stay out.
+    const withBlink = [...samples, { ...samples[0], features: { ...samples[0].features, blink: 0.95 } }];
+    expect(trainGazeModel(withBlink, { viewport: VIEWPORT, maxBlink: 0.85 }).diagnostics.droppedInvalid).toBe(1);
+
+    const bottom = collect([{ x: 640, y: 760 }], 20, 55).map(lowered);
+    expect(evaluateModel(lenient.model, bottom).sampleCount).toBe(0);
+    expect(evaluateModel(lenient.model, bottom, { maxBlink: 0.85 }).sampleCount).toBeGreaterThan(15);
+    expect(evaluateModel(lenient.model, bottom, { maxBlink: Number.NaN }).sampleCount).toBe(0); // NaN → default
+
+    const quick = collect([{ x: 640, y: 400 }, { x: 192, y: 720 }, { x: 1088, y: 720 }], 20, 56).map(lowered);
+    expect(refineGazeModel(lenient.model, quick, { viewport: VIEWPORT }).report.perPoint).toHaveLength(1);
+    expect(refineGazeModel(lenient.model, quick, { viewport: VIEWPORT, maxBlink: 0.85 }).report.perPoint).toHaveLength(3);
+  });
+
   it('skips non-finite feature rows instead of poisoning the fit', () => {
     const samples = collect(GRID, 20, 61);
     samples[0].features.vector[2] = Number.NaN;
@@ -228,6 +263,33 @@ describe('RidgeGazeModel.predict', () => {
     const j = model.dominantFeatures[0];
     expect(model.predict({ ...good, vector: good.vector.map((v, i) => (i === j ? v + 100 : v)) })).toBeNull();
     expect(model.predictScreen(null)).toBeNull();
+  });
+
+  it('never rejects a prediction because the reader sits differently (posture features), only for eye glitches', () => {
+    // The reader nodded slightly toward each dot, so head `ty` tracks the targets and is picked as dominant.
+    const names = Array.from({ length: FEATURE_COUNT }, (_, i) => (i === 5 ? 'ty' : `f${i}`));
+    const r = rng(86);
+    const nod = (s: CalibrationSample): CalibrationSample => {
+      const v = [...s.features.vector];
+      v[5] = 0.8 * (s.target.y / VIEWPORT.height - 0.5) + 0.01 * gaussian(r);
+      return { ...s, features: { ...s.features, vector: v } };
+    };
+    const trained = trainGazeModel(collect(GRID, 25, 87).map(nod), { viewport: VIEWPORT, featureNames: names }).model;
+    expect(trained.dominantFeatures).toContain(5);
+    const f = nod({ target: GRID[12], features: eyeFeatures(GRID[12], rng(88), { noise: 0 }), t: 0 }).features;
+    // Leaning back 20 cm later is hundreds of calibration SDs in `ty`: still a prediction.
+    expect(trained.predict({ ...f, vector: f.vector.map((v, i) => (i === 5 ? v + 20 : v)) })).not.toBeNull();
+    // An eye feature that far out is still a tracking glitch.
+    const eye = trained.dominantFeatures.find((j) => j !== 5)!;
+    expect(trained.predict({ ...f, vector: f.vector.map((v, i) => (i === eye ? v + 100 : v)) })).toBeNull();
+
+    // Models saved before this rule learn it on load from the running build's names…
+    const legacy = { ...trained.toJSON() } as Record<string, unknown>;
+    delete legacy.glitchCheck;
+    const leaned = { ...f, vector: f.vector.map((v, i) => (i === 5 ? v + 20 : v)) };
+    expect(deserializeGazeModel(legacy, { featureNames: names })!.predict(leaned)).not.toBeNull();
+    // …and without names keep the old, all-dominant check.
+    expect(deserializeGazeModel(legacy)!.predict(leaned)).toBeNull();
   });
 
   it('stays bounded when non-gaze features drift far from calibration', () => {

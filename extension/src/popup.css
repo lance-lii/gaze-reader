@@ -65,6 +65,21 @@ label.row {
   border-top: 1px solid var(--border);
 }
 
+.row--stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.segmented--fill {
+  display: flex;
+}
+
+.segmented--fill label {
+  flex: 1;
+  justify-content: center;
+}
+
 .row-text {
   display: flex;
   flex-direction: column;
@@ -154,6 +169,10 @@ label.row {
   flex-wrap: wrap;
   gap: 4px;
   margin: 0;
+}
+
+.foot .keys {
+  white-space: nowrap;
 }
 
 .foot svg {

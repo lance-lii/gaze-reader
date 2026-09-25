@@ -30,8 +30,9 @@ export interface SanitizeOptions {
   rewriteHref?: (href: string) => string | null;
 }
 
-const XHTML_NS = 'http://www.w3.org/1999/xhtml';
 const XML_NS = 'http://www.w3.org/XML/1998/namespace';
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const MATHML_NS = 'http://www.w3.org/1998/Math/MathML';
 
 /** Elements that survive unchanged (the contract in docs/ARCHITECTURE.md). */
 const ALLOWED = new Set([
@@ -91,15 +92,13 @@ function tagOf(el: Element): string {
   return el.localName.toLowerCase();
 }
 
-function isHtmlNamespace(el: Element): boolean {
-  return el.namespaceURI === XHTML_NS || el.namespaceURI === null;
-}
-
 function disposition(el: Element): Disposition {
   const tag = tagOf(el);
   if (DROPPED.has(tag)) return { kind: 'drop' };
-  // Anything from a foreign namespace (epub:switch, stray MathML children, …) keeps only its text.
-  if (!isHtmlNamespace(el)) return { kind: 'unwrap' };
+  // SVG/MathML fragments outside their roots keep only their text. Other vocabularies that
+  // reuse HTML names (DTBook's <p>, <h1>, <em> in EPUB 2) map like HTML: every output element
+  // is created fresh in the HTML namespace, so no namespace can be smuggled through.
+  if (el.namespaceURI === SVG_NS || el.namespaceURI === MATHML_NS) return { kind: 'unwrap' };
   if (ALLOWED.has(tag)) return { kind: 'element', tag };
   const renamed = RENAMED[tag];
   if (renamed) return { kind: 'element', tag: renamed };
@@ -123,6 +122,14 @@ function prefixedId(raw: string, prefix: string): string | null {
   return token ? prefix + token : null;
 }
 
+/**
+ * The id the sanitizer gives an element whose source id is `raw` (and the fragment a
+ * link to it gets), e.g. for adding link targets outside the sanitized content.
+ */
+export function sanitizeId(raw: string, prefix: string = SANITIZE_ID_PREFIX): string | null {
+  return prefixedId(raw, resolveOptions({ idPrefix: prefix }).idPrefix);
+}
+
 function decodeFragment(fragment: string): string {
   try {
     return decodeURIComponent(fragment);
@@ -133,7 +140,7 @@ function decodeFragment(fragment: string): string {
 
 /** ASCII tab/newline are removed anywhere by the URL parser; C0 controls and spaces are trimmed. */
 function compactUrl(raw: string): string {
-  return raw.replace(/[\t\n\r]/g, '').replace(/^[\u0000- ]+|[\u0000- ]+$/g, '');
+  return raw.replace(/[\t\n\r]/g, '').replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '');
 }
 
 function isSameDocument(url: URL, base: URL): boolean {
@@ -195,20 +202,29 @@ function resolveOptions(opts: SanitizeOptions | undefined): ResolvedOptions {
   return { base, idPrefix, rewriteHref: opts?.rewriteHref ?? null };
 }
 
+/** Output attributes are written in this order, whatever the source order, so sanitizing is idempotent. */
+const ATTRIBUTE_ORDER = [
+  'id', 'href', 'rel', 'target', 'title', 'lang', 'dir', 'datetime', 'colspan', 'rowspan', 'scope', 'start',
+  'reversed', 'type', 'value',
+] as const;
+type OutputAttribute = (typeof ATTRIBUTE_ORDER)[number];
+
 /** Copies the allowlisted, validated attributes of `src` onto `out`. */
 function copyAttributes(src: Element, out: Element, tag: string, opts: ResolvedOptions): void {
+  const attrs = new Map<OutputAttribute, string>();
   let id: string | null = null;
   let legacyName: string | null = null;
+  let xmlLang: string | null = null;
 
   for (const attr of Array.from(src.attributes)) {
     const ns = attr.namespaceURI;
     const name = attr.localName.toLowerCase();
     const value = attr.value;
+    const trimmed = value.trim();
     if (value.length > MAX_ATTR_LENGTH && name !== 'href') continue;
 
     if (ns === XML_NS) {
-      // xml:lang from XHTML is the same thing as lang.
-      if (name === 'lang' && LANG_RE.test(value.trim())) out.setAttribute('lang', value.trim());
+      if (name === 'lang' && LANG_RE.test(trimmed)) xmlLang = trimmed; // XHTML's xml:lang is lang
       continue;
     }
     if (ns !== null) continue;
@@ -221,59 +237,54 @@ function copyAttributes(src: Element, out: Element, tag: string, opts: ResolvedO
         if (tag === 'a') legacyName = value; // <a name="ch1"> is an old-style link target
         break;
       case 'title':
-        if (value.trim()) out.setAttribute('title', value.trim());
+        if (trimmed) attrs.set('title', trimmed);
         break;
       case 'lang':
-        if (LANG_RE.test(value.trim())) out.setAttribute('lang', value.trim());
+        if (LANG_RE.test(trimmed)) attrs.set('lang', trimmed);
         break;
       case 'dir': {
-        const dir = value.trim().toLowerCase();
-        if (dir === 'ltr' || dir === 'rtl' || dir === 'auto') out.setAttribute('dir', dir);
+        const dir = trimmed.toLowerCase();
+        if (dir === 'ltr' || dir === 'rtl' || dir === 'auto') attrs.set('dir', dir);
         break;
       }
       case 'href': {
         if (tag !== 'a') break;
         const safe = sanitizeHref(value, opts);
         if (!safe) break;
-        out.setAttribute('href', safe.href);
+        attrs.set('href', safe.href);
         if (safe.kind === 'external') {
-          out.setAttribute('rel', 'noopener noreferrer');
-          out.setAttribute('target', '_blank');
+          attrs.set('rel', 'noopener noreferrer');
+          attrs.set('target', '_blank');
         }
         break;
       }
       case 'datetime':
-        if (tag === 'time' && value.trim().length <= 100) out.setAttribute('datetime', value.trim());
+        if (tag === 'time' && trimmed.length <= 100) attrs.set('datetime', trimmed);
         break;
       case 'colspan':
       case 'rowspan': {
         if (tag !== 'td' && tag !== 'th') break;
         const n = parseIntAttr(value, name === 'colspan' ? 1 : 0, 1000);
-        if (n !== null) out.setAttribute(name, n);
+        if (n !== null) attrs.set(name, n);
         break;
       }
       case 'scope': {
-        const scope = value.trim().toLowerCase();
-        if (tag === 'th' && /^(row|col|rowgroup|colgroup)$/.test(scope)) out.setAttribute('scope', scope);
+        const scope = trimmed.toLowerCase();
+        if (tag === 'th' && /^(row|col|rowgroup|colgroup)$/.test(scope)) attrs.set('scope', scope);
         break;
       }
       case 'start':
-        if (tag === 'ol') {
-          const n = parseIntAttr(value, -1_000_000, 1_000_000);
-          if (n !== null) out.setAttribute('start', n);
-        }
+      case 'value': {
+        if ((name === 'start' && tag !== 'ol') || (name === 'value' && tag !== 'li')) break;
+        const n = parseIntAttr(value, -1_000_000, 1_000_000);
+        if (n !== null) attrs.set(name, n);
         break;
+      }
       case 'reversed':
-        if (tag === 'ol') out.setAttribute('reversed', '');
+        if (tag === 'ol') attrs.set('reversed', '');
         break;
       case 'type':
-        if (tag === 'ol' && /^[1aAiI]$/.test(value.trim())) out.setAttribute('type', value.trim());
-        break;
-      case 'value':
-        if (tag === 'li') {
-          const n = parseIntAttr(value, -1_000_000, 1_000_000);
-          if (n !== null) out.setAttribute('value', n);
-        }
+        if (tag === 'ol' && /^[1aAiI]$/.test(trimmed)) attrs.set('type', trimmed);
         break;
       default:
         // Everything else — on*, style, class, src, srcdoc, formaction, xlink:href, data-*, … — is dropped.
@@ -282,17 +293,53 @@ function copyAttributes(src: Element, out: Element, tag: string, opts: ResolvedO
   }
 
   const safeId = prefixedId(id ?? legacyName ?? '', opts.idPrefix);
-  if (safeId) out.setAttribute('id', safeId);
+  if (safeId) attrs.set('id', safeId);
+  if (xmlLang && !attrs.has('lang')) attrs.set('lang', xmlLang);
+  if (tagOf(src) === 'bdi' && !attrs.has('dir')) attrs.set('dir', 'auto');
+  for (const name of ATTRIBUTE_ORDER) {
+    const value = attrs.get(name);
+    if (value !== undefined) out.setAttribute(name, value);
+  }
 }
 
-/** Would this <p> produce block-level output? Then it must be a <div> to stay valid HTML. */
-function hasBlockDescendant(el: Element): boolean {
-  const all = el.getElementsByTagName('*');
-  for (let i = 0; i < all.length; i++) {
-    const d = disposition(all[i]);
-    if (d.kind === 'element' && BLOCK_OUTPUT.has(d.tag)) return true;
-  }
-  return false;
+/**
+ * Answers "would this <p> produce block-level output?" (then it must become a <div>
+ * to stay valid HTML). Results are memoized per source element, so hostile nesting
+ * such as <p><table><tr><td><p>… repeated thousands of times costs O(n) in total
+ * instead of rescanning every paragraph's subtree. Dropped subtrees produce no
+ * output and are not searched. Any tag that buildInto later demotes (nested links,
+ * the depth cap) only makes this an over-estimate, which is the safe direction.
+ */
+function createBlockProbe(): (el: Element) => boolean {
+  const memo = new WeakMap<Element, boolean>();
+  return (root) => {
+    const known = memo.get(root);
+    if (known !== undefined) return known;
+    const stack: { el: Element; next: Element | null; found: boolean }[] = [
+      { el: root, next: root.firstElementChild, found: false },
+    ];
+    let result = false;
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1];
+      const child = top.next;
+      if (child) {
+        top.next = child.nextElementSibling;
+        const d = disposition(child);
+        if (d.kind === 'drop') continue;
+        if (d.kind === 'element' && BLOCK_OUTPUT.has(d.tag)) top.found = true;
+        const cached = memo.get(child);
+        if (cached !== undefined) top.found ||= cached;
+        else stack.push({ el: child, next: child.firstElementChild, found: false });
+        continue;
+      }
+      stack.pop();
+      memo.set(top.el, top.found);
+      const parent = stack[stack.length - 1];
+      if (parent) parent.found ||= top.found;
+      else result = top.found;
+    }
+    return result;
+  };
 }
 
 interface Frame {
@@ -300,21 +347,25 @@ interface Frame {
   parent: Node;
   depth: number;
   inLink: boolean;
+  inHeading: boolean;
 }
+
+const HEADINGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
 
 /**
  * Rebuilds the sanitized children of `src` under `outRoot`, creating every node
  * with `outDoc`. Iterative (explicit stack) so hostile nesting can't blow the stack.
  */
 function buildInto(src: Node, outDoc: Document, outRoot: Node, opts: ResolvedOptions): void {
+  const hasBlockDescendant = createBlockProbe();
   const stack: Frame[] = [];
-  const pushChildren = (node: Node, parent: Node, depth: number, inLink: boolean): void => {
-    for (let c = node.lastChild; c; c = c.previousSibling) stack.push({ node: c, parent, depth, inLink });
+  const pushChildren = (node: Node, parent: Node, depth: number, inLink: boolean, inHeading: boolean): void => {
+    for (let c = node.lastChild; c; c = c.previousSibling) stack.push({ node: c, parent, depth, inLink, inHeading });
   };
-  pushChildren(src, outRoot, 0, false);
+  pushChildren(src, outRoot, 0, false, false);
 
   while (stack.length > 0) {
-    const { node, parent, depth, inLink } = stack.pop() as Frame;
+    const { node, parent, depth, inLink, inHeading } = stack.pop() as Frame;
 
     if (node.nodeType === Node.TEXT_NODE || node.nodeType === Node.CDATA_SECTION_NODE) {
       const data = (node as CharacterData).data;
@@ -330,8 +381,13 @@ function buildInto(src: Node, outDoc: Document, outRoot: Node, opts: ResolvedOpt
     let tag = d.kind === 'element' ? d.tag : null;
     const parentTag = parent.nodeType === Node.ELEMENT_NODE ? (parent as Element).localName : '';
 
-    if (tag === 'a' && inLink) tag = null; // nested links are invalid; keep the text
+    // Content models an HTML parser enforces: fix them now so a later parse can't rearrange the tree.
+    if (tag === 'a' && inLink) tag = null; // nested links: keep the text
+    if (tag !== null && HEADINGS.has(tag) && inHeading) tag = null; // nested headings: keep the text
     if (tag === 'p' && hasBlockDescendant(el)) tag = 'div';
+    // A list item outside its list would be auto-closed (and moved) by the next list item a parser sees.
+    if (tag === 'li' && parentTag !== 'ul' && parentTag !== 'ol') tag = 'div';
+    if ((tag === 'dt' || tag === 'dd') && parentTag !== 'dl') tag = 'div';
     // Keep table structure well-formed so a later HTML parse can't rearrange it.
     if ((tag === 'thead' || tag === 'tbody') && parentTag !== 'table') tag = null;
     if (tag === 'tr' && !TABLE_SECTION.has(parentTag)) tag = 'div';
@@ -343,26 +399,48 @@ function buildInto(src: Node, outDoc: Document, outRoot: Node, opts: ResolvedOpt
       if (parentTag === 'table' && parent.parentNode) {
         const div = outDoc.createElement('div');
         parent.parentNode.insertBefore(div, parent);
-        pushChildren(el, div, depth + 1, inLink);
+        pushChildren(el, div, depth + 1, inLink, inHeading);
       } else {
-        pushChildren(el, parent, depth, inLink);
+        pushChildren(el, parent, depth, inLink, inHeading);
       }
       continue;
     }
 
     if (tag === null) {
-      pushChildren(el, parent, depth, inLink);
+      pushChildren(el, parent, depth, inLink, inHeading);
       continue;
     }
 
     const out = outDoc.createElement(tag);
     copyAttributes(el, out, tag, opts);
-    if (tag === 'span' && tagOf(el) === 'bdi' && !out.hasAttribute('dir')) out.setAttribute('dir', 'auto');
     parent.appendChild(out);
-    if (tag !== 'br' && tag !== 'hr') pushChildren(el, out, depth + 1, inLink || tag === 'a');
+    if (tag !== 'br' && tag !== 'hr') {
+      pushChildren(el, out, depth + 1, inLink || tag === 'a', inHeading || HEADINGS.has(tag));
+    }
   }
 
   pruneEmpty(outRoot);
+  trimLeadingWhitespace(outRoot);
+}
+
+/**
+ * An HTML parser drops ASCII whitespace that precedes the first content, so leading
+ * whitespace would not survive a serialize → parse round trip. It never renders
+ * anyway (it sits at the start of a block), so remove it for a stable output.
+ */
+function trimLeadingWhitespace(root: Node): void {
+  let first = root.firstChild;
+  while (first && first.nodeType === Node.TEXT_NODE) {
+    const text = first as Text;
+    const trimmed = text.data.replace(/^[\t\n\f\r ]+/, '');
+    if (trimmed) {
+      text.data = trimmed;
+      return;
+    }
+    const next = first.nextSibling;
+    root.removeChild(first);
+    first = next;
+  }
 }
 
 function pruneEmpty(root: Node): void {

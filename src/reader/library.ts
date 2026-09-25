@@ -154,9 +154,17 @@ class IdbBackend implements Backend {
 let backendPromise: Promise<Backend> | null = null;
 let warned = false;
 
-function openDatabase(factory: IDBFactory): Promise<IDBDatabase> {
+/**
+ * Opens the database. `onLost` runs when this connection goes away later (another
+ * tab upgrades the schema, or the browser closes it) so the next call reopens.
+ */
+function openDatabase(factory: IDBFactory, onLost: () => void): Promise<IDBDatabase> {
   return new Promise<IDBDatabase>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('IndexedDB took too long to open')), OPEN_TIMEOUT_MS);
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      reject(new Error('IndexedDB took too long to open'));
+    }, OPEN_TIMEOUT_MS);
     let request: IDBOpenDBRequest;
     try {
       request = factory.open(DB_NAME, DB_VERSION);
@@ -172,30 +180,36 @@ function openDatabase(factory: IDBFactory): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(PROGRESS)) db.createObjectStore(PROGRESS, { keyPath: 'bookId' });
     };
     request.onsuccess = () => {
-      clearTimeout(timer);
       const db = request.result;
-      // Let another tab upgrade the schema; we reopen lazily on the next call.
+      if (settled) {
+        // We gave up waiting and fell back to memory: don't leak a connection that
+        // would block other tabs' upgrades (and must never reset the fallback).
+        db.close();
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
       db.onversionchange = () => {
         db.close();
-        backendPromise = null;
+        onLost();
       };
-      db.onclose = () => {
-        backendPromise = null;
-      };
+      db.onclose = onLost;
       resolve(db);
     };
     request.onerror = () => {
       clearTimeout(timer);
+      if (settled) return;
+      settled = true;
       reject(request.error ?? new Error('IndexedDB failed to open'));
     };
   });
 }
 
-async function createBackend(): Promise<Backend> {
+async function createBackend(onLost: () => void): Promise<Backend> {
   const factory = typeof indexedDB === 'undefined' ? null : indexedDB;
   if (!factory) return new MemoryBackend();
   try {
-    return new IdbBackend(await openDatabase(factory));
+    return new IdbBackend(await openDatabase(factory, onLost));
   } catch (err) {
     if (!warned) {
       warned = true;
@@ -206,7 +220,13 @@ async function createBackend(): Promise<Backend> {
 }
 
 function backend(): Promise<Backend> {
-  backendPromise ??= createBackend();
+  if (!backendPromise) {
+    const created: Promise<Backend> = createBackend(() => {
+      // Only forget the connection that was lost, never a newer one (or the memory fallback).
+      if (backendPromise === created) backendPromise = null;
+    });
+    backendPromise = created;
+  }
   return backendPromise;
 }
 

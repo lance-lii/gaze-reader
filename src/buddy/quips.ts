@@ -253,10 +253,16 @@ export class QuipPicker {
 
   pick(key: QuipKey, vars: QuipVars = {}, avoid: (line: string) => boolean = () => false): string | null {
     const lines: readonly string[] = QUIP_TABLE[key];
-    if (lines.length === 0) return null;
-    // One pass over a full deck is enough to try every line once.
-    for (let attempt = 0; attempt < lines.length; attempt++) {
-      const idx = this.draw(key, lines.length);
+    const n = lines.length;
+    if (n === 0) return null;
+    // A partly dealt deck can run out mid-search and be reshuffled, so count
+    // distinct lines tried, not draws: the rest of this deck plus one fresh
+    // deck (≤ 2n draws) is guaranteed to show every line at least once.
+    const tried = new Set<number>();
+    for (let draws = 0; tried.size < n && draws < 2 * n; draws++) {
+      const idx = this.draw(key, n);
+      if (tried.has(idx)) continue;
+      tried.add(idx);
       const filled = fillTemplate(lines[idx] ?? '', vars);
       if (filled !== null && !avoid(filled)) {
         this.lastPicked.set(key, idx);

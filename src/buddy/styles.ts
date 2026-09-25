@@ -311,7 +311,7 @@ ${mouthRules} { opacity: 1; }
   54% { opacity: 1; transform: scaleX(-0.06) skewY(9deg); }
   100% { opacity: 1; transform: scaleX(-1); }
 }
-@keyframes ${B}-flip-shade { 0%, 50% { opacity: 0; } 51% { opacity: 0.45; } 100% { opacity: 0.18; } }
+@keyframes ${B}-flip-shade { 0% { opacity: 0; } 40% { opacity: 0.3; } 50% { opacity: 0.55; } 100% { opacity: 0.2; } }
 @keyframes ${B}-z {
   0% { opacity: 0; transform: translate(0, 3px) scale(0.7); }
   25% { opacity: 0.9; }

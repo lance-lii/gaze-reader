@@ -331,10 +331,8 @@ export class CameraHub {
   }
 
   private send(port: PortLike, msg: HubToTab): void {
-    if (!safePost(port, msg)) {
-      // Dead port whose disconnect event hasn't arrived yet.
-      this.tabs.delete(port);
-    }
+    // A failed post means a dead port; its onDisconnect handler removes it and reconciles.
+    safePost(port, msg);
   }
 
   private command(msg: HubToOffscreen): void {

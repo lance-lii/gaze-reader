@@ -11,7 +11,6 @@
 import type {
   AppSettings,
   CommandName,
-  GazeModel,
   GazeSample,
   GazeSource,
   LayoutChangeReason,
@@ -27,12 +26,11 @@ import { createSettingsStore, type SettingsStore } from '../../src/core/settings
 import { IGNORE_ATTR } from '../../src/core/constants';
 import { WebcamGazeSource } from '../../src/gaze/webcamGazeSource';
 import { MouseGazeSource } from '../../src/gaze/mouseGazeSource';
-import { deserializeGazeModel } from '../../src/gaze/calibrationModel';
 import { FEATURE_NAMES } from '../../src/gaze/features';
 import { CalibrationOverlay } from '../../src/ui/calibrationOverlay';
 import { FixationDetector } from '../../src/signal/fixations';
 import { LineTracker } from '../../src/reading/lineTracker';
-import { PageEndDetector } from '../../src/reading/pageEndDetector';
+import { PageEndDetector, lastFullyVisibleLine } from '../../src/reading/pageEndDetector';
 import { measureLines } from '../../src/reader/lineGeometry';
 import { ScrollController } from '../../src/reader/scrollController';
 import { Buddy } from '../../src/buddy/buddy';
@@ -57,12 +55,24 @@ import { PagePill } from './pagePill';
 import type { PortLike } from './ports';
 import { RemoteFeatureSource, RemoteTrackerError, type RemoteSourceStatus } from './remoteFeatureSource';
 import { isTypingContext, matchShortcut, type ShortcutAction } from './shortcuts';
+import { zoomAware, zoomAwareFromJSON, type ZoomAwareGazeModel } from './zoomModel';
 
 export const HOST_TAG = 'gaze-reader-root';
 /** The host must sit above everything the page draws; our components order themselves inside it with Z.*. */
 const HOST_Z_INDEX = '2147483647';
+/** Grace beyond scrollDurationMs before a stalled page-turn animation is finished instantly. */
+const SCROLL_RESCUE_MS = 1_500;
 /** A calibration saved by a build with different features is useless; reject it on load. */
 const MODEL_COMPAT = { featureNames: FEATURE_NAMES } as const;
+/** Tracking-state detail while the webcam waits for a first calibration. */
+const NOT_CALIBRATED = 'Not calibrated yet';
+/** How often Dewey hears how far through the page the reader is. */
+const PROGRESS_EVERY_MS = 5_000;
+/**
+ * Confidence must stay low this long before the pill says "shaky": the blink score rises as the
+ * lids lower to read the last lines, so every page end dips it for a moment.
+ */
+const POOR_AFTER_MS = 2_500;
 
 export interface PageSessionDeps {
   storage: ExtStorage;
@@ -107,8 +117,13 @@ export class PageSession {
       loadSettings(deps.storage.area),
       loadCalibrationJSON(deps.storage.area),
     ]);
-    const session = new PageSession(deps, settings, calibration ? deserializeGazeModel(calibration, MODEL_COMPAT) : null);
-    session.boot();
+    const session = new PageSession(deps, settings, calibration ? zoomAwareFromJSON(calibration, MODEL_COMPAT) : null);
+    try {
+      session.boot();
+    } catch (err) {
+      session.destroy(); // whatever boot() managed to set up
+      throw err;
+    }
     return session;
   }
 
@@ -134,7 +149,7 @@ export class PageSession {
   private href = location.href;
   private layout: LineLayout | null = null;
 
-  private model: GazeModel | null;
+  private model: ZoomAwareGazeModel | null;
   private remote: RemoteFeatureSource | null = null;
   private gaze: GazeSource | null = null;
   private offGaze: Unsubscribe | null = null;
@@ -161,11 +176,17 @@ export class PageSession {
   private lastSampleAt = 0;
   private lastValidAt = 0;
   private confidence = 1;
+  /** When the smoothed confidence dropped under the "poor" threshold (null while above it). */
+  private lowSince: number | null = null;
   private readingMs = 0;
+  private totalReadingMs = 0;
+  private lastProgressAt = 0;
+  private wordCount = 0;
   private lastTick = performance.now();
   private disposed = false;
+  private buddyView: { from: AppSettings; view: AppSettings } | null = null;
 
-  private constructor(deps: PageSessionDeps, settings: AppSettings, model: GazeModel | null) {
+  private constructor(deps: PageSessionDeps, settings: AppSettings, model: ZoomAwareGazeModel | null) {
     this.deps = deps;
     this.model = model;
     // Never the page's localStorage: this store lives in memory and syncs with chrome.storage.local.
@@ -193,7 +214,7 @@ export class PageSession {
     this.pill.mount(this.root);
     d.add(() => this.pill.destroy());
 
-    this.mountSafely('Dewey', () => new Buddy({ bus: this.bus, getSettings: this.getSettings }));
+    this.mountSafely('Dewey', () => new Buddy({ bus: this.bus, getSettings: this.buddySettings }));
     this.gazeDot = this.mountSafely('gaze dot', () => new GazeDot({ bus: this.bus, getSettings: this.getSettings }));
     this.debugOverlay = this.mountSafely('debug overlay', () => new DebugOverlay({ bus: this.bus, getSettings: this.getSettings }));
     this.gazeDot?.setVisible(settings.showGazeDot);
@@ -228,15 +249,28 @@ export class PageSession {
       this.scroll = null;
     });
 
+    this.wordCount = countWords(this.main.textContent ?? '');
     this.bus.emit('book-opened', {
       id: `page:${location.origin}${location.pathname}`,
       title: document.title.trim() || location.hostname || 'this page',
       author: null,
-      wordCount: countWords(this.main.textContent ?? ''),
+      wordCount: this.wordCount,
       resumed: false,
     });
     void this.startSource();
   }
+
+  /**
+   * Dewey's view of the settings. Pausing is per tab here (settings are shared
+   * by every tab), so the reader's pause shows up as auto-scroll off: his menu
+   * then offers "Resume" rather than a second "Pause".
+   */
+  private readonly buddySettings = (): AppSettings => {
+    const s = this.store.get();
+    if (!this.paused || !s.autoScroll) return s;
+    if (this.buddyView?.from !== s) this.buddyView = { from: s, view: { ...s, autoScroll: false } };
+    return this.buddyView.view;
+  };
 
   destroy(): void {
     if (this.disposed) return;
@@ -269,7 +303,7 @@ export class PageSession {
       case 'recalibrate':
         return this.recalibrate();
       case 'page-forward':
-        void this.turnPage(lastFullyVisible(this.layout), false, 'keyboard');
+        void this.turnPage(this.layout ? lastFullyVisibleLine(this.layout) : -1, false, 'keyboard');
         return;
       case 'page-back':
         void this.pageBack();
@@ -288,7 +322,7 @@ export class PageSession {
         this.pill.toggleHelp();
         return;
       case 'open-settings':
-        this.say('My settings live behind the Gaze Reader button in your toolbar.', 'normal', 'thinking');
+        this.say('My settings live behind the Gaze Reader button in your toolbar.', 'high', 'thinking');
         return;
       case 'turn-off':
         this.deps.onEnded('user');
@@ -362,11 +396,18 @@ export class PageSession {
     this.scrollerDisposer = sd;
   }
 
-  /** Content that changes size or text (lazy images, live updates, infinite scroll) invalidates the layout. */
+  /**
+   * Content that changes size or text (lazy images, live updates, infinite
+   * scroll) invalidates the layout. It is still the same text, so this is a
+   * reflow ('resize': the tracker carries its belief across by docTop), not new
+   * content ('content' would wipe the posterior and the fixation count, and on
+   * pages whose ads or timestamps tick every few seconds auto-scroll would never
+   * build up enough evidence to turn).
+   */
   private observeMain(): void {
     this.mainObservers?.dispose();
     const od = new Disposer();
-    const changed = throttle(od, () => this.remeasure('content'), 300);
+    const changed = throttle(od, () => this.remeasure('resize'), 300);
     if (typeof ResizeObserver === 'function') {
       const ro = new ResizeObserver(changed);
       ro.observe(this.main);
@@ -382,6 +423,8 @@ export class PageSession {
 
   private remeasure(reason: LayoutChangeReason): LineLayout | null {
     if (this.disposed) return null;
+    // Mid-turn the page is between positions; the turn remeasures when it lands.
+    if (this.turning && reason !== 'page-turn') return this.layout;
     if (!this.main.isConnected || location.href !== this.href) {
       this.locateContent();
       reason = 'content';
@@ -422,6 +465,7 @@ export class PageSession {
 
   private async startSource(): Promise<void> {
     const gen = ++this.sourceGen;
+    this.interruptCalibration();
     this.stopGaze();
     if (this.disposed || this.hidden) return;
     const kind: SourceKind = this.getSettings().gazeSource === 'webcam' ? 'webcam' : 'mouse';
@@ -505,21 +549,32 @@ export class PageSession {
       case 'reconnecting':
         if (this.cameraRunning) this.setBase('starting', 'Reconnecting…');
         return;
+      case 'starting':
+        // The service worker is restarting the camera for us (e.g. the offscreen document crashed).
+        if (this.cameraRunning && !this.calibration) this.setBase('starting', 'Restarting the camera…');
+        return;
       case 'running':
-        if (this.cameraRunning && this.base === 'starting') this.setBase(this.calibration ? 'calibrating' : 'tracking');
+        if (this.cameraRunning && this.base === 'starting') this.settleWebcamState();
         return;
       case 'error':
         // Errors while starting are handled by startSource(); this is a camera that died mid-read.
         if (this.cameraRunning) {
           this.cameraRunning = false;
           this.stopGaze();
-          this.calibration?.cancel();
+          this.interruptCalibration();
           this.onCameraError(new RemoteTrackerError(s.code ?? 'unknown', s.message));
         }
         return;
       default:
         return;
     }
+  }
+
+  /** The camera is back (after a reconnect or restart): return to whatever the webcam path was doing. */
+  private settleWebcamState(): void {
+    if (this.calibration) this.setBase('calibrating');
+    else if (!this.model) this.setBase('paused', NOT_CALIBRATED);
+    else this.setBase('tracking');
   }
 
   private onCameraError(err: unknown): void {
@@ -558,7 +613,7 @@ export class PageSession {
   private recalibrate(): void {
     if (this.disposed || this.calibration) return;
     if (this.getSettings().gazeSource !== 'webcam') {
-      this.say('Calibration is only needed for webcam mode.', 'normal', 'thinking');
+      this.say('Calibration is only needed for webcam mode.', 'high', 'thinking');
       return;
     }
     this.calibrationDeclined = false;
@@ -577,11 +632,12 @@ export class PageSession {
       bus: this.bus,
       video: null, // the camera lives in the offscreen document; positioning feedback comes from the features
       mode: 'standard',
-      baseModel: this.model,
+      baseModel: this.model?.inner ?? null,
       featureNames: FEATURE_NAMES,
       // "≈ N lines" in the results uses this page's real line spacing.
       linePitchPx: () => this.layout?.linePitch,
     });
+    const gen = this.sourceGen;
     this.calibration = overlay;
     this.calibrationInterrupted = false;
     this.setBase('calibrating');
@@ -598,16 +654,20 @@ export class PageSession {
       if (!this.disposed) this.pill.setHidden(false);
     }
     if (this.disposed) return;
+    const sourceChanged = gen !== this.sourceGen; // tab hidden, or the reader switched source
 
     if (result) {
-      this.model = result.model;
+      // Trained at this page's zoom; the wrapper records it so other sites map correctly.
+      this.model = zoomAware(result.model);
       this.viewportWarned = false;
       this.calibrationDeclined = false;
-      void saveCalibrationJSON(this.deps.storage.area, result.model.toJSON());
+      void saveCalibrationJSON(this.deps.storage.area, this.model.toJSON());
+      if (sourceChanged) return;
       this.resetPipeline();
       this.setBase('tracking');
-    } else if (this.calibrationInterrupted) {
-      this.setBase('paused', 'Calibration interrupted');
+    } else if (sourceChanged || this.calibrationInterrupted) {
+      // Whoever interrupted owns the state now: the new source, the camera-error
+      // notice, or the visibility handler (which recalibrates when the tab returns).
     } else if (!this.model) {
       this.calibrationDeclined = true;
       this.needCalibration();
@@ -616,8 +676,15 @@ export class PageSession {
     }
   }
 
+  /** Cancel a running calibration for a reason other than the reader pressing Esc. */
+  private interruptCalibration(): void {
+    if (!this.calibration) return;
+    this.calibrationInterrupted = true;
+    this.calibration.cancel();
+  }
+
   private needCalibration(): void {
-    this.setBase('paused', 'Not calibrated yet');
+    this.setBase('paused', NOT_CALIBRATED);
     this.pill.notify({
       text: 'Webcam reading needs a 30-second calibration first.',
       tone: 'info',
@@ -629,30 +696,34 @@ export class PageSession {
   }
 
   private onStoredCalibration(value: unknown): void {
-    // Another tab calibrated (or the calibration was cleared): pick it up.
+    // Another tab calibrated, or the reader chose "Forget it" in the popup: pick it up.
     if (value === undefined) {
+      if (!this.model) return;
       this.model = null;
+      // Reading on without a model would just look like "can't see your eyes".
+      if (this.sourceKind === 'webcam' && this.cameraRunning && !this.calibration) {
+        this.resetPipeline();
+        this.needCalibration();
+      }
       return;
     }
     if (!isSerializedGazeModel(value)) return;
-    const model = deserializeGazeModel(value, MODEL_COMPAT);
+    const model = zoomAwareFromJSON(value, MODEL_COMPAT);
     if (model && model.trainedAt !== this.model?.trainedAt) {
       this.model = model;
       this.viewportWarned = false;
-      if (this.base === 'paused' && this.detail === 'Not calibrated yet') {
+      if (this.base === 'paused' && this.detail === NOT_CALIBRATED) {
         this.pill.notify(null);
         this.setBase('tracking');
       }
     }
   }
 
-  /** A model trained for a very different window size maps gaze poorly. */
+  /** A model trained for a very different window size maps gaze poorly (page zoom is already accounted for). */
   private checkCalibrationViewport(): void {
     const m = this.model;
     if (!m || this.viewportWarned) return;
-    const dw = Math.abs(window.innerWidth - m.viewport.width) / Math.max(1, m.viewport.width);
-    const dh = Math.abs(window.innerHeight - m.viewport.height) / Math.max(1, m.viewport.height);
-    if (dw < 0.2 && dh < 0.2) return;
+    if (m.viewportChange({ width: window.innerWidth, height: window.innerHeight }) < 0.2) return;
     this.viewportWarned = true;
     this.pill.notify({
       text: 'Your window size changed since you calibrated. A quick recalibration keeps page turns accurate.',
@@ -700,9 +771,10 @@ export class PageSession {
     if (!scroll || this.turning || this.disposed) return;
     const layout = this.layout ?? this.remeasure('scroll');
     const anchorDocTop = layout?.lines[targetLineIndex]?.docTop ?? null;
+    const destination = scroll.computeTarget(layout, targetLineIndex, this.getSettings().overlapLines);
     this.turning = true;
     try {
-      await scroll.turnPage(layout, targetLineIndex, { auto, reason });
+      await this.withScrollDeadline(scroll, scroll.turnPage(layout, targetLineIndex, { auto, reason }), destination);
     } catch (err) {
       console.warn('[gaze-reader] page turn failed', err);
     } finally {
@@ -722,31 +794,55 @@ export class PageSession {
   }
 
   private async pageBack(): Promise<void> {
-    const scroll = this.scroll;
-    if (!scroll || this.turning) return;
-    this.turning = true;
-    try {
+    await this.manualMove(async (scroll) => {
       await scroll.pageBack(this.layout);
-    } finally {
-      this.turning = false;
-      this.ignoreScrollUntil = performance.now() + 150;
-    }
-    this.afterManualMove();
+      return true;
+    });
   }
 
   private async undoTurn(): Promise<void> {
+    const undone = await this.manualMove((scroll) => scroll.undo());
+    // Direct feedback to a key press: 'high', or Dewey would hold it while the reader is mid-line
+    // (and at the default chattiness drop a 'low' line altogether).
+    if (!undone && !this.disposed) this.say('Nothing to undo yet.', 'high', 'thinking');
+  }
+
+  /** Runs a reader-initiated scroll, then re-syncs the pipeline. Resolves to whether anything moved. */
+  private async manualMove(move: (scroll: ScrollController) => Promise<boolean>): Promise<boolean> {
     const scroll = this.scroll;
-    if (!scroll || this.turning) return;
+    if (!scroll || this.turning || this.disposed) return false;
     this.turning = true;
-    let undone = false;
+    let moved = false;
     try {
-      undone = await scroll.undo();
+      moved = await this.withScrollDeadline(scroll, move(scroll), null);
+    } catch (err) {
+      console.warn('[gaze-reader] scrolling failed', err);
     } finally {
       this.turning = false;
       this.ignoreScrollUntil = performance.now() + 150;
     }
-    if (undone) this.afterManualMove();
-    else this.say('Nothing to undo yet.', 'low', 'thinking');
+    if (moved) this.afterManualMove();
+    return moved;
+  }
+
+  /**
+   * Awaits a scroll animation, but never forever. ScrollController animates
+   * with requestAnimationFrame, which stalls in a window that reports itself
+   * visible but isn't painting (occluded, compositor hiccup); a turn that
+   * never settles would leave `turning` stuck and auto-scroll dead. Past the
+   * deadline we jump to the destination (or stop where we are):
+   * scrollTo(top, 0) cancels the stuck animation, which settles its promise.
+   */
+  private async withScrollDeadline<T>(scroll: ScrollController, move: Promise<T>, destination: number | null): Promise<T> {
+    const timer = setTimeout(() => {
+      const top = destination ?? (this.scroller ? scrollMetrics(this.scroller).scrollTop : null);
+      if (top !== null) void scroll.scrollTo(top, 0);
+    }, this.getSettings().scrollDurationMs + SCROLL_RESCUE_MS);
+    try {
+      return await move;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private afterManualMove(): void {
@@ -761,8 +857,11 @@ export class PageSession {
     this.tracker.reset();
     this.pageEnd.reset();
     if (this.layout) this.tracker.setLayout(this.layout, 'initial');
+    // Fresh baselines, so the watchdogs don't report "no face" before the first frame.
     this.lastValidAt = performance.now();
+    this.lastSampleAt = performance.now();
     this.confidence = 1;
+    this.lowSince = null;
   }
 
   // ─────────────────────────────── tracking state ───────────────────────────
@@ -773,8 +872,10 @@ export class PageSession {
     if (s.valid) {
       this.lastValidAt = now;
       this.confidence += 0.1 * (s.confidence - this.confidence);
+      this.lowSince = this.confidence < 0.3 ? (this.lowSince ?? now) : null;
       // Hysteresis so the pill doesn't flicker between "shaky" and "reading".
-      const poor = this.base === 'poor' ? this.confidence < 0.4 : this.confidence < 0.3;
+      const poor =
+        this.base === 'poor' ? this.confidence < 0.4 : this.lowSince !== null && now - this.lowSince >= POOR_AFTER_MS;
       this.setBase(poor ? 'poor' : 'tracking');
     } else if (now - this.lastValidAt > 1_000) {
       this.setBase('no-face');
@@ -792,7 +893,7 @@ export class PageSession {
     if (paused === this.paused) return;
     this.paused = paused;
     if (!paused) this.pageEnd.notifyScrolled(performance.now()); // no instant turn right after resuming
-    this.say(paused ? "Paused. I'll wait right here." : 'Back to reading!', 'normal', paused ? 'idle' : 'happy');
+    this.say(paused ? "Paused. I'll wait right here." : 'Back to reading!', 'high', paused ? 'idle' : 'happy');
     this.refreshState();
   }
 
@@ -818,18 +919,42 @@ export class PageSession {
       return;
     }
     if (location.href !== this.href) this.remeasure('content'); // SPA navigation
+    // A hidden tab has released the camera on purpose: no "can't see you" for that.
+    if (this.hidden) return;
 
     // Frames stopped arriving altogether (e.g. the service worker is restarting).
     if (this.sourceKind === 'webcam' && isLiveState(this.base) && now - this.lastSampleAt > 1_500) this.setBase('no-face');
 
     const s = this.getSettings();
-    if (!this.hidden && this.shown === 'tracking' && dt < 5_000) {
+    if (this.shown === 'tracking' && dt < 5_000) {
       this.readingMs += dt;
+      this.totalReadingMs += dt;
       if (s.breakReminders && this.readingMs >= s.breakIntervalMin * 60_000) {
         this.bus.emit('break-due', { minutesReading: Math.round(this.readingMs / 60_000) });
         this.readingMs = 0;
       }
     }
+    if (now - this.lastProgressAt >= PROGRESS_EVERY_MS) {
+      this.lastProgressAt = now;
+      this.emitProgress();
+    }
+  }
+
+  /** Lets Dewey cheer milestones (25/50/75 % of the article, every 10 pages) as he does in the app. */
+  private emitProgress(): void {
+    const viewport = this.layout?.viewport;
+    if (!viewport || !this.main.isConnected) return;
+    const r = this.main.getBoundingClientRect();
+    if (!(r.height > 0)) return;
+    // How much of the main text has been on screen: 1 once its end is visible.
+    const fraction = Math.min(1, Math.max(0, (viewport.bottom - r.top) / r.height));
+    this.bus.emit('book-progress', {
+      fraction,
+      wordsRead: Math.round(fraction * this.wordCount),
+      wpm: null,
+      pagesTurned: this.scroll?.pagesTurned ?? 0,
+      minutesReading: Math.floor(this.totalReadingMs / 60_000),
+    });
   }
 
   // ─────────────────────────────── events ───────────────────────────────────
@@ -854,10 +979,7 @@ export class PageSession {
     if (hidden) {
       // Another tab is in front: stop using the camera for this one.
       this.sourceGen++;
-      if (this.calibration) {
-        this.calibrationInterrupted = true;
-        this.calibration.cancel();
-      }
+      this.interruptCalibration();
       this.stopGaze();
       if (this.sourceKind === 'webcam') this.releaseCamera(true);
     } else if (this.base !== 'error') {
@@ -885,12 +1007,6 @@ export class PageSession {
 /** States in which live gaze quality decides what we show. */
 function isLiveState(s: TrackingState): boolean {
   return s === 'tracking' || s === 'no-face' || s === 'poor';
-}
-
-function lastFullyVisible(layout: LineLayout | null): number {
-  if (!layout) return -1;
-  for (let i = layout.lines.length - 1; i >= 0; i--) if (layout.lines[i]!.fullyVisible) return i;
-  return -1;
 }
 
 function countWords(text: string): number {

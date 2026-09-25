@@ -27,6 +27,8 @@ jobs:
       - run: npm test
       # prebuild copies the MediaPipe WASM runtime into public/ so it is served from our own origin.
       - run: npm run build
+      # The Chrome extension shares most of its code with the app; make sure it still packages.
+      - run: npm run build:ext
       - uses: actions/configure-pages@v6
         if: github.event_name != 'pull_request'
       - uses: actions/upload-pages-artifact@v5

@@ -162,6 +162,24 @@ describe('QuipPicker', () => {
     expect(picker.pick('tenPages', { pages: 30 })).toContain('30');
   });
 
+  it('finds the one allowed line even when the deck runs out mid-search (regression)', () => {
+    // Before the fix, a partly dealt deck plus a reshuffle could end the search
+    // before the only allowed line was tried, so pick() returned null.
+    const lines = QUIPS.trackingBack ?? [];
+    let misses = 0;
+    for (let seed = 1; seed <= 150; seed++) {
+      const rnd = seeded(seed);
+      for (let prior = 0; prior < lines.length; prior++) {
+        for (const only of lines) {
+          const picker = new QuipPicker(rnd);
+          for (let k = 0; k < prior; k++) picker.pick('trackingBack');
+          if (picker.pick('trackingBack', {}, (l) => l !== only) !== only) misses++;
+        }
+      }
+    }
+    expect(misses).toBe(0);
+  });
+
   it('copes with a broken random source', () => {
     const picker = new QuipPicker(() => Number.NaN);
     expect(QUIPS.poke).toContain(picker.pick('poke'));

@@ -4,7 +4,7 @@
  * Pipeline (all fitted on the calibration samples, nothing hard-coded about
  * which features exist — the feature vector is treated as opaque):
  *
- *  1. Drop blinks (blink > 0.5) and non-finite rows.
+ *  1. Drop blinks (blink > maxBlink, default 0.5) and non-finite rows.
  *  2. z-score every feature (constant features are neutralized, not divided by ~0).
  *  3. Pick the "dominant" gaze features: the ones most correlated with the
  *     target x or y, taken alternately per axis so the hard vertical axis gets
@@ -33,6 +33,7 @@ import type {
   SerializedGazeModel,
 } from '../types';
 import { readJSON, removeKey, writeJSON } from '../core/storage';
+import type { FeatureName } from './features';
 import { RidgeNormalEquations, dot, ridgeFit } from './ridge';
 
 export const GAZE_MODEL_VERSION = 1;
@@ -41,7 +42,13 @@ export const CALIBRATION_STORAGE_KEY = 'calibration.v1';
 export const DEFAULT_LAMBDAS: readonly number[] = Object.freeze([1e-3, 1e-2, 0.03, 0.1, 0.3, 1, 3, 10, 30, 100]);
 /** App default text: 22 px × 1.9 line height. */
 export const DEFAULT_LINE_PITCH_PX = 22 * 1.9;
-/** Samples with a blink score above this are never used. */
+/**
+ * Default cutoff: samples with a blink score above this are dropped. Callers
+ * that already gate blinks over time (the calibration overlay uses the
+ * runtime gaze source's BlinkGate) pass a higher `maxBlink`, because a
+ * sustained moderate score is lowered lids — the reader looking at the bottom
+ * of the screen — and the model must learn those frames, not extrapolate them.
+ */
 export const MAX_BLINK = 0.5;
 
 const DEFAULT_QUADRATIC_FEATURES = 6;
@@ -51,6 +58,14 @@ const MIN_SAMPLES = 6;
 const Z_CLAMP = 6;
 /** A dominant gaze feature this many calibration SDs out means a tracking glitch, not gaze. */
 const Z_REJECT = 10;
+/**
+ * Head pose and distance. The head barely moves during calibration, so its SDs are tiny, and
+ * a reader who leans back or slouches later is legitimately "10 SDs out". These features are
+ * never grounds for rejecting a prediction (Z_CLAMP bounds their influence instead);
+ * otherwise a head feature picked as dominant would silence the tracker for the rest of the
+ * session, reading as "can't see you" with the face in plain view.
+ */
+const POSTURE_FEATURES: ReadonlySet<string> = new Set<FeatureName>(['yaw', 'pitch', 'roll', 'tx', 'ty', 'tz', 'faceScale']);
 const MAD_TO_SD = 1.4826;
 /** Leys et al. (2013) call 2.5 robust SDs "moderately conservative" — our default. */
 const MAD_THRESHOLD = 2.5;
@@ -90,8 +105,16 @@ export interface TrainOptions {
   /**
    * FEATURE_NAMES of the running build. Stored as a signature so a model from
    * a build whose features were reordered (same length!) is rejected on load.
+   * Must have one name per vector entry.
    */
   featureNames?: readonly string[];
+  /** Drop samples whose blink score exceeds this (default {@link MAX_BLINK}). */
+  maxBlink?: number;
+}
+
+export interface EvaluateOptions {
+  /** Ignore samples whose blink score exceeds this (default {@link MAX_BLINK}). */
+  maxBlink?: number;
 }
 
 export interface TrainDiagnostics {
@@ -121,6 +144,8 @@ export interface RefineOptions {
   fitScale?: boolean;
   /** κ in λ = κ·Σ(p − p̄)²; the OLS scale correction is divided by (1 + κ). Default 2. */
   scaleShrinkage?: number;
+  /** Drop samples whose blink score exceeds this (default {@link MAX_BLINK}). */
+  maxBlink?: number;
 }
 
 /** What the running build expects of a stored model. */
@@ -144,6 +169,8 @@ export interface GazeModelParams {
   std: Float64Array;
   /** Dominant feature indices, expanded as z_a·z_b for a ≤ b. */
   quad: readonly number[];
+  /** The dominant features a Z_REJECT outlier on means a tracking glitch (no posture features). Default: quad. */
+  glitchCheck?: readonly number[];
   expMean: Float64Array;
   expStd: Float64Array;
   wx: Float64Array;
@@ -171,6 +198,7 @@ export class RidgeGazeModel implements GazeModel {
   readonly featureSignature: string | null;
   readonly dominantFeatures: readonly number[];
   private readonly params: GazeModelParams;
+  private readonly glitchCheck: readonly number[];
   // Scratch buffers: predict runs at camera rate, so avoid per-call allocation.
   private readonly zBuf: Float64Array;
   private readonly phiBuf: Float64Array;
@@ -183,6 +211,7 @@ export class RidgeGazeModel implements GazeModel {
     this.featureLength = params.featureLength;
     this.featureSignature = params.featureSignature;
     this.dominantFeatures = Object.freeze([...params.quad]);
+    this.glitchCheck = Object.freeze([...(params.glitchCheck ?? params.quad)]);
     this.zBuf = new Float64Array(params.featureLength);
     this.phiBuf = new Float64Array(params.expMean.length);
   }
@@ -214,7 +243,7 @@ export class RidgeGazeModel implements GazeModel {
       if (!Number.isFinite(x)) return null;
       z[j] = (x - P.mean[j]) / P.std[j];
     }
-    for (const q of P.quad) if (Math.abs(z[q]) > Z_REJECT) return null;
+    for (const q of this.glitchCheck) if (Math.abs(z[q]) > Z_REJECT) return null;
     for (let j = 0; j < P.featureLength; j++) z[j] = clamp(z[j], -Z_CLAMP, Z_CLAMP);
 
     const phi = this.phiBuf;
@@ -248,6 +277,7 @@ export class RidgeGazeModel implements GazeModel {
       mean: Array.from(P.mean),
       std: Array.from(P.std),
       quad: [...P.quad],
+      glitchCheck: [...this.glitchCheck],
       expMean: Array.from(P.expMean),
       expStd: Array.from(P.expStd),
       wx: Array.from(P.wx),
@@ -284,8 +314,12 @@ interface ColumnStats {
 }
 
 export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions = {}): TrainResult {
-  const prepared = prepareRows(samples);
+  const prepared = prepareRows(samples, undefined, opts.maxBlink);
   const p = prepared.featureLength;
+  // A signature over the wrong number of names would make every reload reject the model.
+  if (opts.featureNames && opts.featureNames.length !== p) {
+    throw new RangeError(`featureNames lists ${opts.featureNames.length} features but the vectors have ${p}.`);
+  }
   let rows = prepared.rows;
   const initialGroups = groupRows(rows);
   if (initialGroups.length < MIN_TARGETS) {
@@ -363,6 +397,7 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     mean: stats.mean,
     std: stats.std,
     quad: dominant,
+    glitchCheck: glitchCheckFor(dominant, opts.featureNames),
     expMean: exp.mean,
     expStd: exp.std,
     wx: final.weights[0],
@@ -417,7 +452,7 @@ export function refineGazeModel(
 ): { model: RidgeGazeModel; report: CalibrationReport } {
   const inner = asRidgeGazeModel(base);
   if (!inner) throw new Error('This calibration can’t be refined — please run a full calibration.');
-  const { rows } = prepareRows(samples, inner.featureLength);
+  const { rows } = prepareRows(samples, inner.featureLength, opts.maxBlink);
   const origin = currentScreenOrigin();
   const fitScale = opts.fitScale ?? true;
   const kappa = Math.max(0, opts.scaleShrinkage ?? DEFAULT_SCALE_SHRINKAGE);
@@ -468,11 +503,12 @@ export function refineGazeModel(
  * standard "accuracy" measure in eye tracking. With nothing evaluable the
  * errors are NaN, `sampleCount` is 0 and quality is 'poor'.
  */
-export function evaluateModel(model: GazeModel, samples: CalibrationSample[]): CalibrationReport {
+export function evaluateModel(model: GazeModel, samples: CalibrationSample[], opts: EvaluateOptions = {}): CalibrationReport {
+  const maxBlink = blinkCutoff(opts.maxBlink);
   const groups = new Map<string, { target: Point; preds: Point[] }>();
   for (const s of Array.isArray(samples) ? samples : []) {
     if (!s || !isFinitePoint(s.target) || !s.features) continue;
-    if (s.features.blink > MAX_BLINK) continue;
+    if (s.features.blink > maxBlink) continue;
     let p: Point | null = null;
     try {
       p = model.predict(s.features);
@@ -547,6 +583,9 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
     const std = finiteVector(json.std, featureLength, true);
     const quad = indexList(json.quad, featureLength);
     if (!mean || !std || !quad) return null;
+    // Models saved before the field existed: derive it from the running build's feature names.
+    const glitchCheck = json.glitchCheck === undefined ? glitchCheckFor(quad, expect.featureNames) : indexList(json.glitchCheck, featureLength);
+    if (!glitchCheck) return null;
     const D = featureLength + (quad.length * (quad.length + 1)) / 2;
     const expMean = finiteVector(json.expMean, D);
     const expStd = finiteVector(json.expStd, D, true);
@@ -581,6 +620,7 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
       mean,
       std,
       quad,
+      glitchCheck,
       expMean,
       expStd,
       wx,
@@ -645,8 +685,10 @@ export function currentScreenOrigin(): Point {
 function prepareRows(
   samples: readonly CalibrationSample[],
   expectedLength?: number,
+  maxBlinkOption?: number,
 ): { rows: Row[]; featureLength: number; dropped: number } {
   if (!Array.isArray(samples) || samples.length === 0) throw new Error('No calibration samples.');
+  const maxBlink = blinkCutoff(maxBlinkOption);
   let len = expectedLength ?? -1;
   const rows: Row[] = [];
   let dropped = 0;
@@ -665,7 +707,7 @@ function prepareRows(
       );
     }
     // A missing (NaN) blink score compares false and keeps the sample.
-    if (!isFinitePoint(s.target) || s.features.blink > MAX_BLINK) {
+    if (!isFinitePoint(s.target) || s.features.blink > maxBlink) {
       dropped++;
       continue;
     }
@@ -687,6 +729,11 @@ function prepareRows(
   }
   if (len <= 0) throw new Error('Calibration samples carry no features.');
   return { rows, featureLength: len, dropped };
+}
+
+/** A caller's blink cutoff, or MAX_BLINK when absent/NaN (Infinity keeps everything). */
+function blinkCutoff(v: number | undefined): number {
+  return typeof v === 'number' && !Number.isNaN(v) ? v : MAX_BLINK;
 }
 
 function targetKey(t: Point): string {
@@ -851,6 +898,11 @@ function rejectOutliers(rows: readonly Row[], groups: readonly Group[], stats: C
  * Needs ≥ 5 points to say anything; never drops more than a third (the most
  * extreme first), because a target that is mostly "outliers" is really a
  * target whose median we don't trust either.
+ *
+ * With 6 dominant features the per-feature rule also trims ~5–9 % of clean
+ * Gaussian samples. That is deliberate and cheap: symmetric tail trimming
+ * doesn't bias the per-target mean, and on synthetic data the robust fit
+ * matched a fit on uncontaminated samples to within 0.2 px.
  */
 function robustKeep(columns: readonly ArrayLike<number>[], m: number, floor: number): number[] {
   const all = [...Array(m).keys()];
@@ -1026,6 +1078,11 @@ function finiteVector(v: unknown, length: number, positive = false): Float64Arra
     out[i] = x;
   }
   return out;
+}
+
+/** The dominant features whose wild values mean a tracking glitch: all of them, minus posture when the names are known. */
+function glitchCheckFor(quad: readonly number[], names: readonly string[] | undefined): number[] {
+  return names && names.length > 0 ? quad.filter((j) => !POSTURE_FEATURES.has(names[j] ?? '')) : [...quad];
 }
 
 function indexList(v: unknown, bound: number): number[] | null {

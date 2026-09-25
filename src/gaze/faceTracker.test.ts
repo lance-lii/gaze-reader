@@ -2,10 +2,11 @@
 import type { FaceLandmarkerOptions } from '@mediapipe/tasks-vision';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FeatureFrame } from '../types';
-import type { CameraHandle } from './camera';
+import type { CameraHandle, OpenCameraOptions } from './camera';
 import {
   CameraFeatureSource,
   createLandmarkerLoader,
+  preloadFaceLandmarker,
   TrackerError,
   type Delegate,
   type FaceLandmarkerLike,
@@ -96,7 +97,7 @@ function fakeVideo(): { video: HTMLVideoElement; state: FakeVideoState } {
 }
 
 function fakeCamera(video: HTMLVideoElement) {
-  const track = new EventTarget();
+  const track = Object.assign(new EventTarget(), { readyState: 'live' as MediaStreamTrackState });
   const stop = vi.fn();
   const handle: CameraHandle = {
     stream: {} as MediaStream,
@@ -112,7 +113,7 @@ function harness(opts: { camera?: Deferred<CameraHandle>; model?: Deferred<Landm
   const { video, state } = fakeVideo();
   const cam = fakeCamera(video);
   const lm = new FakeHandle();
-  const openCamera = vi.fn(() => opts.camera?.promise ?? Promise.resolve(cam.handle));
+  const openCamera = vi.fn((_opts: OpenCameraOptions) => opts.camera?.promise ?? Promise.resolve(cam.handle));
   const loadLandmarker = vi.fn(() => opts.model?.promise ?? Promise.resolve<LandmarkerHandle>(lm));
   const src = new CameraFeatureSource(
     { wasmBaseUrl: 'https://app.test/mediapipe/wasm', backgroundProcessing: opts.backgroundProcessing ?? false },
@@ -227,6 +228,13 @@ describe('createLandmarkerLoader', () => {
     const handle = await createLandmarkerLoader(v.importVision).load(CFG);
     for (const t of [1000.4, 1000.4, 999, Number.NaN, 1003.2, 2000]) handle.detect(INPUT, t);
     expect(v.created[0].timestamps).toEqual([1000, 1001, 1002, 1003, 1004, 2000]);
+  });
+
+  it('never hands MediaPipe a non-finite or negative timestamp, even first', async () => {
+    const v = fakeVision();
+    const handle = await createLandmarkerLoader(v.importVision).load(CFG);
+    for (const t of [Number.NaN, -50, Number.POSITIVE_INFINITY, 10]) handle.detect(INPUT, t);
+    expect(v.created[0].timestamps).toEqual([0, 1, 2, 10]);
   });
 
   it('shares the timestamp sequence between everyone using the cached landmarker', async () => {
@@ -444,6 +452,74 @@ describe('CameraFeatureSource', () => {
     expect(h.src.running).toBe(false);
   });
 
+  it('stop() cancels an in-flight camera open, so a late grant is released at once', async () => {
+    const camera = deferred<CameraHandle>();
+    const h = harness({ camera });
+    const started = h.src.start();
+    const signal = h.openCamera.mock.calls[0][0].signal;
+    expect(signal?.aborted).toBe(false);
+    h.src.stop();
+    expect(signal?.aborted).toBe(true);
+    camera.resolve(h.cam.handle);
+    await expect(started).resolves.toBeUndefined();
+    expect(h.src.running).toBe(false);
+  });
+
+  it('fails fast if the camera is unplugged while the model downloads', async () => {
+    const model = deferred<LandmarkerHandle>();
+    const h = harness({ model });
+    const runtimeErrors: TrackerError[] = [];
+    h.src.onError((e) => runtimeErrors.push(e));
+    const started = h.src.start().catch((e: unknown) => e);
+    await flush();
+    expect(h.src.video).toBe(h.video);
+
+    h.cam.track.readyState = 'ended';
+    h.cam.track.dispatchEvent(new Event('ended'));
+    const err = await started; // without waiting for the model or its 60 s timeout
+    expect(err).toBeInstanceOf(TrackerError);
+    expect((err as TrackerError).code).toBe('camera-in-use');
+    expect(h.src.lastError).toBe(err);
+    expect(h.cam.stop).toHaveBeenCalled();
+    expect(h.src.running).toBe(false);
+    expect(h.src.video).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(runtimeErrors).toHaveLength(0); // start() failures reject; onError is for after start
+
+    model.resolve(h.lm);
+    await flush();
+    expect(h.src.running).toBe(false);
+    expect(h.lm.calls).toHaveLength(0);
+  });
+
+  it('does not start a session on a track that ended before the model arrived', async () => {
+    const h = harness();
+    h.cam.track.readyState = 'ended'; // the 'ended' event fired before anyone listened
+    await expect(h.src.start()).rejects.toMatchObject({ code: 'camera-in-use' });
+    expect(h.src.running).toBe(false);
+    expect(h.cam.stop).toHaveBeenCalled();
+    vi.advanceTimersByTime(500);
+    expect(h.lm.calls).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('rejects with model-load-failed, not a raw TypeError, when the default WASM URL cannot be resolved', async () => {
+    Object.defineProperty(document, 'baseURI', { value: 'about:blank', configurable: true });
+    try {
+      const openCamera = vi.fn((_opts: OpenCameraOptions) => Promise.resolve(fakeCamera(fakeVideo().video).handle));
+      const src = new CameraFeatureSource({}, { openCamera, loadLandmarker: () => Promise.resolve<LandmarkerHandle>(new FakeHandle()) });
+      const err = await src.start().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(TrackerError);
+      expect((err as TrackerError).code).toBe('model-load-failed');
+      expect(src.lastError).toBe(err);
+      expect(openCamera).not.toHaveBeenCalled();
+      // "Never rejects" includes never throwing synchronously.
+      await expect(preloadFaceLandmarker()).resolves.toBe(false);
+    } finally {
+      Reflect.deleteProperty(document, 'baseURI');
+    }
+  });
+
   it('a fresh start() after a cancelled one works', async () => {
     const camera = deferred<CameraHandle>();
     const h = harness({ camera });
@@ -507,6 +583,31 @@ describe('CameraFeatureSource', () => {
     expect(errors[0].code).toBe('camera-in-use');
     expect(h.frames.at(-1)?.faceFound).toBe(false);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('reports an unbiased fps when frame times jitter', async () => {
+    let enqueue!: (f: VideoFrame) => void;
+    class FakeProcessor {
+      readonly readable = new ReadableStream<VideoFrame>({
+        start(controller) {
+          enqueue = (f) => controller.enqueue(f);
+        },
+      });
+    }
+    Object.assign(globalThis, { MediaStreamTrackProcessor: FakeProcessor });
+    const h = harness({ backgroundProcessing: true });
+    await h.src.start();
+    // 30 fps on average, delivered alternately 15 ms and 51.7 ms apart. Averaging
+    // instantaneous rates would read ≈ 43 fps here.
+    for (let i = 0; i < 120; i++) {
+      vi.advanceTimersByTime(i % 2 ? 15 : 2 * FRAME_MS - 15);
+      enqueue({ displayWidth: 640, displayHeight: 480, close: () => undefined } as unknown as VideoFrame);
+      await flush();
+    }
+    expect(h.lm.calls).toHaveLength(120);
+    expect(h.src.fps).toBeGreaterThan(28.5);
+    expect(h.src.fps).toBeLessThan(31.5);
+    h.src.stop();
   });
 
   it('lets fps decay when frames stop arriving', async () => {
@@ -600,6 +701,33 @@ describe('CameraFeatureSource', () => {
     h.src.stop();
     await flush();
     expect(cancelled).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('falls back to the video element if the track processor gives out mid-session', async () => {
+    let controller!: ReadableStreamDefaultController<VideoFrame>;
+    class FakeProcessor {
+      readonly readable = new ReadableStream<VideoFrame>({
+        start(c) {
+          controller = c;
+        },
+      });
+    }
+    Object.assign(globalThis, { MediaStreamTrackProcessor: FakeProcessor });
+    const h = harness({ backgroundProcessing: true });
+    await h.src.start();
+    const frame = { displayWidth: 640, displayHeight: 480, close: vi.fn() };
+    controller.enqueue(frame as unknown as VideoFrame);
+    await flush();
+    expect(h.lm.calls).toHaveLength(1);
+
+    controller.error(new Error('processor died'));
+    await flush();
+    vi.advanceTimersByTime(1000);
+    expect(h.lm.calls.length).toBeGreaterThan(25);
+    expect(h.lm.calls.slice(1).every((c) => c.input === h.video)).toBe(true);
+    expect(h.src.running).toBe(true);
+    h.src.stop();
     expect(vi.getTimerCount()).toBe(0);
   });
 });
