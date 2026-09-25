@@ -92,7 +92,7 @@ export class Onboarding implements Mountable {
   private resolve: ((choice: GazeSourceKind | null) => void) | null = null;
   private pending: Promise<GazeSourceKind | null> | null = null;
 
-  constructor(opts: { bus: EventBus }) {
+  constructor(opts: { bus: EventBus; onClose?: () => void }) {
     this.bus = opts.bus;
     const uid = `gr-onb-${++onbSeq}`;
     this.layer = new ModalLayer({
@@ -100,7 +100,10 @@ export class Onboarding implements Mountable {
       labelledBy: `${uid}-title-0`,
       // Just under Dewey, so he can talk the reader through it.
       zIndex: Z.buddy - 1,
-      onClose: () => this.finish(null),
+      onClose: () => {
+        this.finish(null);
+        opts.onClose?.();
+      },
     });
     const surface = this.layer.surface;
 
@@ -221,7 +224,8 @@ export class Onboarding implements Mountable {
     const last = i === STEPS.length - 1;
     this.next.hidden = last;
     const s = STEPS[i]!;
-    this.bus.emit('buddy-say', { text: s.dewey.text, priority: 'high', mood: s.dewey.mood, durationMs: 6000 });
+    // Dewey sizes the bubble's duration to the text, so his lines keep pace with the steps.
+    this.bus.emit('buddy-say', { text: s.dewey.text, priority: 'high', mood: s.dewey.mood });
     if (!moveFocus) return;
     // Focus the new step's heading so screen readers announce it; on the last step, the first choice.
     const target = last ? this.steps[i]!.querySelector<HTMLElement>('.gr-choice') : this.steps[i]!.querySelector<HTMLElement>('h2');

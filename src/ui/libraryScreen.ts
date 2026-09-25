@@ -127,7 +127,7 @@ export class LibraryScreen implements Mountable {
           <h2 class="gr-sr-only" id="${uid}-open">Open a book</h2>
           <div class="gr-drop">
             <span class="gr-drop__icon">${icon('upload')}</span>
-            <p class="gr-drop__title">Drop a book here</p>
+            <p class="gr-drop__title"><span class="gr-drop__drag">Drop a book here</span><span class="gr-drop__tap">Open a book</span></p>
             <p class="gr-drop__formats">EPUB, PDF, plain text, Markdown or HTML</p>
             <div class="gr-drop__actions">
               <button type="button" class="gr-btn gr-btn--primary gr-lib-choose">${icon('book')}<span>Choose a file</span></button>

@@ -38,6 +38,10 @@ const LONG_TEXT = 4000;
 const WINDOW_SLACK = 600;
 /** A fragment joins a line when they overlap by at least this share of the smaller height. */
 const LINE_OVERLAP = 0.5;
+/** A "line" of at most this many characters that overlaps a neighbour is folded into it… */
+const STRAY_MAX_CHARS = 4;
+/** …when they overlap by at least this share of the smaller height (real lines barely touch). */
+const STRAY_OVERLAP = 0.2;
 
 interface Fragment {
   top: number;
@@ -93,6 +97,32 @@ function misses(r: DOMRect, band: Band): boolean {
 
 const isZeroSize = (r: DOMRect): boolean => r.width === 0 && r.height === 0;
 
+const clips = (overflow: string): boolean => overflow === 'hidden' || overflow === 'clip';
+
+/**
+ * The band that the content of `el` can show up in. Text that overflows a box with
+ * `overflow: hidden | clip` is invisible — collapsed accordions (`height: 0`),
+ * line-clamped teasers, truncated cards — so it must not become phantom lines on
+ * top of the real text. Scroll containers (auto/scroll) are left alone: their
+ * content is about to be scrolled into view, which is what the margin is for.
+ * Returns null when nothing of the content can be visible.
+ */
+function clipBand(band: Band, rect: DOMRect, style: CSSStyleDeclaration): Band | null {
+  if (style.display === 'inline' || style.display === 'contents') return band; // overflow doesn't apply
+  // Browsers resolve the longhands; some engines (jsdom) only keep the shorthand ("x [y]").
+  const [shortX = '', shortY = shortX] = (style.overflow || '').trim().split(/\s+/);
+  const clipX = clips(style.overflowX) || clips(shortX);
+  const clipY = clips(style.overflowY) || clips(shortY);
+  if (!clipX && !clipY) return band;
+  const out: Band = {
+    top: clipY ? Math.max(band.top, rect.top) : band.top,
+    bottom: clipY ? Math.min(band.bottom, rect.bottom) : band.bottom,
+    left: clipX ? Math.max(band.left, rect.left) : band.left,
+    right: clipX ? Math.min(band.right, rect.right) : band.right,
+  };
+  return out.bottom - out.top < 1 || out.right - out.left < 1 ? null : out;
+}
+
 class Measurer {
   readonly fragments: Fragment[] = [];
   private readonly range: Range | null;
@@ -106,41 +136,58 @@ class Measurer {
   }
 
   walk(root: Element): void {
-    const stack: Element[] = [root];
+    const stack: { el: Element; band: Band }[] = [{ el: root, band: this.band }];
     while (stack.length > 0) {
-      const el = stack.pop() as Element;
+      const { el, band: outer } = stack.pop() as { el: Element; band: Band };
       if (isIgnored(el)) continue;
 
       const rect = el.getBoundingClientRect();
       const zero = isZeroSize(rect);
       if (!zero) {
-        if (misses(rect, this.band)) continue;
+        if (misses(rect, outer)) continue;
         if (rect.width <= 2 && rect.height <= 2) continue; // "visually hidden" screen-reader text
       }
       const style = getComputedStyle(el);
       if (isHiddenByStyle(style)) continue;
+      const band = clipBand(outer, rect, style);
+      if (!band) continue;
+      const vertical = stacksVertically(style);
 
+      const texts: Text[] = [];
       for (let n = el.firstChild; n; n = n.nextSibling) {
-        if (n.nodeType === Node.TEXT_NODE) this.measureText(n as Text);
+        if (n.nodeType === Node.TEXT_NODE && /\S/.test((n as Text).data)) texts.push(n as Text);
       }
+      // Thousands of <br>-separated text nodes (old-school web fiction) get the same band search as elements.
+      const range = this.range;
+      const [textFrom, textTo] =
+        texts.length >= BINARY_SEARCH_MIN_CHILDREN && vertical && range && typeof range.getBoundingClientRect === 'function'
+          ? this.bandRange(band, texts.length, (i) => {
+              range.selectNodeContents(texts[i]);
+              return range.getBoundingClientRect();
+            })
+          : [0, texts.length];
+      for (let i = textFrom; i < textTo; i++) this.measureText(texts[i], band);
 
-      const kids = el.children;
+      // Only children that can hold text; <br>s between those text nodes need no layout queries at all.
+      const kids: Element[] = [];
+      for (let c = el.firstElementChild; c; c = c.nextElementSibling) if (c.firstChild) kids.push(c);
       if (kids.length === 0) continue;
       const [from, to] =
-        kids.length >= BINARY_SEARCH_MIN_CHILDREN && stacksVertically(style) ? this.bandRange(kids) : [0, kids.length];
-      for (let i = to - 1; i >= from; i--) stack.push(kids[i]);
+        kids.length >= BINARY_SEARCH_MIN_CHILDREN && vertical
+          ? this.bandRange(band, kids.length, (i) => kids[i].getBoundingClientRect())
+          : [0, kids.length];
+      for (let i = to - 1; i >= from; i--) stack.push({ el: kids[i], band });
     }
   }
 
   /**
-   * Children [from, to) that can intersect the band, assuming they stack vertically.
-   * Zero-size children (display:none, empty anchors) carry no position, so probes step over them.
+   * Items [from, to) of a vertically stacked list that can intersect the band.
+   * Zero-size items (display:none, empty anchors) carry no position, so probes step over them.
    */
-  private bandRange(kids: HTMLCollection): [number, number] {
-    const n = kids.length;
+  private bandRange(band: Band, n: number, rectAt: (i: number) => DOMRect): [number, number] {
     const probe = (i: number): { index: number; rect: DOMRect } | null => {
       for (let j = i; j < n && j < i + 16; j++) {
-        const rect = kids[j].getBoundingClientRect();
+        const rect = rectAt(j);
         if (!isZeroSize(rect)) return { index: j, rect };
       }
       return null;
@@ -153,7 +200,7 @@ class Measurer {
       const mid = (lo + hi) >> 1;
       const p = probe(mid);
       if (!p) return [0, n]; // no positional information here: scan everything
-      if (p.rect.bottom >= this.band.top) {
+      if (p.rect.bottom >= band.top) {
         start = Math.min(start, p.index);
         hi = mid - 1;
       } else {
@@ -162,18 +209,18 @@ class Measurer {
     }
     const from = Math.max(0, start - 1);
 
-    // Walk forward until children start below the band (allowing a little non-monotonic slack).
+    // Walk forward until items start below the band (allowing a little non-monotonic slack).
     let to = from;
     let below = 0;
     while (to < n && below < 2) {
-      const rect = kids[to].getBoundingClientRect();
-      if (!isZeroSize(rect) && rect.top > this.band.bottom) below++;
+      const rect = rectAt(to);
+      if (!isZeroSize(rect) && rect.top > band.bottom) below++;
       to++;
     }
     return [from, to];
   }
 
-  private measureText(node: Text): void {
+  private measureText(node: Text, band: Band): void {
     const range = this.range;
     const data = node.data;
     if (!range || !/\S/.test(data)) return;
@@ -181,7 +228,7 @@ class Measurer {
     let start = 0;
     let end = data.length;
     if (data.length > LONG_TEXT && typeof range.getBoundingClientRect === 'function') {
-      [start, end] = this.textWindow(node, range);
+      [start, end] = this.textWindow(node, range, band);
       if (start >= end) return;
     }
     range.setStart(node, start);
@@ -197,7 +244,7 @@ class Measurer {
     for (let i = 0; i < rects.length; i++) {
       const r = rects[i];
       if (r.width <= 0 || r.height <= 0) continue;
-      if (r.bottom < this.band.top || r.top > this.band.bottom || r.right < this.band.left || r.left > this.band.right) continue;
+      if (r.bottom < band.top || r.top > band.bottom || r.right < band.left || r.left > band.right) continue;
       this.fragments.push({
         top: r.top,
         bottom: r.bottom,
@@ -208,33 +255,53 @@ class Measurer {
     }
   }
 
-  /** Character offsets of a long text node that cover the band, found by binary search on small ranges. */
-  private textWindow(node: Text, range: Range): [number, number] {
+  /**
+   * Character offsets of a long text node that cover the band, found by binary search
+   * on small ranges. When a probe finds no box on either side (a long run of collapsed
+   * whitespace), the search can't tell which way to go: rather than guess — and risk
+   * cutting visible lines off — the whole node is measured.
+   */
+  private textWindow(node: Text, range: Range, band: Band): [number, number] {
     const len = node.data.length;
     const CHUNK = 12;
+    const PROBES = 8;
+    const boxAt = (o: number): DOMRect | null => {
+      range.setStart(node, o);
+      range.setEnd(node, Math.min(len, o + CHUNK));
+      const r = range.getBoundingClientRect();
+      return isZeroSize(r) ? null : r;
+    };
     const rectAt = (offset: number): DOMRect | null => {
-      // Newlines and collapsed whitespace can have empty rects: step forward to find a visible chunk.
-      for (let o = offset; o < len && o < offset + CHUNK * 8; o += CHUNK) {
-        range.setStart(node, o);
-        range.setEnd(node, Math.min(len, o + CHUNK));
-        const r = range.getBoundingClientRect();
-        if (!isZeroSize(r)) return r;
+      // Newlines and collapsed whitespace can have empty rects: look for a visible chunk nearby.
+      for (let k = 0; k < PROBES; k++) {
+        const ahead = offset + k * CHUNK;
+        if (ahead < len) {
+          const r = boxAt(ahead);
+          if (r) return r;
+        }
+        const behind = offset - (k + 1) * CHUNK;
+        if (behind >= 0) {
+          const r = boxAt(behind);
+          if (r) return r;
+        }
       }
       return null;
     };
-    const search = (test: (r: DOMRect) => boolean): number => {
+    const search = (test: (r: DOMRect) => boolean): number | null => {
       let lo = 0;
       let hi = len;
       while (lo < hi) {
         const mid = (lo + hi) >> 1;
         const r = rectAt(mid);
-        if (r === null || test(r)) hi = mid;
+        if (r === null) return null;
+        if (test(r)) hi = mid;
         else lo = mid + 1;
       }
       return lo;
     };
-    const first = search((r) => r.bottom >= this.band.top);
-    const last = search((r) => r.top > this.band.bottom);
+    const first = search((r) => r.bottom >= band.top);
+    const last = first === null ? null : search((r) => r.top > band.bottom);
+    if (first === null || last === null) return [0, len];
     return [Math.max(0, first - WINDOW_SLACK), Math.min(len, last + WINDOW_SLACK)];
   }
 }
@@ -283,7 +350,42 @@ function mergeIntoLines(fragments: Fragment[]): LineAcc[] {
       target.coreChars = f.chars;
     }
   }
-  return lines.sort((a, b) => a.coreTop - b.coreTop);
+  return foldStrayFragments(lines.sort((a, b) => a.coreTop - b.coreTop));
+}
+
+/**
+ * A few characters that overlap an adjacent line belong to it; they are not a
+ * line of their own. Chrome reports an `initial-letter` drop cap as a
+ * glyph-sized box about half a line *above* its first line (too little overlap
+ * to join it in mergeIntoLines), which would otherwise put a phantom
+ * three-character line at the top of every chapter.
+ */
+function foldStrayFragments(lines: LineAcc[]): LineAcc[] {
+  if (lines.length < 2) return lines;
+  const share = (a: LineAcc, b: LineAcc): number => {
+    const overlap = Math.min(a.coreBottom, b.coreBottom) - Math.max(a.coreTop, b.coreTop);
+    const smaller = Math.min(a.coreBottom - a.coreTop, b.coreBottom - b.coreTop);
+    return smaller > 0 ? overlap / smaller : 0;
+  };
+  const out: LineAcc[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.chars <= STRAY_MAX_CHARS) {
+      const prev = out[out.length - 1];
+      const next = lines[i + 1];
+      const toPrev = prev ? share(line, prev) : 0;
+      const toNext = next ? share(line, next) : 0;
+      const host = toNext >= toPrev ? next : prev;
+      if (host && Math.max(toPrev, toNext) >= STRAY_OVERLAP && host.chars > line.chars) {
+        host.left = Math.min(host.left, line.left);
+        host.right = Math.max(host.right, line.right);
+        host.chars += line.chars;
+        continue;
+      }
+    }
+    out.push(line);
+  }
+  return out;
 }
 
 function fallbackPitch(root: Element, lines: LineAcc[]): number {
@@ -361,15 +463,11 @@ export function measureLines(opts: MeasureOptions): LineLayout {
   }
   const linePitch = deltas.length ? medianOf(deltas) : fallbackPitch(opts.root, acc);
 
-  return {
-    ...base,
-    lines,
-    column: {
-      left: Math.min(...lines.map((l) => l.left)),
-      top: lines[0].top,
-      right: Math.max(...lines.map((l) => l.right)),
-      bottom: Math.max(...lines.map((l) => l.bottom)),
-    },
-    linePitch,
-  };
+  const column: Rect = { left: Infinity, top: lines[0].top, right: -Infinity, bottom: -Infinity };
+  for (const l of lines) {
+    column.left = Math.min(column.left, l.left);
+    column.right = Math.max(column.right, l.right);
+    column.bottom = Math.max(column.bottom, l.bottom);
+  }
+  return { ...base, lines, column, linePitch };
 }

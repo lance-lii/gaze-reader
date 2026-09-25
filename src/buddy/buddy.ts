@@ -56,6 +56,11 @@ const SPEECH_GAP_MS = 350;
 const HOLD_RETRY_MS = 800;
 const QUEUE_LIMIT = 6;
 const TTL_MS: Readonly<Record<SpeechPriority, number>> = { low: 60_000, normal: 120_000, high: 30_000 };
+/**
+ * Host lines are mostly feedback on something the reader just did ("Paused."),
+ * which is stale soon after; one still held back by the mid-line rule is dropped.
+ */
+const APP_TTL_MS = 20_000;
 const MANUAL_MOOD_MS = 5_000;
 const CELEBRATE_MS = 5_200;
 const PAGE_TURN_REACTION_P = 0.18;
@@ -130,6 +135,10 @@ export interface BubbleWidthInput {
   viewportWidth: number;
   /** Center x of the reading column, if known. */
   columnCenterX: number | null;
+  /** The column's edge on Dewey's side (right edge for right corners), if known. */
+  columnEdgeX?: number | null;
+  /** A gutter at least this wide is used instead of overlapping the text. */
+  comfortable?: number;
   preferred?: number;
   min?: number;
   /** Distance kept from the screen edge. */
@@ -140,7 +149,8 @@ export interface BubbleWidthInput {
 
 /**
  * Widest the bubble may be so that, growing from Dewey's outer edge toward the
- * page, it stops short of the reading column's center.
+ * page, it stops short of the reading column's center — and, when the margin
+ * beside the column is roomy enough, stays out of the text altogether.
  */
 export function bubbleMaxWidth(o: BubbleWidthInput): number {
   const preferred = o.preferred ?? 260;
@@ -156,6 +166,11 @@ export function bubbleMaxWidth(o: BubbleWidthInput): number {
   if (c !== null && Number.isFinite(c)) {
     if (right && c < anchorX) limit = Math.min(limit, anchorX - (c + gap));
     if (!right && c > anchorX) limit = Math.min(limit, c - gap - anchorX);
+  }
+  const e = o.columnEdgeX;
+  if (e !== null && e !== undefined && Number.isFinite(e)) {
+    const gutter = right ? anchorX - (e + edge) : e - edge - anchorX;
+    if (gutter >= (o.comfortable ?? 180)) limit = Math.min(limit, gutter);
   }
   return Math.round(clamp(limit, min, preferred));
 }
@@ -270,7 +285,10 @@ export class Buddy implements Mountable {
 
   // mood layers (see resolveMood)
   private mood: BuddyMood = 'idle';
+  /** Short reactions to events and to his own speech. */
   private transient: { mood: BuddyMood; until: number; fromSpeech: boolean } | null = null;
+  /** A mood the host asked for with setMood(); reactions play over it, then it returns. */
+  private held: { mood: BuddyMood; until: number } | null = null;
   private calibrationMood: BuddyMood | null = null;
   private calPhase: CalibrationPhase | null = null;
   private noFace = false;
@@ -297,6 +315,8 @@ export class Buddy implements Mountable {
   private lastFraction: number | null = null;
   private readonly milestonesSaid = new Set<number>();
   private tensSeen: number | null = null;
+  /** The book was finished: progress reports may still trail in, but they're old news. */
+  private bookDone = false;
 
   // interaction
   private menuOpen = false;
@@ -437,18 +457,18 @@ export class Buddy implements Mountable {
 
   /**
    * Shows `mood` for `holdMs` (default 5 s; `Infinity` holds until the next
-   * setMood), after which Dewey returns to his situational mood. `holdMs` 0
-   * clears a held mood.
+   * setMood), after which Dewey returns to his situational mood. Brief
+   * reactions (a spoken line's mood, a page-turn grin) may play over a held
+   * mood; it comes back when they end. `holdMs` 0 clears a held mood.
    */
   setMood(mood: BuddyMood, holdMs = MANUAL_MOOD_MS): void {
     if (this.destroyed || !isMood(mood)) return;
     const ms = Number.isNaN(holdMs) ? MANUAL_MOOD_MS : Math.max(0, holdMs);
-    if (ms === 0) {
-      this.transient = null;
-      this.refreshMood();
-      return;
-    }
-    this.setTransient(mood, ms);
+    // The host's latest request wins over whatever reaction is playing now.
+    this.transient = null;
+    this.held = ms === 0 ? null : { mood, until: now() + ms };
+    this.refreshMood();
+    this.scheduleVitals();
   }
 
   /** Viewport px to look at; null returns to following the reader. */
@@ -512,7 +532,7 @@ export class Buddy implements Mountable {
     this.root.hidden = !on;
     if (!on) {
       this.closeMenu(false);
-      this.cancelDrag();
+      this.endDrag(false); // settles any drag offset so he reappears in his corner
       this.dropSpeech();
       this.stopLife();
       this.cancelFrame();
@@ -556,7 +576,8 @@ export class Buddy implements Mountable {
       this.lastGaze = g;
       this.lastValidGazeAt = t;
       this.lastActivityAt = t;
-      if (this.sleepy) this.wake(true);
+      // If he was also worried, "There you are!" says it all.
+      if (this.sleepy) this.wake(!this.worried);
       if (!wasReading) {
         this.refreshMood();
         this.scheduleVitals();
@@ -597,8 +618,10 @@ export class Buddy implements Mountable {
   private readonly onTrackingState = (e: AppEvents['tracking-state']): void => {
     const state = e?.state;
     if (state !== 'calibrating' && state !== 'starting' && this.calibrationMood !== null) {
+      // Calibration ended without its closing event: don't stay above panels and toasts.
       this.calibrationMood = null;
       this.calPhase = null;
+      this.raise(false);
       this.refreshMood();
     }
     if (state === 'no-face') {
@@ -628,8 +651,8 @@ export class Buddy implements Mountable {
     this.worried = true;
     this.refreshMood();
     if (!this.worriedSpoken) {
-      this.worriedSpoken = true;
-      this.sayQuip('trackingLost', { priority: 'high', ttlMs: 15_000, tag: 'worry' });
+      // Only a line that was actually queued earns the "there you are" later.
+      this.worriedSpoken = this.sayQuip('trackingLost', { priority: 'high', ttlMs: 15_000, tag: 'worry' });
     }
   };
 
@@ -667,7 +690,9 @@ export class Buddy implements Mountable {
         // Targets can appear anywhere, including under Dewey: step behind the overlay.
         this.raise(false);
         this.calibrationMood = 'reading';
-        if (e.index === 0) this.coach('calibrationPoint');
+        // Only the first target's first announcement; the overlay re-emits it with a
+        // message on retry / pause / resume, which isn't worth a new tip.
+        if (e.index === 0 && typeof e.message !== 'string') this.coach('calibrationPoint');
         break;
       case 'training':
         this.raise(true);
@@ -720,6 +745,7 @@ export class Buddy implements Mountable {
     this.lastFraction = null;
     this.milestonesSaid.clear();
     this.tensSeen = null;
+    this.bookDone = false;
     const title = typeof e?.title === 'string' && e.title.trim() ? shortTitle(e.title) : undefined;
     this.setTransient('happy', 2_600);
     this.sayQuip(e?.resumed ? 'welcomeBack' : 'greeting', { priority: 'normal', ttlMs: 20_000 }, { title });
@@ -727,7 +753,8 @@ export class Buddy implements Mountable {
 
   private readonly onBookProgress = (e: AppEvents['book-progress']): void => {
     if (!e || typeof e !== 'object') return;
-    let announced = false;
+    // After the finale, keep the baselines current but save the applause.
+    let announced = this.bookDone;
     const f = e.fraction;
     if (typeof f === 'number' && Number.isFinite(f)) {
       const frac = clamp(f, 0, 1);
@@ -740,7 +767,7 @@ export class Buddy implements Mountable {
         const crossed = MILESTONES.filter((m) => prev < m && frac >= m && !this.milestonesSaid.has(m));
         for (const m of crossed) this.milestonesSaid.add(m);
         const top = crossed[crossed.length - 1];
-        if (top !== undefined) {
+        if (top !== undefined && !announced) {
           const key: QuipKey = top === 0.25 ? 'milestone25' : top === 0.5 ? 'milestone50' : 'milestone75';
           announced = this.sayQuip(key, { priority: 'normal', remark: true, mood: 'excited', ttlMs: 120_000 });
         }
@@ -762,6 +789,9 @@ export class Buddy implements Mountable {
 
   private readonly onBookFinished = (): void => {
     this.markActivity();
+    this.bookDone = true;
+    // A milestone still waiting for a pause would be an odd encore.
+    this.queue = this.queue.filter((u) => !u.remark);
     this.celebrate();
     this.sayQuip('bookFinished', { priority: 'high', mood: 'celebrating', ttlMs: 60_000 });
   };
@@ -814,7 +844,12 @@ export class Buddy implements Mountable {
     const t = now();
     if (this.current?.text === text || this.queue.some((u) => u.text === text)) return false;
     if (!(o.fromApp === true && priority === 'high') && this.recentlySaid(text, t)) return false;
-    const ttl = o.ttlMs !== undefined && Number.isFinite(o.ttlMs) && o.ttlMs > 0 ? o.ttlMs : TTL_MS[priority];
+    const ttl =
+      o.ttlMs !== undefined && Number.isFinite(o.ttlMs) && o.ttlMs > 0
+        ? o.ttlMs
+        : o.fromApp === true
+          ? Math.min(APP_TTL_MS, TTL_MS[priority])
+          : TTL_MS[priority];
     const u: Utterance = {
       text,
       priority,
@@ -885,6 +920,8 @@ export class Buddy implements Mountable {
 
   /** True while the reader is in the middle of reading a line of text. */
   private readerBusy(t: number): boolean {
+    // Calibrating isn't reading, however much valid gaze lands on the column.
+    if (this.calPhase !== null) return false;
     if (t - this.pageTurnAt < PAGE_TURN_WINDOW_MS) return false;
     const g = this.lastGaze;
     if (!g || t - this.lastValidGazeAt > BUSY_GAZE_MS || t - this.validRunStart < SETTLE_MS) return false;
@@ -899,6 +936,8 @@ export class Buddy implements Mountable {
   }
 
   private show(u: Utterance): void {
+    // Nobody talks in their sleep here: speaking wakes him (quietly) and resets the nap clock.
+    this.markActivity();
     const t = now();
     this.current = u;
     for (const [line, at] of this.spokenAt) if (t - at >= DEDUPE_WINDOW_MS) this.spokenAt.delete(line);
@@ -984,6 +1023,7 @@ export class Buddy implements Mountable {
 
   private resolveMood(t: number): BuddyMood {
     if (this.transient && this.transient.until > t) return this.transient.mood;
+    if (this.held && this.held.until > t) return this.held.mood;
     if (this.calibrationMood) return this.calibrationMood;
     if (this.worried) return 'worried';
     if (this.sleepy) return 'sleepy';
@@ -993,6 +1033,7 @@ export class Buddy implements Mountable {
   private refreshMood(): void {
     const t = now();
     if (this.transient && this.transient.until <= t) this.transient = null;
+    if (this.held && this.held.until <= t) this.held = null;
     const m = this.resolveMood(t);
     if (m === this.mood) return;
     this.root.classList.remove(`${B}--mood-${this.mood}`);
@@ -1020,6 +1061,7 @@ export class Buddy implements Mountable {
     if (!this.sleepy) due = Math.min(due, this.lastActivityAt + SLEEP_AFTER_MS);
     if (t - this.lastValidGazeAt < READING_LINGER_MS) due = Math.min(due, this.lastValidGazeAt + READING_LINGER_MS);
     if (this.transient && Number.isFinite(this.transient.until)) due = Math.min(due, this.transient.until);
+    if (this.held && Number.isFinite(this.held.until)) due = Math.min(due, this.held.until);
     if (!Number.isFinite(due)) {
       this.timers.clear('vitals');
       this.vitalsDueAt = Infinity;
@@ -1109,7 +1151,7 @@ export class Buddy implements Mountable {
   }
 
   private stopLife(): void {
-    for (const name of ['blink', 'blink-end', 'fidget', 'fidget-end', 'glance', 'look']) this.timers.clear(name);
+    for (const name of ['blink', 'blink-end', 'fidget', 'fidget-end', 'glance', 'look', 'stale']) this.timers.clear(name);
     this.root.classList.remove(`${B}--blink`, `${B}--push`);
   }
 
@@ -1200,9 +1242,25 @@ export class Buddy implements Mountable {
       }
       if (!settled) moving = true;
     }
-    if (moving) this.requestFrame();
-    else this.lastFrameAt = 0;
+    if (moving) {
+      this.requestFrame();
+    } else {
+      this.lastFrameAt = 0;
+      this.armStaleCheck(t);
+    }
   };
+
+  /**
+   * The eyes rest while following a steady gaze; if the stream simply stops,
+   * wake the loop once the gaze goes stale so they drift home. One timer at a
+   * time, re-armed lazily — never per sample.
+   */
+  private armStaleCheck(t: number): void {
+    if (this.lastGaze === null || this.timers.has('stale')) return;
+    const staleAt = this.lastValidGazeAt + GAZE_FRESH_MS;
+    if (staleAt <= t) return;
+    this.timers.set('stale', staleAt - t + 5, () => this.requestFrame());
+  }
 
   private measureEyes(t: number): void {
     const center = (i: 0 | 1): Point => {
@@ -1277,7 +1335,10 @@ export class Buddy implements Mountable {
   }
 
   private readonly onPointerDown = (e: PointerEvent): void => {
-    if (e.button !== 0 || e.isPrimary === false || this.drag || !this.win) return;
+    if (e.button !== 0 || e.isPrimary === false || !this.win) return;
+    // A press that never saw its release (the page swallowed it, the window lost
+    // focus mid-drag…) must not leave Dewey glued to the pointer: settle it first.
+    if (this.drag) this.endDrag(false);
     if (this.root.classList.contains(`${B}--snapping`)) {
       this.root.classList.remove(`${B}--snapping`);
       this.root.style.transform = '';
@@ -1294,9 +1355,10 @@ export class Buddy implements Mountable {
       active: false,
       captureTarget: target,
     };
-    this.win.addEventListener('pointermove', this.onPointerMove);
-    this.win.addEventListener('pointerup', this.onPointerUp);
-    this.win.addEventListener('pointercancel', this.onPointerCancel);
+    // Capture phase: a host page that stops propagation can't hide the release from us.
+    this.win.addEventListener('pointermove', this.onPointerMove, true);
+    this.win.addEventListener('pointerup', this.onPointerUp, true);
+    this.win.addEventListener('pointercancel', this.onPointerCancel, true);
     try {
       target?.setPointerCapture?.(e.pointerId);
     } catch {
@@ -1307,6 +1369,11 @@ export class Buddy implements Mountable {
   private readonly onPointerMove = (e: PointerEvent): void => {
     const d = this.drag;
     if (!d || e.pointerId !== d.id) return;
+    if (e.pointerType === 'mouse' && (e.buttons & 1) === 0) {
+      // The button went up where we couldn't see it (e.g. outside the window).
+      this.endDrag(true);
+      return;
+    }
     const dx = e.clientX - d.x0;
     const dy = e.clientY - d.y0;
     if (!d.active) {
@@ -1327,37 +1394,46 @@ export class Buddy implements Mountable {
   };
 
   private readonly onPointerUp = (e: PointerEvent): void => {
-    const d = this.drag;
-    if (!d || e.pointerId !== d.id) return;
-    this.cancelDrag();
-    if (!d.active) return; // a plain click: the click event opens the menu
-    this.suppressClickUntil = now() + 400;
-    const center = {
-      x: (d.base.left + d.base.right) / 2 + d.dx,
-      y: (d.base.top + d.base.bottom) / 2 + d.dy,
-    };
-    const corner = nearestCorner(center, this.viewport(), this.corner);
-    this.setCorner(corner, true);
-    if (corner !== this.settings().buddyCorner) this.bus.emit('settings-patch', { buddyCorner: corner });
-    this.pump();
+    if (this.drag && e.pointerId === this.drag.id) this.endDrag(true);
   };
 
   private readonly onPointerCancel = (e: PointerEvent): void => {
-    const d = this.drag;
-    if (!d || e.pointerId !== d.id) return;
-    this.cancelDrag();
-    if (d.active) this.setCorner(this.corner, true);
-    this.pump();
+    if (this.drag && e.pointerId === this.drag.id) this.endDrag(false);
   };
 
-  /** Ends any drag in progress: listeners, capture and the dragging class. */
+  /**
+   * Finishes the press. A press that never became a drag is a plain click (the
+   * click event opens the menu). A drag either drops — snapping to the nearest
+   * corner — or, when cancelled, slides back to where it came from.
+   */
+  private endDrag(drop: boolean): void {
+    const d = this.drag;
+    if (!d) return;
+    this.cancelDrag();
+    if (!d.active) return;
+    if (drop) {
+      this.suppressClickUntil = now() + 400;
+      const center = {
+        x: (d.base.left + d.base.right) / 2 + d.dx,
+        y: (d.base.top + d.base.bottom) / 2 + d.dy,
+      };
+      const corner = nearestCorner(center, this.viewport(), this.corner);
+      this.setCorner(corner, true);
+      if (corner !== this.settings().buddyCorner) this.bus.emit('settings-patch', { buddyCorner: corner });
+    } else {
+      this.setCorner(this.corner, true);
+    }
+    this.pump();
+  }
+
+  /** Drops any press in progress without side effects: listeners, capture and the dragging class. */
   private cancelDrag(): void {
     const d = this.drag;
     if (!d) return;
     this.drag = null;
-    this.win?.removeEventListener('pointermove', this.onPointerMove);
-    this.win?.removeEventListener('pointerup', this.onPointerUp);
-    this.win?.removeEventListener('pointercancel', this.onPointerCancel);
+    this.win?.removeEventListener('pointermove', this.onPointerMove, true);
+    this.win?.removeEventListener('pointerup', this.onPointerUp, true);
+    this.win?.removeEventListener('pointercancel', this.onPointerCancel, true);
     try {
       if (d.captureTarget?.hasPointerCapture?.(d.id)) d.captureTarget.releasePointerCapture(d.id);
     } catch {
@@ -1503,9 +1579,12 @@ export class Buddy implements Mountable {
         this.focusItem(n - 1);
         break;
       case 'Escape':
-      case 'Tab':
         this.closeMenu(true);
         break;
+      case 'Tab':
+        // Menu-button pattern: close, then let Tab carry on from Dewey to the next control.
+        this.closeMenu(true);
+        return;
       case 'Enter':
       case ' ':
         e.stopPropagation(); // native activation; just keep it from the app's shortcuts
@@ -1574,14 +1653,18 @@ export class Buddy implements Mountable {
   private placeFloating(el: HTMLElement): void {
     if (!this.mounted) return;
     const r = this.root.getBoundingClientRect();
-    const col = this.layout && this.layout.lines.length > 0 ? this.layout.column : null;
-    const center = col && col.right > col.left ? (col.left + col.right) / 2 : null;
+    const col = this.layout && this.layout.lines.length > 0 && this.layout.column.right > this.layout.column.left
+      ? this.layout.column
+      : null;
+    const menu = el === this.pop;
     const width = bubbleMaxWidth({
       corner: this.corner,
       anchor: { left: r.left, top: r.top, right: r.right, bottom: r.bottom },
       viewportWidth: this.viewport().width,
-      columnCenterX: center,
-      preferred: el === this.pop ? 228 : 260,
+      columnCenterX: col ? (col.left + col.right) / 2 : null,
+      columnEdgeX: col ? (this.corner.endsWith('right') ? col.right : col.left) : null,
+      preferred: menu ? 228 : 260,
+      min: menu ? 200 : 120,
     });
     el.style.maxWidth = `${width}px`;
   }

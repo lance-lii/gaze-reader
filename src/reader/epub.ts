@@ -11,7 +11,7 @@ import {
   type ParseOptions,
   type ParsedBook,
 } from './bookLoader';
-import { SANITIZE_ID_PREFIX, sanitizeToElement } from './sanitize';
+import { SANITIZE_ID_PREFIX, sanitizeId, sanitizeToElement } from './sanitize';
 
 /**
  * EPUB 2/3 → Book. META-INF/container.xml → OPF package (metadata, manifest,
@@ -55,7 +55,8 @@ function hasParserError(doc: Document): boolean {
  * parser — "<title/>" would swallow the whole body — so expand them first.
  */
 function expandSelfClosing(markup: string): string {
-  return markup.replace(/<([A-Za-z][\w:.-]*)(\s[^<>]*?)?\s*\/>/g, (whole, tag: string, attrs?: string) =>
+  // One lazy group up to "/>" (no separate \s* before it, which would backtrack quadratically on long tags).
+  return markup.replace(/<([A-Za-z][\w:.-]*)(\s[^<>]*?)?\/>/g, (whole, tag: string, attrs?: string) =>
     VOID_TAGS.has(tag.toLowerCase()) ? whole : `<${tag}${attrs ?? ''}></${tag}>`,
   );
 }
@@ -361,15 +362,28 @@ export async function parseEpub(data: ArrayBuffer, opts: ParseOptions = {}): Pro
     const container = sanitizeToElement(body, { idPrefix: idPrefixFor(i), rewriteHref });
     if (!/\S/.test(container.textContent ?? '')) continue; // cover images, blank pages
 
-    const start = container.ownerDocument.createElement('a');
-    start.id = `${idPrefixFor(i)}top`; // target for links to the start of this document
-    container.prepend(start);
+    // Link targets for the start of this document: "chapter.xhtml" (→ …top) and ids that sit on
+    // <html> or <body> ("chapter.xhtml#ch2"), which the sanitizer never sees since it keeps children only.
+    const targets = new Set([`${idPrefixFor(i)}top`]);
+    for (const el of [doc.documentElement, body]) {
+      const raw = el ? attr(el, 'id') : null;
+      const id = raw ? sanitizeId(raw, idPrefixFor(i)) : null;
+      if (id) targets.add(id);
+    }
+    container.prepend(
+      ...[...targets].map((id) => {
+        const a = container.ownerDocument.createElement('a');
+        a.id = id;
+        return a;
+      }),
+    );
 
     const docLang = attr(doc.documentElement, 'lang') ?? attr(body, 'lang') ?? pkg.language;
     if (docLang && LANG_RE.test(docLang.trim())) {
       const wrapper = container.ownerDocument.createElement('div');
       wrapper.setAttribute('lang', docLang.trim());
-      wrapper.append(...Array.from(container.childNodes));
+      // Moved one by one: a single-file book can have 100 000+ top-level nodes, too many to spread.
+      while (container.firstChild) wrapper.appendChild(container.firstChild);
       container.append(wrapper);
     }
 

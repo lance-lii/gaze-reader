@@ -38,6 +38,9 @@ export class CameraPreview implements Mountable {
   private lastLandmarks: PreviewSource['lastLandmarks'] = null;
   private cssW = 0;
   private cssH = 0;
+  /** The canvas box needs measuring (first draw, or it was resized). Avoids a layout read per frame. */
+  private sizeDirty = true;
+  private readonly resizeObserver: ResizeObserver | null;
 
   constructor(opts: { onHide: () => void }) {
     const el = document.createElement('figure');
@@ -60,6 +63,15 @@ export class CameraPreview implements Mountable {
     this.ctx = this.canvas.getContext('2d', { alpha: false });
     this.lost = el.querySelector('.gr-preview__lost')!;
     el.querySelector('.gr-preview__close')!.addEventListener('click', () => opts.onHide());
+    this.resizeObserver =
+      typeof ResizeObserver === 'function'
+        ? new ResizeObserver(() => {
+            this.sizeDirty = true;
+            // Redraw even if the video hasn't advanced, or the resized canvas stays blank.
+            this.lastVideoTime = -1;
+          })
+        : null;
+    this.resizeObserver?.observe(this.canvas);
   }
 
   mount(parent: HTMLElement | ShadowRoot): void {
@@ -85,15 +97,25 @@ export class CameraPreview implements Mountable {
 
   destroy(): void {
     this.stopLoop();
+    this.resizeObserver?.disconnect();
     this.source = null;
     this.el.remove();
   }
 
   private sync(): void {
     const show = this.visible && this.source !== null && this.ctx !== null;
+    const wasHidden = this.el.hidden;
     this.el.hidden = !show;
-    if (show) this.startLoop();
-    else this.stopLoop();
+    if (show) {
+      // Its box may have changed while hidden (corner, viewport width); redraw on the next frame.
+      if (wasHidden) {
+        this.sizeDirty = true;
+        this.lastVideoTime = -1;
+      }
+      this.startLoop();
+    } else {
+      this.stopLoop();
+    }
   }
 
   private startLoop(): void {
@@ -176,6 +198,9 @@ export class CameraPreview implements Mountable {
   }
 
   private fitCanvas(): void {
+    // Without a ResizeObserver, fall back to measuring every drawn frame.
+    if (!this.sizeDirty && this.resizeObserver) return;
+    this.sizeDirty = false;
     const rect = this.canvas.getBoundingClientRect();
     const w = Math.round(rect.width);
     const h = Math.round(rect.height);

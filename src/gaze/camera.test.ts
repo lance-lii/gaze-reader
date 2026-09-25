@@ -5,11 +5,26 @@ import {
   cameraSupportError,
   DEFAULT_VIDEO_CONSTRAINTS,
   openCamera,
+  settleWithin,
   toTrackerError,
   TRACKER_ERROR_MESSAGES,
   TrackerError,
   trackerErrorCode,
 } from './camera';
+
+async function flush(): Promise<void> {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 interface FakeTrack {
   kind: 'video';
@@ -93,6 +108,54 @@ describe('TrackerError', () => {
     expect(trackerErrorCode({ code: 'ENOENT' })).toBe('unknown');
     expect(trackerErrorCode(null)).toBe('unknown');
     expect(trackerErrorCode('camera-denied')).toBe('unknown');
+  });
+
+  it('toTrackerError keeps the code (and message) of a TrackerError-shaped object', () => {
+    // e.g. a TrackerError that was structured-cloned or came from another realm.
+    const cloned = { name: 'TrackerError', code: 'model-load-failed', message: 'Model fetch failed.' };
+    const mapped = toTrackerError(cloned);
+    expect(mapped).toBeInstanceOf(TrackerError);
+    expect(mapped.code).toBe('model-load-failed');
+    expect(mapped.message).toBe('Model fetch failed.');
+    expect(mapped.cause).toBe(cloned);
+    expect(toTrackerError({ code: 'no-camera' }).message).toBe(TRACKER_ERROR_MESSAGES['no-camera']);
+    // A DOMException's legacy numeric `code` is not mistaken for one.
+    expect(toTrackerError(new DOMException('x', 'NotAllowedError')).code).toBe('camera-denied');
+  });
+});
+
+describe('settleWithin', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('passes the value through and leaves no timer behind', async () => {
+    await expect(settleWithin(Promise.resolve(7), 1000, () => new Error('late'))).resolves.toBe(7);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('rejects on timeout, and a late rejection of the input stays handled', async () => {
+    const d = deferred<number>();
+    const p = settleWithin(d.promise, 50, () => new TrackerError('unknown', 'late'));
+    vi.advanceTimersByTime(50);
+    await expect(p).rejects.toMatchObject({ message: 'late' });
+    d.reject(new Error('after the fact')); // would surface as an unhandled rejection if unobserved
+    await flush();
+  });
+
+  it('rejects with the abort reason and removes its listener', async () => {
+    const ctrl = new AbortController();
+    const remove = vi.spyOn(ctrl.signal, 'removeEventListener');
+    const reason = new TrackerError('camera-in-use');
+    const p = settleWithin(new Promise<never>(() => undefined), 1000, () => new Error('late'), ctrl.signal);
+    ctrl.abort(reason);
+    await expect(p).rejects.toBe(reason);
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
+    expect(vi.getTimerCount()).toBe(0);
+    await expect(settleWithin(Promise.resolve(1), 1000, () => new Error('late'), ctrl.signal)).rejects.toBe(reason);
   });
 });
 
@@ -221,6 +284,73 @@ describe('openCamera', () => {
     const cam = await pending;
     expect(cam.video.srcObject).not.toBeNull();
     cam.stop();
+  });
+
+  it('does not prompt at all with an already-aborted signal', async () => {
+    const ctrl = new AbortController();
+    ctrl.abort();
+    await expect(openCamera({ signal: ctrl.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(getUserMedia).not.toHaveBeenCalled();
+  });
+
+  it('releases a camera granted after an abort at once, leaving a shared element alone', async () => {
+    const pending = deferred<MediaStream>();
+    getUserMedia.mockReturnValue(pending.promise);
+    const shared = document.createElement('video');
+    const newer = {} as MediaStream; // what a newer attempt already put there
+    shared.srcObject = newer;
+    const ctrl = new AbortController();
+    const opened = openCamera({ video: shared, signal: ctrl.signal });
+    ctrl.abort(); // e.g. CameraFeatureSource.stop() while the permission prompt is open
+
+    const { stream, tracks } = fakeStream();
+    pending.resolve(stream);
+    await expect(opened).rejects.toMatchObject({ name: 'AbortError' });
+    expect(tracks[0].stop).toHaveBeenCalledTimes(1);
+    expect(shared.srcObject).toBe(newer);
+    expect(document.querySelector('video')).toBeNull(); // no hidden element was created either
+  });
+
+  it('an abort while waiting for video releases the camera immediately, not at the timeout', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      fakeMediaPipeline({ ready: false });
+      const { stream, tracks } = fakeStream();
+      getUserMedia.mockResolvedValue(stream);
+      const ctrl = new AbortController();
+      const opened = openCamera({ signal: ctrl.signal, startTimeoutMs: 10_000 });
+      opened.catch(() => undefined);
+      await flush();
+      expect(document.querySelector('video')).not.toBeNull();
+      expect(tracks[0].stop).not.toHaveBeenCalled();
+
+      ctrl.abort();
+      await expect(opened).rejects.toMatchObject({ name: 'AbortError' });
+      expect(tracks[0].stop).toHaveBeenCalledTimes(1);
+      expect(document.querySelector('video')).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives up on a play() that never settles, releasing the camera', async () => {
+    fakeMediaPipeline({ play: () => new Promise<void>(() => undefined) });
+    const { stream, tracks } = fakeStream();
+    getUserMedia.mockResolvedValue(stream);
+    await expect(openCamera({ startTimeoutMs: 20 })).rejects.toMatchObject({ name: 'TrackerError', code: 'unknown' });
+    expect(tracks[0].stop).toHaveBeenCalled();
+    expect(document.querySelector('video')).toBeNull();
+  });
+
+  it('never leaves the camera on if the video element cannot be created', async () => {
+    const { stream, tracks } = fakeStream();
+    getUserMedia.mockResolvedValue(stream);
+    vi.spyOn(document, 'createElement').mockImplementation(() => {
+      throw new DOMException('blocked', 'SecurityError');
+    });
+    await expect(openCamera()).rejects.toBeInstanceOf(TrackerError);
+    expect(tracks[0].stop).toHaveBeenCalled();
   });
 
   it('reports a playback refusal without blaming camera permission', async () => {

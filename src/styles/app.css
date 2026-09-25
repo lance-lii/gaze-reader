@@ -324,6 +324,11 @@ html[data-screen='reader'] body {
   font-family: var(--gr-font-ui);
 }
 
+/* Room to scroll the last cards clear of Dewey when he sits in a bottom corner. */
+:root[data-buddy='on'][data-buddy-corner^='bottom'] .gr-library {
+  padding-bottom: 170px;
+}
+
 .gr-lib-header {
   display: flex;
   align-items: center;
@@ -452,6 +457,18 @@ html[data-screen='reader'] body {
 .gr-drop__title {
   margin: 0;
   font: 650 20px/1.3 var(--gr-font-ui);
+}
+/* Touch devices can't drag files in; don't invite them to. */
+.gr-drop__tap {
+  display: none;
+}
+@media (hover: none) and (pointer: coarse) {
+  .gr-drop__drag {
+    display: none;
+  }
+  .gr-drop__tap {
+    display: inline;
+  }
 }
 .gr-drop__formats {
   margin: 0 0 14px;
@@ -789,8 +806,16 @@ html[data-screen='reader'] body {
   flex: 1 1 auto;
   min-height: 0;
 }
+/*
+ * The reading surface holds focus most of the time (so Space / Page Down work),
+ * so a bold ring would frame the whole page. Keyboard focus gets a hairline instead:
+ * still perceptible, never distracting.
+ */
 .gr-reader-stage > :focus {
   outline: none;
+}
+.gr-reader-stage > :focus-visible {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gr-accent) 28%, transparent);
 }
 
 /* ─────────────────────────────── Top bar ─────────────────────────────── */
@@ -869,7 +894,8 @@ html[data-screen='reader'] body {
   transform: translateY(-6px);
   pointer-events: none;
 }
-/* The pill hides with the bar, except when the camera is on (privacy) or the demo runs. */
+/* The pill hides with the bar, except when it must stay visible (camera on, demo, paused, error:
+   see pillAlwaysVisible in src/app/logic.ts). */
 .gr-topbar[data-concealed='true'][data-persist='false'] .gr-topbar__status {
   opacity: 0;
 }

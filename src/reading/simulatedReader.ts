@@ -31,6 +31,16 @@ export function mulberry32(seed: number): () => number {
   };
 }
 
+/** `v` if it is a finite number > 0 (capped at `max`), else `fallback`. */
+function positive(v: number | undefined, fallback: number, max = Infinity): number {
+  return v !== undefined && Number.isFinite(v) && v > 0 ? Math.min(v, max) : fallback;
+}
+
+/** `v` if it is a finite number ≥ 0, else `fallback`. */
+function nonNegative(v: number | undefined, fallback: number): number {
+  return v !== undefined && Number.isFinite(v) && v >= 0 ? v : fallback;
+}
+
 /** Standard normal deviate (Box–Muller). */
 export function gaussian(rng: () => number): number {
   let u = 0;
@@ -45,7 +55,7 @@ export function gaussian(rng: () => number): number {
  * 62-character column, see simulatedReader.test.ts); durations scale by
  * NATURAL_WPM / wpm.
  */
-export const NATURAL_WPM = 245;
+export const NATURAL_WPM = 236;
 
 type Anchor =
   | { kind: 'text'; docTop: number; char: number; dyPx: number }
@@ -487,10 +497,10 @@ export interface SimulatedReading {
 /** Reads `layout` from `startLine` to `endLine`, then lingers for `lingerMs`. Deterministic per seed. */
 export function simulateReading(layout: LineLayout, opts: SimulateReadingOptions = {}): SimulatedReading {
   const seed = opts.seed ?? 1;
-  const hz = opts.hz !== undefined && opts.hz > 0 ? opts.hz : 30;
+  const hz = positive(opts.hz, 30, 1000);
   const period = 1000 / hz;
-  const t0 = opts.t0 ?? 0;
-  const lingerMs = Math.max(0, opts.lingerMs ?? 2500);
+  const t0 = opts.t0 !== undefined && Number.isFinite(opts.t0) ? opts.t0 : 0;
+  const lingerMs = nonNegative(opts.lingerMs, 2500);
   const firstFull = layout.lines.findIndex((l) => l.fullyVisible);
   let lastFull = -1;
   layout.lines.forEach((l, i) => {
@@ -502,14 +512,14 @@ export function simulateReading(layout: LineLayout, opts: SimulateReadingOptions
 
   const startLine = opts.startLine ?? firstFull;
   const endLine = opts.endLine ?? lastFull;
-  const wpm = opts.wpm ?? 250;
+  const wpm = positive(opts.wpm, 250);
   const brain = new ReaderBrain(mulberry32(seed), { wpm: () => wpm, startLine, endLine });
   const sensor = new GazeSensor(mulberry32(seed ^ 0x9e3779b9), {
-    noisePx: Math.max(0, opts.noisePx ?? 0),
-    driftPx: opts.driftPx ?? 0,
+    noisePx: nonNegative(opts.noisePx, 0),
+    driftPx: nonNegative(opts.driftPx, 0),
     driftOnset: opts.driftOnset ?? 'gradual',
-    wanderPx: Math.max(0, opts.wanderPx ?? 0),
-    blinksPerMin: Math.max(0, opts.blinksPerMin ?? 0),
+    wanderPx: nonNegative(opts.wanderPx, 0),
+    blinksPerMin: nonNegative(opts.blinksPerMin, 0),
     source: 'simulated',
   });
   const jitter = mulberry32(seed ^ 0x51ed27);
@@ -566,20 +576,21 @@ export class SimulatedReaderSource implements GazeSource {
   private isRunning = false;
   private nextTickAt = 0;
   private lastTickAt: number | null = null;
+  /** When a running source was last stopped; the reader resumes from there on start(). */
+  private stoppedAt: number | null = null;
 
   constructor(opts: SimulatedReaderOptions) {
     const seed = opts.seed ?? 1;
-    const hz = opts.hz !== undefined && Number.isFinite(opts.hz) && opts.hz > 0 ? Math.min(opts.hz, 240) : 30;
-    this.period = 1000 / hz;
+    this.period = 1000 / positive(opts.hz, 30, 240);
     this.getLayout = opts.getLayout;
     const wpm = opts.wpm ?? ((): number => 250);
     this.brain = new ReaderBrain(mulberry32(seed), { wpm });
     this.sensor = new GazeSensor(mulberry32(seed ^ 0x9e3779b9), {
-      noisePx: Math.max(0, opts.noisePx ?? 14),
-      driftPx: opts.driftPx ?? 10,
+      noisePx: nonNegative(opts.noisePx, 14),
+      driftPx: nonNegative(opts.driftPx, 10),
       driftOnset: 'gradual',
-      wanderPx: Math.max(0, opts.wanderPx ?? 0),
-      blinksPerMin: Math.max(0, opts.blinksPerMin ?? 0),
+      wanderPx: nonNegative(opts.wanderPx, 0),
+      blinksPerMin: nonNegative(opts.blinksPerMin, 0),
       source: 'simulated',
     });
   }
@@ -595,14 +606,22 @@ export class SimulatedReaderSource implements GazeSource {
 
   start(): Promise<void> {
     if (this.isRunning) return Promise.resolve();
+    const now = performance.now();
+    if (this.stoppedAt !== null) {
+      // The eye-movement plan is timed; without this the first tick would replay (read) the whole pause.
+      this.brain.shift(now - this.stoppedAt);
+      this.sensor.resetFilter();
+      this.stoppedAt = null;
+    }
     this.isRunning = true;
     this.lastTickAt = null;
-    this.nextTickAt = performance.now();
+    this.nextTickAt = now;
     this.schedule(0);
     return Promise.resolve();
   }
 
   stop(): void {
+    if (this.isRunning) this.stoppedAt = performance.now();
     this.isRunning = false;
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;

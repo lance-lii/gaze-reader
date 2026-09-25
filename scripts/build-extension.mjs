@@ -7,7 +7,7 @@
 //
 // The verification step fails the build if anything the manifest, the pages or
 // the code references is missing, if a page would need inline script (blocked
-// by the extension CSP), or if content.js isn't a self-contained classic script.
+// by the extension CSP), or if content.js isn't a self-contained classic script free of HTML-string sinks.
 //
 // Usage: node scripts/build-extension.mjs
 import { build } from 'vite';
@@ -166,6 +166,10 @@ if (exists('content.js')) {
     problems.push('content.js is not a self-contained classic script (found import/export/import.meta)');
   }
   if (/@mediapipe|FilesetResolver/.test(code)) problems.push('content.js pulled in MediaPipe (it must only run in the offscreen document)');
+  // Sites that enforce Trusted Types (much of Google) throw on these, and Gaze Reader would fail to start there.
+  if (/\.(?:innerHTML|outerHTML)\s*=[^=]|\binsertAdjacentHTML\s*\(|\bdocument\.write(?:ln)?\s*\(/.test(code)) {
+    problems.push('content.js writes HTML strings into the page; build its DOM with createElement/createElementNS');
+  }
 }
 if (exists('background.js')) {
   const code = readFileSync(toOut('background.js'), 'utf8');

@@ -33,15 +33,24 @@ import { classifySaccade } from '../signal/fixations';
  *   regression → stay .85 / prev .08 / next .03; return sweep → next .75 /
  *   next+1 .08 / stay .07 / prev .03; jump → 60 % uniform + 40 % where dy
  *   points. The remaining mass is spread uniformly.
- * - Drift transitions: a slow Gaussian random walk (driftRate × 0.5 lines per
+ * - Drift transitions: a slow Gaussian random walk (driftRate × 0.8 lines per
  *   fixation) plus a small chance of a sudden shift (the head moved).
  * - σ_y adapts from the residuals of confident fixations (0.4–3 lines).
+ * - The page edges absorb: "moved on" from the last readable line (looking for
+ *   a next line that isn't there) keeps the reader at the bottom.
+ * - Fixations well off the text (the keyboard, Dewey, the top bar) are
+ *   excursions: they don't move the reading state, and the next saccade is
+ *   measured from the last fixation on the text.
+ *
+ * Measured on the simulator (pipeline.test.ts): ≥ 99 % of fixations on the
+ * true line at σ = 0.5–1 line of noise with half a line of drift; ~97 % with
+ * correlated noise and blinks.
  */
 
 export interface LineTrackerOptions {
   /** Initial vertical emission σ, in lines (adapted online, clamped 0.4–3). */
   sigmaYLines: number;
-  /** How fast the drift may wander: the random-walk step is driftRate × 0.5 lines per fixation. */
+  /** How fast the drift may wander: the random-walk step is driftRate × 0.8 lines per fixation (σ; 0.12 lines at the default). */
   driftRate: number;
   /** Drift range modeled, ± lines. */
   maxDriftLines: number;
@@ -55,7 +64,10 @@ export const DEFAULT_LINE_TRACKER_OPTIONS: Readonly<LineTrackerOptions> = Object
 
 /** A LineEstimate that also reports the tracker's current vertical σ (for the debug overlay). */
 export interface TrackedLineEstimate extends LineEstimate {
+  /** Current vertical emission σ, px. */
   sigmaYPx: number;
+  /** Fixations judged to be looks away from the text since the last reset. */
+  excursions: number;
 }
 
 export function isTrackedLineEstimate(e: LineEstimate | null | undefined): e is TrackedLineEstimate {
@@ -105,6 +117,13 @@ const SIGMA_INFLATE = 1.6;
 const SIGMA_MIN_LINES = 0.4;
 const SIGMA_MAX_LINES = 3;
 
+/**
+ * Fixations further than this (in lines, drift-corrected) above the first or below the last
+ * readable line, or this far (× column width) beside the column, are looks away from the text.
+ */
+const EXCURSION_LINES = 2;
+const EXCURSION_COLUMN = 0.2;
+
 /** A line counts as readable (a state) when at least this much of its height is inside the viewport. */
 const READABLE_FRACTION = 0.6;
 /** Line-probability mass kept uniform when carrying the posterior across a layout change. */
@@ -141,6 +160,8 @@ export class LineTracker {
   private layout: LineLayout | null = null;
   /** Indices (into layout.lines) of the readable lines, top to bottom. */
   private states: number[] = [];
+  /** Horizontal extent of the text (layout.column, or the readable lines' union if that is unusable). */
+  private column: { left: number; right: number } = { left: 0, right: 0 };
   /** Joint posterior, row k (state) × column b (drift bin). */
   private joint: Float64Array = new Float64Array(0);
   /** Drift belief independent of the layout; seeds new layouts. */
@@ -153,6 +174,8 @@ export class LineTracker {
   /** EMA of squared drift-corrected residuals, lines². */
   private residVar: number;
   private fixCount = 0;
+  /** Fixations off the text since the last reset (diagnostics). */
+  private excursions = 0;
   private lastSaccade: SaccadeKind | null = null;
   private progressX = 0;
   private est: TrackedLineEstimate | null = null;
@@ -192,6 +215,7 @@ export class LineTracker {
     const oldJoint = this.joint;
     this.layout = layout;
     this.states = readableStates(layout);
+    this.column = textColumn(layout, this.states);
     const m = this.states.length;
     const D = this.grid.length;
     const joint = new Float64Array(m * D);
@@ -255,6 +279,13 @@ export class LineTracker {
     const pitch = this.pitch();
     const D = this.grid.length;
 
+    // A look away from the text (the keyboard, Dewey, the top bar) doesn't move the reading
+    // state; the next saccade is measured from the last fixation on the text.
+    if (this.isExcursion(f, lines, pitch)) {
+      this.excursions++;
+      return this.publish(t);
+    }
+
     let kind: SaccadeKind | null = null;
     if (this.prevFix) {
       const bestPrev = argmax(this.post);
@@ -265,7 +296,7 @@ export class LineTracker {
 
     const sigma = this.sigmaLines;
     const yL = f.y / pitch;
-    const colW = Math.max(layout.column.right - layout.column.left, pitch);
+    const colW = Math.max(this.column.right - this.column.left, pitch);
     const joint = this.joint;
     let total = 0;
     for (let k = 0; k < m; k++) {
@@ -342,6 +373,7 @@ export class LineTracker {
     this.sigmaLines = this.opts.sigmaYLines;
     this.residVar = (this.sigmaLines / SIGMA_INFLATE) ** 2;
     this.fixCount = 0;
+    this.excursions = 0;
     this.lastSaccade = null;
     this.progressX = 0;
     this.summarize();
@@ -385,6 +417,16 @@ export class LineTracker {
     }
     for (let b = 0; b < p.length; b++) p[b] = p[b]! / z;
     return p;
+  }
+
+  private isExcursion(f: Fixation, lines: readonly TextLine[], pitch: number): boolean {
+    const first = lines[this.states[0]!]!;
+    const last = lines[this.states[this.states.length - 1]!]!;
+    const yc = f.y - this.driftY;
+    if (yc < first.centerY - EXCURSION_LINES * pitch || yc > last.centerY + EXCURSION_LINES * pitch) return true;
+    const c = this.column;
+    const margin = EXCURSION_COLUMN * Math.max(c.right - c.left, pitch);
+    return f.x < c.left - margin || f.x > c.right + margin;
   }
 
   /** A confident fixation's residual is fit to learn σ from (not a glance past the first/last line). */
@@ -483,6 +525,7 @@ export class LineTracker {
       driftY: this.driftY,
       fixationsOnPage: this.fixCount,
       sigmaYPx: this.sigmaYPx,
+      excursions: this.excursions,
     };
     return this.est;
   }
@@ -504,6 +547,22 @@ function readableStates(layout: LineLayout): number[] {
     if (visible / h >= READABLE_FRACTION) out.push(i);
   });
   return out;
+}
+
+/** layout.column when it is a real box, else the union of the readable lines (else the viewport). */
+function textColumn(layout: LineLayout, states: readonly number[]): { left: number; right: number } {
+  const c = layout.column;
+  if (Number.isFinite(c.left) && Number.isFinite(c.right) && c.right > c.left) return { left: c.left, right: c.right };
+  let left = Infinity;
+  let right = -Infinity;
+  for (const i of states) {
+    const l = layout.lines[i]!;
+    if (Number.isFinite(l.left)) left = Math.min(left, l.left);
+    if (Number.isFinite(l.right)) right = Math.max(right, l.right);
+  }
+  if (right > left) return { left, right };
+  const v = layout.viewport;
+  return Number.isFinite(v.left) && Number.isFinite(v.right) && v.right > v.left ? { left: v.left, right: v.right } : { left: 0, right: 0 };
 }
 
 /** Index of the line whose docTop is nearest to `docTop` (within `tol`), or -1. Lines must be sorted by top. */
@@ -568,22 +627,23 @@ function transitionLines(a: readonly number[], kind: SaccadeKind, dyLines: numbe
     for (let j = 0; j < m; j++) out[j] = out[j]! + (JUMP_UNIFORM * mass) / m;
     return out;
   }
+  // Absorbing edges: moving on from the last readable line (looking for a next line
+  // that isn't there) keeps the reader at the bottom rather than scattering them over
+  // the page; likewise moving back from the first line keeps them at the top.
   const T = LINE_TRANSITIONS[kind];
   const rem = Math.max(0, 1 - (T.stay + T.next + T.next2 + T.prev));
   let uniformMass = 0;
   for (let i = 0; i < m; i++) {
     const ai = a[i]!;
     if (!(ai > 0)) continue;
-    const hasNext = i + 1 < m;
-    const hasNext2 = i + 2 < m;
-    const hasPrev = i > 0;
-    const z = T.stay + (hasNext ? T.next : 0) + (hasNext2 ? T.next2 : 0) + (hasPrev ? T.prev : 0) + rem;
-    const w = ai / z;
-    out[i] = out[i]! + w * T.stay;
-    if (hasNext) out[i + 1] = out[i + 1]! + w * T.next;
-    if (hasNext2) out[i + 2] = out[i + 2]! + w * T.next2;
-    if (hasPrev) out[i - 1] = out[i - 1]! + w * T.prev;
-    uniformMass += w * rem;
+    const down1 = Math.min(i + 1, m - 1);
+    const down2 = Math.min(i + 2, m - 1);
+    const up1 = Math.max(i - 1, 0);
+    out[i] = out[i]! + ai * T.stay;
+    out[down1] = out[down1]! + ai * T.next;
+    out[down2] = out[down2]! + ai * T.next2;
+    out[up1] = out[up1]! + ai * T.prev;
+    uniformMass += ai * rem;
   }
   for (let j = 0; j < m; j++) out[j] = out[j]! + uniformMass / m;
   return out;

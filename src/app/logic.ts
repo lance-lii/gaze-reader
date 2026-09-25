@@ -29,8 +29,13 @@ export interface TrackingThresholds {
   noFaceAfterMs: number;
   /** A continuous valid run this long is needed to leave `no-face` (prevents flicker). */
   recoverAfterMs: number;
-  /** Smoothed confidence below this → `poor`… */
+  /** Smoothed confidence below this… */
   poorEnter: number;
+  /**
+   * …for this long → `poor`. Brief dips are normal: MediaPipe's blink score rises as the lids
+   * lower to read the last lines of a page, which pulls confidence down on every page.
+   */
+  poorAfterMs: number;
   /** …and it must climb back above this to leave `poor` (hysteresis). */
   poorExit: number;
   /** Time constant of the confidence EMA. */
@@ -41,6 +46,7 @@ export const DEFAULT_TRACKING_THRESHOLDS: Readonly<TrackingThresholds> = Object.
   noFaceAfterMs: 1000,
   recoverAfterMs: 200,
   poorEnter: 0.3,
+  poorAfterMs: 2500,
   poorExit: 0.42,
   confidenceTauMs: 600,
 });
@@ -78,6 +84,8 @@ export class TrackingStateMachine {
   private validRunStart: number | null = null;
   private confidence: number | null = null;
   private lastConfidenceT: number | null = null;
+  /** When the smoothed confidence last dropped under poorEnter (null while it's above). */
+  private lowSince: number | null = null;
   private noFace = false;
   private poor = false;
 
@@ -92,6 +100,7 @@ export class TrackingStateMachine {
     this.validRunStart = null;
     this.confidence = null;
     this.lastConfidenceT = null;
+    this.lowSince = null;
     this.noFace = false;
     this.poor = false;
   }
@@ -113,6 +122,7 @@ export class TrackingStateMachine {
       this.confidence += alpha * (c - this.confidence);
     }
     this.lastConfidenceT = s.t;
+    this.lowSince = this.confidence < this.th.poorEnter ? (this.lowSince ?? s.t) : null;
   }
 
   /** Smoothed confidence of recent valid samples, or null before the first one. */
@@ -162,7 +172,7 @@ export class TrackingStateMachine {
     const c = this.confidence;
     if (c === null) {
       this.poor = false;
-    } else if (!this.poor && c < this.th.poorEnter) {
+    } else if (!this.poor && c < this.th.poorEnter && this.lowSince !== null && now - this.lowSince >= this.th.poorAfterMs) {
       this.poor = true;
     } else if (this.poor && c >= this.th.poorExit) {
       this.poor = false;
@@ -213,7 +223,9 @@ export function statusPill(state: TrackingState, kind: GazeSourceKind | null, ca
     case 'poor':
       return { label: 'Low confidence', tone: 'warn', description: `${cam}Tracking is unsure: try more light or sit a little closer.` };
     case 'starting':
-      return { label: 'Starting camera', tone: 'info', description: `${cam}Getting the camera and face model ready.` };
+      return kind === 'webcam'
+        ? { label: 'Starting camera', tone: 'info', description: `${cam}Getting the camera and face model ready.` }
+        : { label: 'Starting', tone: 'info', description: 'Getting ready to follow along.' };
     case 'calibrating':
       return { label: 'Calibrating', tone: 'info', description: `${cam}Follow the dots with your eyes.` };
     case 'error':
@@ -224,10 +236,41 @@ export function statusPill(state: TrackingState, kind: GazeSourceKind | null, ca
   }
 }
 
+/**
+ * Whether the pill must stay on screen while the top bar is auto-hidden:
+ * always while the camera is on (privacy), during the demo (it explains the
+ * moving dot), and whenever page turning isn't happening (paused, or the
+ * camera failed) so the reader can see why.
+ */
+export function pillAlwaysVisible(state: TrackingState, kind: GazeSourceKind | null, cameraOn: boolean): boolean {
+  return cameraOn || kind === 'simulated' || state === 'paused' || state === 'error';
+}
+
 // ─────────────────────────────── Page turning ───────────────────────────────
 
 type LineLike = Pick<TextLine, 'docTop'>;
 type VisibleLineLike = Pick<TextLine, 'fullyVisible'>;
+
+/**
+ * True when every remaining line of the book is already on screen, so a page
+ * turn would only reveal the end-of-book padding.
+ *
+ * `textBottom` is the viewport y where the text ends (the bottom of the last
+ * chapter), when the host can tell. Without it, fall back to the layout: it
+ * includes every line within half a viewport below the reading area, so a fully
+ * visible last line means no more text follows nearby.
+ */
+export function textEndsOnScreen(
+  lines: readonly VisibleLineLike[],
+  viewportBottom: number,
+  textBottom: number | null = null,
+): boolean {
+  if (textBottom !== null && Number.isFinite(textBottom) && Number.isFinite(viewportBottom)) {
+    return textBottom <= viewportBottom + 1;
+  }
+  const last = lines[lines.length - 1];
+  return last !== undefined && last.fullyVisible;
+}
 
 /**
  * Where reading resumes after a page turn: the first line whose `docTop` lies
@@ -640,8 +683,15 @@ export function previewCorner(buddyCorner: Corner): 'bottom-left' | 'bottom-righ
 export function normalizeUrl(input: string): string | null {
   const raw = input.trim();
   if (!raw) return null;
-  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(raw);
-  const candidate = hasScheme ? raw : /^[\w-]+(\.[\w-]+)+(:\d+)?(\/|$)/.test(raw) || raw.startsWith('localhost') ? `https://${raw}` : null;
+  // "host:8080/…" is a host and port, not a scheme: a scheme's colon is never followed by a digit.
+  const hasScheme = /^[a-z][a-z0-9+.-]*:(?!\d)/i.test(raw);
+  let candidate: string | null = raw;
+  if (!hasScheme) {
+    // Local servers rarely speak https; everything else gets it by default.
+    if (/^(localhost|127\.\d+\.\d+\.\d+|\[::1\])(:\d+)?(\/|$)/i.test(raw)) candidate = `http://${raw}`;
+    else if (/^[\w-]+(\.[\w-]+)+(:\d+)?(\/|$)/.test(raw)) candidate = `https://${raw}`;
+    else candidate = null;
+  }
   if (!candidate) return null;
   try {
     const url = new URL(candidate);

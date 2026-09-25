@@ -280,6 +280,63 @@ describe('WebcamGazeSource blink handling', () => {
     const h = setup();
     for (let i = 0; i < 60; i++) expect(h.blink(0.95).valid).toBe(false);
   });
+
+  it('never lets shut lids through, even when the blink score stays moderate', () => {
+    // Some faces never reach the 0.85 score with their eyes closed; the lid
+    // aperture tells a long closure apart from lowered lids.
+    const h = setup();
+    for (let i = 0; i < 60; i++) {
+      expect(h.frame({ features: { ...features(500, 400, 0.6), openness: 0.03 } }).valid).toBe(false);
+    }
+    // The same score with open-enough lids (reading the bottom of the page) still passes.
+    for (let i = 0; i < 20; i++) h.frame({ features: { ...features(500, 400, 0.6), openness: 0.16 } });
+    expect(h.samples.at(-1)?.valid).toBe(true);
+  });
+});
+
+describe('WebcamGazeSource robustness', () => {
+  it('falls back to the defaults for NaN or negative tuning options', () => {
+    const src = new FakeFeatures();
+    let now = 0;
+    const gaze = new WebcamGazeSource({
+      features: src,
+      getModel: () => new FakeModel(),
+      resetAfterInvalidMs: Number.NaN,
+      maxOffscreenViewports: -1,
+      now: () => now,
+    });
+    const samples: GazeSample[] = [];
+    gaze.onSample((s) => samples.push(s));
+    void gaze.start();
+    const look = (x: number, y: number, dt = FRAME_MS): GazeSample => {
+      now += dt;
+      src.push({ t: now, faceFound: true, features: features(x, y), quality: 1 });
+      return samples[samples.length - 1];
+    };
+    // An on-screen point is still valid (a negative bound would reject everything)…
+    for (let i = 0; i < 30; i++) expect(look(100, 100).valid).toBe(true);
+    // …and a long gap still restarts the smoothing (NaN would never reset it).
+    expect(look(700, 500, 1000).x).toBe(700);
+  });
+
+  it('treats a throwing getModel as "no model", still emitting one sample per frame', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const src = new FakeFeatures();
+    const gaze = new WebcamGazeSource({
+      features: src,
+      getModel: () => {
+        throw new Error('storage exploded');
+      },
+      now: () => 1000,
+    });
+    const samples: GazeSample[] = [];
+    gaze.onSample((s) => samples.push(s));
+    void gaze.start();
+    src.push({ t: 1000, faceFound: true, features: features(1, 1), quality: 1 });
+    expect(samples).toHaveLength(1);
+    expect(samples[0]).toMatchObject({ valid: false, confidence: 0 });
+    expect(errors).not.toHaveBeenCalled();
+  });
 });
 
 describe('BlinkGate', () => {
@@ -295,5 +352,15 @@ describe('BlinkGate', () => {
     expect(gate.update(490, Number.NaN)).toBe(false);
     gate.reset();
     expect(gate.update(500, 0.6)).toBe(true); // a fresh episode after reset
+  });
+
+  it('uses the lid aperture to tell shut eyes from lowered lids', () => {
+    const gate = new BlinkGate();
+    expect(gate.update(0, 0.6, 0.18)).toBe(true); // start of an episode: could be a blink
+    expect(gate.update(500, 0.6, 0.18)).toBe(false); // sustained with open-enough lids → lowered lids
+    expect(gate.update(533, 0.6, 0.04)).toBe(true); // lids shut despite a moderate score
+    expect(gate.update(566, 0.6, Number.NaN)).toBe(false); // aperture unknown → the score rule alone
+    expect(gate.update(600, 0.6)).toBe(false);
+    expect(gate.update(633, 0.3, 0.02)).toBe(false); // below the score threshold the aperture is not consulted
   });
 });

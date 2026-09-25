@@ -210,6 +210,30 @@ describe('CameraHub', () => {
     expect(statuses(t1).at(-1)).toBe('error');
   });
 
+  it('does not count its own idle closes as crashes when a tab comes back mid-close', async () => {
+    const { calls, tab, offscreen, fromOffscreen } = setup();
+    const t1 = tab(1);
+    for (let round = 0; round < 5; round++) {
+      t1.postMessage({ type: 'subscribe' });
+      await flush();
+      const doc = offscreen();
+      fromOffscreen(doc, { type: 'hello', state: 'idle' });
+      fromOffscreen(doc, { type: 'camera-status', status: { state: 'running' } });
+      await flush();
+      t1.postMessage({ type: 'unsubscribe', linger: false });
+      await flush();
+      await vi.advanceTimersByTimeAsync(5_000); // idle close requested…
+      t1.postMessage({ type: 'subscribe' }); // …and the reader is back before it completes
+      await flush();
+      doc.disconnect();
+      await flush();
+      t1.postMessage({ type: 'unsubscribe', linger: false });
+      await flush();
+    }
+    expect(calls.close).toBe(5);
+    expect(statuses(t1)).not.toContain('error');
+  });
+
   it('reports an error if the offscreen document never connects', async () => {
     const { tab } = setup();
     const t1 = tab(1);

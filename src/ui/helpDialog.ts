@@ -143,8 +143,10 @@ export class ModalLayer {
     const trap = this.trap;
     this.trap = null;
     this.root.hidden = true;
-    trap?.release();
+    // The owner may have made the page inert while we were open; let it undo that
+    // first, or handing focus back to an element in the page would silently fail.
     this.opts.onClose?.();
+    trap?.release();
   }
 
   destroy(): void {

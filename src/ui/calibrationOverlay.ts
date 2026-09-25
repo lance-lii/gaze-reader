@@ -29,12 +29,12 @@ import { CSS_PREFIX, IGNORE_ATTR, Z } from '../core/constants';
 import { OneEuroFilter2D } from '../signal/oneEuro';
 import {
   DEFAULT_LINE_PITCH_PX,
-  MAX_BLINK,
   asRidgeGazeModel,
   evaluateModel,
   refineGazeModel,
   trainGazeModel,
 } from '../gaze/calibrationModel';
+import { BlinkGate, DEFAULT_BLINK_GATE } from '../gaze/webcamGazeSource';
 
 // ─────────────────────────────── Public API ──────────────────────────────────
 
@@ -270,6 +270,8 @@ const QUALITY_COPY: Record<CalibrationQuality, { badge: string; title: string; a
 
 const FAIL_TOO_FEW =
   'I couldn’t get a steady look at your eyes. More light on your face and keeping your head still usually fixes it.';
+const FAIL_QUICK =
+  'Your eyes look quite different from the saved calibration, so a quick tune-up can’t fix it. Let’s do a full calibration instead.';
 
 // ─────────────────────────────── Internals ───────────────────────────────────
 
@@ -282,8 +284,32 @@ type CalibrationEvent = AppEvents['calibration'];
 
 const P = `${CSS_PREFIX}cal`;
 const SVG_NS = 'http://www.w3.org/2000/svg';
-/** Frames the tracker itself rates below this are never used as samples. */
+/**
+ * Frames the tracker itself rates below this are never used as samples —
+ * except lowered lids, which its score also marks down but the blink gate has
+ * already vetted.
+ */
 const MIN_FRAME_QUALITY = 0.15;
+/**
+ * Samples reach the model with blink scores up to here. Real blinks were
+ * already dropped by the same BlinkGate the live gaze source uses; what is
+ * left above its threshold is lowered lids (looking low on the screen), which
+ * the live source keeps — so the model has to learn them, not extrapolate.
+ */
+const SAMPLE_MAX_BLINK = DEFAULT_BLINK_GATE.closedThreshold;
+/** Keys whose default action scrolls: kept from scrolling the page behind the modal. */
+const SCROLL_KEYS: ReadonlySet<string> = new Set([
+  ' ',
+  'Spacebar',
+  'PageUp',
+  'PageDown',
+  'Home',
+  'End',
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+]);
 const MIN_TARGETS_STANDARD = 9;
 const MIN_TARGETS_QUICK = 3;
 const MIN_VALIDATION_TARGETS = 2;
@@ -386,6 +412,8 @@ export class CalibrationOverlay implements Mountable {
   private validSince: number | null = null;
   private watchdog: ReturnType<typeof setInterval> | null = null;
   private lastFeatureLength: number | null = null;
+  /** The live gaze source's blink rule, so calibration keeps exactly the frames tracking will use. */
+  private readonly blinkGate = new BlinkGate();
 
   private liveModel: GazeModel | null = null;
   private readonly liveFilter = new OneEuroFilter2D();
@@ -452,9 +480,9 @@ export class CalibrationOverlay implements Mountable {
     const ctl = new AbortController();
     this.runCtl = ctl;
     const signal = ctl.signal;
-    this.beginRun();
-    this.emit({ phase: 'start' });
     try {
+      this.beginRun();
+      this.emit({ phase: 'start' });
       const result = await this.flow(signal);
       this.endRun();
       this.emit({ phase: 'done', report: result.report });
@@ -494,14 +522,21 @@ export class CalibrationOverlay implements Mountable {
       const startedAt = performance.now();
       await this.sleep(60, signal); // let the "learning" screen paint before the synchronous fit
       const viewport = this.measureViewport();
+      const maxBlink = SAMPLE_MAX_BLINK;
       let trained: CalibrationResult;
       try {
         trained =
           mode === 'quick' && base
-            ? refineGazeModel(base, collected.samples, { viewport })
-            : trainGazeModel(collected.samples, { viewport, featureNames: this.opts.featureNames });
+            ? refineGazeModel(base, collected.samples, { viewport, maxBlink })
+            : trainGazeModel(collected.samples, { viewport, maxBlink, featureNames: this.opts.featureNames });
       } catch (err) {
-        await this.failure(trainingFailureMessage(err), signal);
+        if (mode === 'quick') {
+          // The saved model can't explain today's eyes; retrying the tune-up would fail the same way.
+          mode = 'standard';
+          await this.failure(FAIL_QUICK, signal, 'Full calibration');
+        } else {
+          await this.failure(trainingFailureMessage(err), signal);
+        }
         continue;
       }
       await this.sleep(this.timing.minTrainingMs - (performance.now() - startedAt), signal);
@@ -510,7 +545,7 @@ export class CalibrationOverlay implements Mountable {
       if (mode === 'standard') {
         const val = await this.collectTargets(shuffle(VALIDATION_TARGETS, this.random), 'validating', signal);
         if (val.succeeded >= MIN_VALIDATION_TARGETS) {
-          const checked = evaluateModel(trained.model, val.samples);
+          const checked = evaluateModel(trained.model, val.samples, { maxBlink });
           if (checked.sampleCount > 0) report = checked;
         }
       }
@@ -542,8 +577,8 @@ export class CalibrationOverlay implements Mountable {
     if (dom) {
       dom.next.textContent =
         mode === 'quick'
-          ? 'Quick tune-up: 5 dots, about 10 seconds. Look right at each one until it shrinks away.'
-          : `Next: ${STANDARD_TARGETS.length} dots, then ${VALIDATION_TARGETS.length} quick checks. Look right at each dot until it shrinks away — move your eyes, not your head.`;
+          ? 'Quick tune-up: 5 dots, about 10 seconds. Look right at the center of each one until it disappears.'
+          : `Next: ${STANDARD_TARGETS.length} dots, then ${VALIDATION_TARGETS.length} quick checks. Look right at the center of each dot until it disappears — move your eyes, not your head.`;
     }
     this.setPhase('positioning');
     this.emit({ phase: 'positioning' });
@@ -675,7 +710,7 @@ export class CalibrationOverlay implements Mountable {
     this.liveLastValid = -Infinity;
     this.liveViewport = this.measureViewport();
     const dom = this.dom;
-    if (dom) (report.quality === 'poor' ? dom.redo : dom.use).focus({ preventScroll: true });
+    if (dom) this.focusButton(report.quality === 'poor' ? dom.redo : dom.use);
     return new Promise<Choice>((resolve, reject) => {
       const cleanup = (): void => {
         signal.removeEventListener('abort', onAbort);
@@ -695,12 +730,16 @@ export class CalibrationOverlay implements Mountable {
     });
   }
 
-  private failure(message: string, signal: AbortSignal): Promise<void> {
+  private failure(message: string, signal: AbortSignal, retryLabel = 'Try again'): Promise<void> {
     signal.throwIfAborted();
-    if (this.dom) this.dom.failText.textContent = message;
+    const dom = this.dom;
+    if (dom) {
+      dom.failText.textContent = message;
+      dom.retry.textContent = retryLabel;
+    }
     this.setPhase('failed');
     this.emit({ phase: 'failed', message });
-    this.dom?.retry.focus({ preventScroll: true });
+    if (dom) this.focusButton(dom.retry);
     return new Promise<void>((resolve, reject) => {
       const onAbort = (): void => {
         this.onRetry = null;
@@ -720,9 +759,13 @@ export class CalibrationOverlay implements Mountable {
   private beginRun(): void {
     const root = this.root;
     if (!root) return;
-    this.returnFocus = deepActiveElement(root.ownerDocument);
+    // A closed shadow root (the extension) hides its focus from the document; ask it directly.
+    const node = root.getRootNode();
+    const inOwnTree = node instanceof ShadowRoot ? node.activeElement : null;
+    this.returnFocus = inOwnTree ?? deepActiveElement(root.ownerDocument);
     this.resolveTone();
     root.hidden = false;
+    this.blinkGate.reset();
     this.unsubscribeFrames = this.opts.features.onFrame(this.handleFrame);
     const win = root.ownerDocument.defaultView;
     if (win && !this.listening) {
@@ -778,16 +821,18 @@ export class CalibrationOverlay implements Mountable {
   private readonly handleFrame = (frame: FeatureFrame): void => {
     if (!frame) return;
     const now = performance.now();
+    // Every frame goes through the blink gate, whatever the phase, so blink episodes are timed right.
+    const usable = this.usableFeatures(frame, now);
     switch (this.phase) {
       case 'positioning':
         this.updatePositioning(frame, now);
         break;
       case 'targets':
       case 'validating':
-        this.collectFrame(frame, now);
+        this.collectFrame(usable, now);
         break;
       case 'results':
-        this.updateLive(frame, now);
+        this.updateLive(usable, now);
         break;
       default:
         break;
@@ -808,18 +853,26 @@ export class CalibrationOverlay implements Mountable {
       this.trapFocus(e);
       return;
     }
-    const onButton = this.isOwnButton(e);
-    if ((e.key === ' ' || e.code === 'Space') && (this.phase === 'targets' || this.phase === 'validating')) {
-      if (onButton) return;
+    const focused = this.activeInside();
+    const onButton = focused instanceof HTMLButtonElement;
+    const space = e.key === ' ' || e.key === 'Spacebar' || e.code === 'Space';
+    // Space and Enter on a focused button activate that button (the browser's default).
+    if (onButton && (space || e.key === 'Enter')) return;
+    if (space && (this.phase === 'targets' || this.phase === 'validating')) {
       e.preventDefault();
       if (e.repeat) return;
       if (this.paused) this.resume();
       else this.pause('user');
       return;
     }
-    if (e.key === 'Enter' && this.phase === 'positioning' && !onButton) {
+    if (e.key === 'Enter' && this.phase === 'positioning') {
       e.preventDefault();
       this.tryStart();
+      return;
+    }
+    // Arrow/Page/Home/End/Space would scroll the page behind — unless focus sits in a card that can scroll itself.
+    if ((space || SCROLL_KEYS.has(e.key)) && !isScrollable(focused?.closest<HTMLElement>(`.${P}-center`))) {
+      e.preventDefault();
     }
   };
 
@@ -857,10 +910,16 @@ export class CalibrationOverlay implements Mountable {
     }
   };
 
+  /** Without a keyboard (tablets) a tap is the only way to reach Pause/Cancel mid-run. */
+  private readonly handleStagePointer = (e: PointerEvent): void => {
+    if (e.isPrimary === false || e.button > 0) return;
+    if ((this.phase === 'targets' || this.phase === 'validating') && !this.paused) this.pause('user');
+  };
+
   /** Keeps wheel/touch from scrolling the page behind; an overflowing card may still scroll itself. */
   private readonly blockScroll = (e: Event): void => {
     const panel = e.target instanceof Element ? e.target.closest<HTMLElement>(`.${P}-center`) : null;
-    if (panel && panel.scrollHeight > panel.clientHeight + 1) return; // overscroll-behavior stops chaining
+    if (isScrollable(panel)) return; // overscroll-behavior stops chaining
     if (e.cancelable) e.preventDefault();
   };
 
@@ -969,7 +1028,7 @@ export class CalibrationOverlay implements Mountable {
     if (dom.start.textContent !== label) dom.start.textContent = label;
     const wasDisabled = dom.start.disabled;
     dom.start.disabled = !s.canStart;
-    if (wasDisabled && s.canStart && this.focusIsOnRoot()) dom.start.focus({ preventScroll: true });
+    if (wasDisabled && s.canStart && this.focusIsOnRoot()) this.focusButton(dom.start);
 
     if (!this.previewActive && s.metrics) {
       // No video (e.g. inside the extension): draw where the face is instead.
@@ -1063,8 +1122,25 @@ export class CalibrationOverlay implements Mountable {
 
   // ──────────────────────────────── Targets ──────────────────────────────────
 
-  private collectFrame(frame: FeatureFrame, now: number): void {
-    const f = usableFeatures(frame);
+  /**
+   * Features usable as a calibration sample, or null (no face, blink, junk frame,
+   * non-finite vector). Call exactly once per frame: it advances the blink gate.
+   */
+  private usableFeatures(frame: FeatureFrame, now: number): EyeFeatures | null {
+    const f = frame.faceFound ? frame.features : null;
+    if (!f) {
+      this.blinkGate.reset();
+      return null;
+    }
+    if (this.blinkGate.update(now, f.blink, f.openness)) return null;
+    const loweredLids = f.blink > DEFAULT_BLINK_GATE.threshold; // it passed the gate, so not a blink
+    if (frame.quality < MIN_FRAME_QUALITY && !loweredLids) return null;
+    if (!Array.isArray(f.vector) || f.vector.length === 0) return null;
+    for (const v of f.vector) if (!Number.isFinite(v)) return null;
+    return f;
+  }
+
+  private collectFrame(f: EyeFeatures | null, now: number): void {
     if (f) {
       this.lastFeatureLength = f.vector.length;
       this.lastValidAt = now;
@@ -1199,7 +1275,7 @@ export class CalibrationOverlay implements Mountable {
       dom.pauseText.textContent = 'Look back at the screen — we’ll pick up right where we left off.';
     } else if (this.paused === 'user') {
       dom.pauseTitle.textContent = 'Paused';
-      dom.pauseText.textContent = 'Take your time. Press Space when you’re ready to continue.';
+      dom.pauseText.textContent = 'Take your time — continue whenever you’re ready.';
     }
   }
 
@@ -1268,11 +1344,10 @@ export class CalibrationOverlay implements Mountable {
     );
   }
 
-  private updateLive(frame: FeatureFrame, now: number): void {
+  private updateLive(f: EyeFeatures | null, now: number): void {
     const dom = this.dom;
     const model = this.liveModel;
     if (!dom || !model) return;
-    const f = usableFeatures(frame);
     const p = f ? model.predict(f) : null;
     if (p) {
       const s = this.liveFilter.filter(p.x, p.y, now);
@@ -1311,7 +1386,7 @@ export class CalibrationOverlay implements Mountable {
     if (phase === 'targets' || phase === 'validating' || phase === 'training') root.focus({ preventScroll: true });
     const spoken: Partial<Record<Phase, string>> = {
       positioning: 'Calibration. Position yourself in front of the camera.',
-      targets: 'Look at each dot until it shrinks away.',
+      targets: 'Look at the center of each dot until it disappears.',
       training: 'Learning how your eyes move.',
       validating: 'A few more dots to check accuracy.',
     };
@@ -1373,11 +1448,23 @@ export class CalibrationOverlay implements Mountable {
     this.intervals.delete(id);
   }
 
-  private isOwnButton(e: Event): boolean {
-    const t = e.composedPath()[0];
-    return t instanceof HTMLButtonElement && !!this.root?.contains(t);
+  /**
+   * Focuses one of our buttons without letting the browser scroll the page
+   * behind, then scrolls its card (only) if the button is outside it — on a
+   * short window the action row can sit below the fold.
+   */
+  private focusButton(el: HTMLElement): void {
+    el.focus({ preventScroll: true });
+    const box = el.closest<HTMLElement>(`.${P}-center`);
+    if (!box || !isScrollable(box)) return;
+    const r = el.getBoundingClientRect();
+    const b = box.getBoundingClientRect();
+    const pad = 16;
+    if (r.bottom > b.bottom - pad) box.scrollTop += r.bottom - b.bottom + pad;
+    else if (r.top < b.top + pad) box.scrollTop -= b.top + pad - r.top;
   }
 
+  /** The focused element if it is inside the overlay (works in open and closed shadow roots). */
   private activeInside(): Element | null {
     const root = this.root;
     if (!root) return null;
@@ -1406,7 +1493,7 @@ export class CalibrationOverlay implements Mountable {
     const i = current instanceof HTMLButtonElement ? focusables.indexOf(current) : -1;
     const next =
       i < 0 ? (e.shiftKey ? focusables.length - 1 : 0) : (i + (e.shiftKey ? -1 : 1) + focusables.length) % focusables.length;
-    focusables[next].focus({ preventScroll: true });
+    this.focusButton(focusables[next]);
   }
 
   /**
@@ -1489,7 +1576,7 @@ export class CalibrationOverlay implements Mountable {
     const hudCount = el('span', 'count', {}, '1 / 1');
     const hudBar = el('span', 'bar', { 'aria-hidden': 'true' }, el('span', 'bar-fill'));
     const hud = el('div', 'hud', {}, hudLabel, hudCount, hudBar);
-    const hint = el('p', 'hint', {}, 'Look at the dot until it shrinks away · ', kbd('Space'), ' pause · ', kbd('Esc'), ' cancel');
+    const hint = el('p', 'hint', {}, 'Keep your eyes on the dot · ', kbd('Space'), ' or tap to pause · ', kbd('Esc'), ' cancel');
     const toast = el('p', 'toast', { 'aria-live': 'polite' });
     const hudWrap = el('div', 'hudwrap', {}, hud, hint, toast);
     const pauseTitle = el('h2', 'title', { id: id('pause-title') }, 'Paused');
@@ -1514,7 +1601,15 @@ export class CalibrationOverlay implements Mountable {
     video.playsInline = true;
     video.autoplay = true;
     const face = el('div', 'face', { 'aria-hidden': 'true' });
-    const preview = el('div', 'preview', { 'data-state': 'bad' }, video, face, el('div', 'oval', { 'aria-hidden': 'true' }));
+    const preview = el(
+      'div',
+      'preview',
+      { 'data-state': 'bad' },
+      video,
+      face,
+      el('div', 'oval', { 'aria-hidden': 'true' }),
+      el('p', 'novideo', {}, 'No camera preview here — the ring shows where I see your face.'),
+    );
     const statusText = el('span', 'status-text', {}, COACH.waiting);
     const status = el('p', 'status', { role: 'status', 'aria-live': 'polite' }, el('span', 'status-dot', { 'aria-hidden': 'true' }), statusText);
     const check = (label: string): HTMLLIElement =>
@@ -1601,7 +1696,7 @@ export class CalibrationOverlay implements Mountable {
     const live = el('div', 'live', { 'aria-hidden': 'true' });
 
     // Failure
-    const failText = el('p', 'lede');
+    const failText = el('p', 'lede failed-text');
     const retry = button('Try again', 'retry', true);
     const failed = el(
       'div',
@@ -1623,6 +1718,7 @@ export class CalibrationOverlay implements Mountable {
     for (const section of [stage, hudWrap, pause, positioning, training, results, failed]) section.hidden = true;
 
     root.addEventListener('click', this.handleClick);
+    stage.addEventListener('pointerdown', this.handleStagePointer);
     root.addEventListener('wheel', this.blockScroll, { passive: false });
     root.addEventListener('touchmove', this.blockScroll, { passive: false });
 
@@ -1669,14 +1765,9 @@ export class CalibrationOverlay implements Mountable {
 
 // ─────────────────────────────── Utilities ───────────────────────────────────
 
-/** Features usable as a calibration sample, or null (no face, blink, non-finite, junk frame). */
-function usableFeatures(frame: FeatureFrame): EyeFeatures | null {
-  if (!frame.faceFound || !frame.features) return null;
-  const f = frame.features;
-  if (f.blink > MAX_BLINK || frame.quality < MIN_FRAME_QUALITY) return null;
-  if (!Array.isArray(f.vector) || f.vector.length === 0) return null;
-  for (const v of f.vector) if (!Number.isFinite(v)) return null;
-  return f;
+/** True when the element's content overflows it, i.e. it can scroll itself. */
+function isScrollable(el: HTMLElement | null | undefined): boolean {
+  return !!el && el.scrollHeight > el.clientHeight + 1;
 }
 
 /** Sources may reuse buffers between frames; samples must own their data. */
@@ -1842,7 +1933,7 @@ function buildStyles(): string {
 }
 .${p}-ring { width: 70px; height: 70px; border: 3px solid var(--c-accent); }
 .${p}-target.is-shrinking .${p}-ring { animation: ${p}-shrink var(--dur, 1600ms) cubic-bezier(0.3, 0, 0.25, 1) forwards; }
-.${p}-target.is-done .${p}-ring { opacity: 0; transition: opacity 140ms ease; }
+.${p}-target.is-done .${p}-ring, .${p}-target.is-done .${p}-halo { opacity: 0; transition: opacity 140ms ease; }
 .${p}-dot {
   width: 12px; height: 12px;
   background: var(--c-fg);
@@ -1960,6 +2051,11 @@ function buildStyles(): string {
   transition: left 120ms linear, top 120ms linear, width 120ms linear, height 120ms linear;
 }
 .${p}-face[data-visible="false"] { opacity: 0; }
+.${p}-novideo {
+  position: absolute; left: 0; right: 0; bottom: 0; margin: 0; padding: 8px 12px;
+  font-size: 12px; line-height: 1.35; text-align: center; color: rgba(255, 255, 255, 0.78);
+}
+.${p}-preview[data-video="on"] .${p}-novideo { display: none; }
 .${p}-status { display: flex; align-items: center; gap: 10px; margin: 0; min-height: 1.5em; font-weight: 600; }
 .${p}-status-dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--c-muted); }
 .${p}-status[data-state="good"] .${p}-status-dot { background: var(--c-good); }

@@ -13,6 +13,13 @@ import { errorMessage, type RuntimeRequest } from './messages';
 
 type View = 'checking' | 'prompt' | 'requesting' | 'granted' | 'denied' | 'no-camera' | 'error';
 
+/**
+ * A one-time grant ("Allow this time") ends when this tab closes, before the
+ * offscreen document ever opens the camera, so steer readers to the lasting one.
+ */
+const ALLOW_HINT =
+  'Pick “Allow while visiting the site” (just “Allow” in some versions of Chrome). “Allow this time” would run out as soon as this tab closes.';
+
 interface Dewey {
   say(text: string, opts?: { mood?: BuddyMood; priority?: 'low' | 'normal' | 'high' }): void;
   setMood(mood: BuddyMood): void;
@@ -126,12 +133,12 @@ function show(view: View, detail?: string): void {
       break;
     case 'prompt':
       title = 'One click to go.';
-      body = detail ?? 'Chrome will ask whether Gaze Reader may use your camera. Choose “Allow”.';
+      body = detail ?? `Chrome will ask whether Gaze Reader may use your camera. ${ALLOW_HINT}`;
       visible.add(ui.allow);
       break;
     case 'requesting':
       title = 'Look up near the address bar.';
-      body = 'Chrome is asking for permission. Choose “Allow”.';
+      body = `Chrome is asking for permission. ${ALLOW_HINT}`;
       break;
     case 'granted':
       title = 'All set!';

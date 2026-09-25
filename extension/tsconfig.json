@@ -6,16 +6,24 @@
   "include": [
     "./src",
     "../src/types.ts",
-    "../src/core",
-    "../src/signal",
-    "../src/gaze",
-    "../src/reading",
+    "../src/core/constants.ts",
+    "../src/core/events.ts",
+    "../src/core/settings.ts",
+    "../src/core/storage.ts",
+    "../src/signal/oneEuro.ts",
+    "../src/signal/fixations.ts",
+    "../src/gaze/faceTracker.ts",
+    "../src/gaze/features.ts",
+    "../src/gaze/calibrationModel.ts",
+    "../src/gaze/webcamGazeSource.ts",
+    "../src/gaze/mouseGazeSource.ts",
+    "../src/reading/lineTracker.ts",
+    "../src/reading/pageEndDetector.ts",
     "../src/reader/lineGeometry.ts",
     "../src/reader/scrollController.ts",
     "../src/ui/calibrationOverlay.ts",
     "../src/ui/gazeDot.ts",
     "../src/ui/debugOverlay.ts",
-    "../src/buddy"
-  ],
-  "exclude": ["../src/**/*.test.ts"]
+    "../src/buddy/buddy.ts"
+  ]
 }

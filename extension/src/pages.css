@@ -45,6 +45,11 @@
   box-sizing: border-box;
 }
 
+/* Author `display` rules (e.g. .btn) would otherwise override the hidden attribute. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;

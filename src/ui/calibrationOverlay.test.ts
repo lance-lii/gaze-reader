@@ -89,6 +89,11 @@ interface Reader {
   shift: number[];
   /** Close the eyes while the ring shrinks on this (0-based) target index / attempt. */
   closeEyes: ((index: number, attempt: number) => boolean) | null;
+  /**
+   * Lids that droop while looking at this point: MediaPipe's blink score rises
+   * to a sustained ~0.65 and the tracker's quality score drops with it.
+   */
+  lidsLowered: ((gaze: Point) => boolean) | null;
   pointIndex: number;
   attempt: number;
 }
@@ -102,6 +107,7 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
     faceCenter: { x: 0.5, y: 0.45 },
     shift: [],
     closeEyes: null,
+    lidsLowered: null,
     pointIndex: -1,
     attempt: 0,
   };
@@ -125,9 +131,15 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
     const features = eyeFeatures(gaze, r, reader.shift);
     features.faceScale = reader.faceScale;
     features.faceCenter = { ...reader.faceCenter };
+    let quality = 0.9;
+    if (reader.lidsLowered?.(gaze)) {
+      features.blink = 0.65;
+      features.openness = 0.16;
+      quality = 0.1;
+    }
     const shrinking = target?.classList.contains('is-shrinking') ?? false;
     if (shrinking && reader.closeEyes?.(reader.pointIndex, reader.attempt)) features.blink = 0.9;
-    src.push({ t: performance.now(), faceFound: true, features, quality: 0.9 });
+    src.push({ t: performance.now(), faceFound: true, features, quality });
   }, periodMs);
   return { reader, stop: () => clearInterval(id) };
 }
@@ -315,6 +327,29 @@ describe('CalibrationOverlay — standard flow', () => {
     ctx.sim.stop();
   });
 
+  it('a tap on the screen pauses too (no keyboard on a tablet), and the pause card resumes or cancels', async () => {
+    const ctx = setup();
+    const { events, q, root } = ctx;
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await vi.advanceTimersByTimeAsync(1200);
+    q('.gr-cal-stage').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, isPrimary: true, button: 0 }));
+    expect(root.dataset.paused).toBe('user');
+    expect(events.at(-1)).toMatchObject({ phase: 'point', message: 'paused' });
+    q<HTMLButtonElement>('.gr-cal-pause [data-action="continue"]').click();
+    expect(root.dataset.paused).toBeUndefined();
+    expect(events.at(-1)).toMatchObject({ phase: 'point', message: 'resumed' });
+
+    q('.gr-cal-stage').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, isPrimary: true, button: 2 }));
+    expect(root.dataset.paused).toBeUndefined(); // a right-click is not a tap
+
+    q('.gr-cal-stage').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, isPrimary: true, button: 0 }));
+    q<HTMLButtonElement>('.gr-cal-pause [data-action="cancel"]').click();
+    await expect(done).resolves.toBeNull();
+    expect(events.at(-1)).toEqual({ phase: 'cancelled' });
+    ctx.sim.stop();
+  });
+
   it('repeats a target that collected too few samples', async () => {
     const ctx = setup();
     ctx.sim.reader.closeEyes = (index, attempt) => index === 2 && attempt === 0;
@@ -327,6 +362,40 @@ describe('CalibrationOverlay — standard flow', () => {
     ctx.q<HTMLButtonElement>('[data-action="use"]').click();
     const result = await done;
     expect(result?.report.quality).toBe('excellent');
+    ctx.sim.stop();
+  });
+
+  it('keeps lowered lids on the low targets (same blink rule as the live gaze source) instead of retrying or pausing', async () => {
+    const ctx = setup();
+    ctx.sim.reader.lidsLowered = (gaze) => gaze.y > VH * 0.6;
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 120_000, 250);
+    expect(ctx.events.filter((e) => e.message !== undefined)).toEqual([]);
+    ctx.q<HTMLButtonElement>('[data-action="use"]').click();
+    const result = await done;
+    expect(result?.report.quality).toBe('excellent');
+    // The low check points were measured too.
+    expect(result!.report.perPoint.filter((p) => p.target.y > VH * 0.6)).toHaveLength(2);
+    ctx.sim.stop();
+  });
+
+  it('still treats a real blink as a blink', async () => {
+    const ctx = setup();
+    // Eyes shut for a whole target, but with a moderate score: the collapsed lid aperture gives it away.
+    ctx.sim.reader.closeEyes = (index, attempt) => index === 1 && attempt === 0;
+    const push = ctx.src.push.bind(ctx.src);
+    ctx.src.push = (frame) => {
+      const f = frame.features;
+      if (f && f.blink >= 0.9) push({ ...frame, features: { ...f, blink: 0.7, openness: 0.03 } });
+      else push(frame);
+    };
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.events.filter((e) => e.phase === 'point').length >= 3, 30_000, 100);
+    expect(ctx.events.filter((e) => e.phase === 'point' && e.index === 1).map((e) => e.message)).toEqual([undefined, 'retry']);
+    ctx.overlay.cancel();
+    await done;
     ctx.sim.stop();
   });
 
@@ -428,6 +497,36 @@ describe('CalibrationOverlay — quick mode', () => {
     ctx.sim.stop();
   });
 
+  it('offers a full calibration when the saved model cannot be tuned up', async () => {
+    const r = rng(8);
+    const baseSamples = STANDARD_TARGETS.flatMap((f) =>
+      Array.from({ length: 30 }, (_, i) => {
+        const target = { x: f.x * VW, y: f.y * VH };
+        return { target, features: eyeFeatures(target, r), t: i };
+      }),
+    );
+    const base = trainGazeModel(baseSamples, { viewport: { width: VW, height: VH } }).model;
+    const ctx = setup({ mode: 'quick', baseModel: base });
+    ctx.sim.reader.shift = [1, 1, 1, 1, 1]; // eyes nothing like the saved calibration: every prediction is rejected
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'failed', 60_000, 250);
+    const retry = ctx.q<HTMLButtonElement>('[data-action="retry"]');
+    expect(retry.textContent).toBe('Full calibration');
+    expect(ctx.q('.gr-cal-failed-text').textContent).toMatch(/full calibration/);
+
+    ctx.sim.reader.shift = [];
+    retry.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.q('.gr-cal-next').textContent).toMatch(/13 dots/);
+    const before = ctx.events.length;
+    await startCalibration(ctx);
+    expect(ctx.events.slice(before).find((e) => e.phase === 'point')?.total).toBe(STANDARD_TARGETS.length);
+    ctx.overlay.cancel();
+    await done;
+    ctx.sim.stop();
+  });
+
   it('falls back to the full grid without a usable base model', async () => {
     const ctx = setup({ mode: 'quick', baseModel: null });
     const done = ctx.overlay.run();
@@ -523,6 +622,25 @@ describe('CalibrationOverlay — lifecycle', () => {
     ctx.sim.stop();
   });
 
+  it('a broken feature source fails the run cleanly instead of wedging it', async () => {
+    const bus = createEventBus();
+    const events: CalEvent[] = [];
+    bus.on('calibration', (e) => events.push(e));
+    const broken = new FakeSource();
+    broken.onFrame = () => {
+      throw new Error('port disconnected');
+    };
+    const overlay = new CalibrationOverlay({ features: broken, bus });
+    overlay.mount(document.body);
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    await expect(overlay.run()).resolves.toBeNull();
+    errors.mockRestore();
+    expect(events).toEqual([{ phase: 'failed', message: 'port disconnected' }]);
+    expect(overlay.running).toBe(false);
+    expect(document.querySelector<HTMLElement>('.gr-cal')?.hidden).toBe(true);
+    overlay.destroy();
+  });
+
   it('works mounted straight into the document and keeps focus inside', async () => {
     const bus = createEventBus();
     const src = new FakeSource();
@@ -549,6 +667,106 @@ describe('CalibrationOverlay — lifecycle', () => {
     expect(document.activeElement).toBe(outside); // focus handed back
     overlay.destroy();
     sim.stop();
+  });
+});
+
+describe('CalibrationOverlay — keyboard', () => {
+  it('inside a closed shadow root (the extension), Enter and Space on a focused button belong to the button', async () => {
+    const bus = createEventBus();
+    const events: CalEvent[] = [];
+    bus.on('calibration', (e) => events.push(e));
+    const src = new FakeSource();
+    const host = document.createElement('div');
+    document.body.append(host);
+    const shadow = host.attachShadow({ mode: 'closed' });
+    const overlay = new CalibrationOverlay({ features: src, bus, random: rng(3) });
+    overlay.mount(shadow);
+    const sim = simulateReader(src, shadow, bus);
+    const root = shadow.querySelector<HTMLElement>('.gr-cal')!;
+    const visible = (action: string): HTMLButtonElement =>
+      shadow.querySelector<HTMLButtonElement>(`.gr-cal-center:not([hidden]) [data-action="${action}"]`)!;
+    const done = overlay.run();
+    const start = shadow.querySelector<HTMLButtonElement>('[data-action="start"]')!;
+    await advanceUntil(() => !start.disabled, 5000);
+
+    // Enter on the focused Cancel button must activate Cancel, not start the calibration.
+    const cancel = visible('cancel');
+    cancel.focus();
+    const enter = key('Enter', cancel);
+    expect(enter.defaultPrevented).toBe(false);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(root.dataset.phase).toBe('positioning');
+
+    // Enter anywhere else starts.
+    root.focus();
+    key('Enter', root);
+    await advanceUntil(() => root.dataset.phase === 'targets', 2000, 20);
+
+    // Pause, then Space on the pause card's Cancel button is that button's, not a resume.
+    key(' ', root);
+    expect(root.dataset.paused).toBe('user');
+    const pauseCancel = shadow.querySelector<HTMLButtonElement>('.gr-cal-pause [data-action="cancel"]')!;
+    pauseCancel.focus();
+    const space = key(' ', pauseCancel);
+    expect(space.defaultPrevented).toBe(false);
+    expect(root.dataset.paused).toBe('user');
+    expect(events.at(-1)?.message).toBe('paused');
+
+    overlay.cancel();
+    await expect(done).resolves.toBeNull();
+    overlay.destroy();
+    sim.stop();
+  });
+
+  it('keeps keyboard scrolling from moving the page behind it', async () => {
+    const ctx = setup();
+    const done = ctx.overlay.run();
+    await vi.advanceTimersByTimeAsync(300);
+    for (const k of ['PageDown', 'ArrowDown', 'End', ' ', 'Home']) expect(key(k, ctx.root).defaultPrevented).toBe(true);
+    expect(key('x', ctx.root).defaultPrevented).toBe(false);
+
+    // A card that overflows a short window may still scroll itself.
+    const center = ctx.shadow.querySelector<HTMLElement>('.gr-cal-center:not([hidden])')!;
+    Object.defineProperty(center, 'scrollHeight', { configurable: true, value: 900 });
+    Object.defineProperty(center, 'clientHeight', { configurable: true, value: 400 });
+    const cancel = center.querySelector<HTMLButtonElement>('[data-action="cancel"]')!;
+    cancel.focus();
+    expect(key('ArrowDown', cancel).defaultPrevented).toBe(false);
+    expect(key('PageDown', cancel).defaultPrevented).toBe(false);
+
+    ctx.overlay.cancel();
+    await done;
+    ctx.sim.stop();
+  });
+
+  it('scrolls an overflowing card so the focused button is on screen', async () => {
+    const ctx = setup();
+    const done = ctx.overlay.run();
+    const start = ctx.q<HTMLButtonElement>('[data-action="start"]');
+    const center = start.closest<HTMLElement>('.gr-cal-center')!;
+    // A 400 px tall window: the card's action row sits below the fold.
+    let scrollTop = 0;
+    Object.defineProperty(center, 'scrollHeight', { configurable: true, value: 640 });
+    Object.defineProperty(center, 'clientHeight', { configurable: true, value: 400 });
+    Object.defineProperty(center, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (v: number) => {
+        scrollTop = v;
+      },
+    });
+    const rect = (top: number, height: number): DOMRect => DOMRect.fromRect({ x: 0, y: top, width: 100, height });
+    center.getBoundingClientRect = () => rect(0, 400);
+    start.getBoundingClientRect = () => rect(520 - scrollTop, 44);
+
+    await advanceUntil(() => !start.disabled, 5000);
+    expect(ctx.shadow.activeElement).toBe(start); // focus moves to Start once it lights up…
+    expect(scrollTop).toBeGreaterThanOrEqual(564 - 400); // …and the card scrolls to show it
+    expect(start.getBoundingClientRect().bottom).toBeLessThanOrEqual(400);
+
+    ctx.overlay.cancel();
+    await done;
+    ctx.sim.stop();
   });
 });
 

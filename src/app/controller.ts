@@ -8,6 +8,7 @@
  * progress · pipeline · page turning · layout · sources · calibration ·
  * tracking state · commands & settings · DOM events.
  */
+import { CSS_PREFIX } from '../core/constants';
 import { createEventBus } from '../core/events';
 import { createSettingsStore, type SettingsStore } from '../core/settings';
 import type {
@@ -26,6 +27,7 @@ import type {
   Unsubscribe,
 } from '../types';
 import { Buddy } from '../buddy/buddy';
+import { BUDDY_CLASS } from '../buddy/styles';
 import { clearCalibration, loadCalibration, saveCalibration } from '../gaze/calibrationModel';
 import { CameraFeatureSource, preloadFaceLandmarker } from '../gaze/faceTracker';
 import { FEATURE_NAMES } from '../gaze/features';
@@ -71,6 +73,7 @@ import {
   sameStatus,
   shortcutFor,
   shouldIgnoreShortcut,
+  textEndsOnScreen,
   trackerErrorCode,
   type SourcePhase,
   type TrackingStatus,
@@ -168,7 +171,9 @@ export class AppController {
   private readonly toasts: Toaster;
   private readonly preview: CameraPreview;
   private readonly buddy: Buddy;
-  private readonly gazeDot: GazeDot;
+  private gazeDot: GazeDot;
+  /** True while the dot is forced on for the demo (it's rebuilt when this flips). */
+  private gazeDotForced = false;
   private readonly debug: DebugOverlay;
   private screen: Screen = 'library';
   private readonly darkQuery: MediaQueryList | null;
@@ -184,6 +189,8 @@ export class AppController {
   private samples: readonly SampleBookInfo[] | null = null;
   private hasRecent = false;
   private turning = false;
+  /** Where the forward turn in flight is heading (from its `page-turn` event); null otherwise. */
+  private turnTarget: number | null = null;
   private scrollSettling = false;
   private pipelineWasBlocked = false;
   private lastEstimateEmitAt = Number.NEGATIVE_INFINITY;
@@ -269,10 +276,10 @@ export class AppController {
     // Floating layers, bottom to top.
     this.preview = new CameraPreview({ onHide: () => this.hidePreview() });
     this.debug = new DebugOverlay({ bus: this.bus, getSettings });
-    this.gazeDot = new GazeDot({ bus: this.bus, getSettings });
+    this.gazeDot = this.createGazeDot();
     this.buddy = new Buddy({ bus: this.bus, getSettings });
     this.toasts = new Toaster();
-    this.onboarding = new Onboarding({ bus: this.bus });
+    this.onboarding = new Onboarding({ bus: this.bus, onClose: () => this.syncModalState() });
     this.settingsPanel = new SettingsPanel({
       bus: this.bus,
       getSettings,
@@ -340,11 +347,7 @@ export class AppController {
     this.scroll?.destroy();
     this.scroll = null;
     this.session = null;
-    try {
-      this.reader.close();
-    } catch {
-      /* tearing down anyway */
-    }
+    this.reader.destroy();
     for (const c of [this.help, this.settingsPanel, this.onboarding, this.toasts, this.buddy, this.gazeDot, this.debug, this.preview, this.topbar, this.library]) {
       c.destroy();
     }
@@ -377,7 +380,12 @@ export class AppController {
   }
 
   private syncModalState(): void {
-    this.screens.inert = this.modalOpen() || this.calibration !== null;
+    const blocking = this.modalOpen() || this.calibration !== null;
+    this.screens.inert = blocking;
+    // A closing dialog may have nowhere to hand focus back to (e.g. a button in
+    // another dialog that just closed); keep keyboard paging working.
+    const active = document.activeElement;
+    if (!blocking && this.session && this.screen === 'reader' && (!active || active === document.body)) this.focusReader();
   }
 
   /** Closes the settings drawer and help; returns whether anything was open. */
@@ -557,7 +565,13 @@ export class AppController {
       } catch {
         /* already broken */
       }
+      // endSession() above closed the previous book, but its gaze source (possibly the
+      // camera) is still running. The library has no status pill, so stop it here.
+      this.topbar.setBook(null);
+      document.title = 'Gaze Reader';
       this.showScreen('library');
+      this.syncSource();
+      void this.refreshRecent();
       throw err;
     }
     this.startSession(book, position);
@@ -687,7 +701,9 @@ export class AppController {
 
   private readonly heartbeat = (): void => {
     const now = performance.now();
-    this.refreshTracking(now);
+    // Background tabs throttle camera frames to about 1 Hz, which would read as
+    // "face lost" (and worry Dewey). Hold the state until the tab is visible again.
+    if (!document.hidden) this.refreshTracking(now);
     const session = this.session;
     if (!session) return;
     const s = this.store.get();
@@ -816,6 +832,7 @@ export class AppController {
       this.lastEstimateEmitAt = s.t;
     }
     const decision = this.pageEnd.update({ t: s.t, gaze: s, estimate: this.lineTracker.estimate, layout: this.layout });
+    if (this.debug.visible) this.debug.showDecision(decision);
     if (decision.trigger) this.onPageEnd(decision);
   };
 
@@ -846,45 +863,90 @@ export class AppController {
 
   private onPageEnd(decision: PageEndDecision): void {
     const scroll = this.scroll;
-    if (!scroll || !this.store.get().autoScroll || this.turning || scroll.animating) return;
-    if (scroll.atEnd()) {
+    if (!scroll || this.turning || scroll.animating) return;
+    // The reader has reached the last line of the book. The reader view keeps
+    // generous padding below the text, so the scroller isn't "at the end" yet,
+    // but turning would only show a blank page with nothing left to read.
+    // Pausing auto-scroll stops page turns, not the finale: a reader who paged
+    // through by hand still finished the book.
+    if (scroll.atEnd() || this.onLastPage(this.layout)) {
       this.finishBook();
       this.pageEnd.notifyScrolled(performance.now());
       return;
     }
+    if (!this.store.get().autoScroll) return;
     void this.turnPage({ auto: true, reason: decision.reason, decision });
   }
 
   private async pageForward(): Promise<void> {
     const scroll = this.scroll;
     if (!scroll || !this.session) return;
+    if (this.turning) {
+      // Pressed again mid-turn: the reader is ahead of the animation, so land it now.
+      if (scroll.animating && this.turnTarget !== null) void scroll.scrollTo(this.turnTarget, 0);
+      return;
+    }
     if (scroll.atEnd()) {
       this.finishBook();
       return;
     }
-    await this.turnPage({ auto: false, reason: 'manual' });
+    // Measure afresh: while a manual scroll settles, the stored layout describes the old position.
+    const layout = this.measure('scroll') ?? this.layout;
+    const lastPage = this.onLastPage(layout);
+    await this.turnPage({ auto: false, reason: 'manual', layout });
+    // An explicit "next page" on the last page still moves, then celebrates.
+    if (lastPage && this.scroll === scroll) this.finishBook();
   }
 
-  private async turnPage(opts: { auto: boolean; reason: string; decision?: PageEndDecision }): Promise<void> {
+  private async turnPage(opts: { auto: boolean; reason: string; decision?: PageEndDecision; layout?: LineLayout | null }): Promise<void> {
     const scroll = this.scroll;
     if (!scroll || this.turning || scroll.animating) return;
-    const layout = this.layout ?? this.measure('scroll');
+    // An automatic turn must use the layout the decision's line index refers to.
+    const layout = opts.layout ?? this.layout ?? this.measure('scroll');
     const lines = layout?.lines ?? [];
     const target =
       opts.decision && opts.decision.targetLineIndex >= 0 && opts.decision.targetLineIndex < lines.length
         ? opts.decision.targetLineIndex
         : lastFullyVisibleIndex(lines);
     const oldDocTop = lines[target]?.docTop ?? null;
+    const startTop = this.reader.scroller.scrollTop;
     if (opts.decision) this.bus.emit('page-end', opts.decision);
     this.turning = true;
+    this.turnTarget = null;
     try {
       await scroll.turnPage(layout, target, { auto: opts.auto, reason: opts.reason });
     } catch (err) {
       console.warn('[app] page turn failed', err);
     } finally {
       this.turning = false;
+      this.turnTarget = null;
     }
-    if (this.scroll === scroll && this.session) this.afterJump('turn', oldDocTop);
+    if (this.scroll !== scroll || !this.session) return;
+    if (Math.abs(this.reader.scroller.scrollTop - startTop) < 1) {
+      // Nothing moved, so the reading model is still right; just start the cooldown.
+      this.pageEnd.notifyScrolled(performance.now());
+      return;
+    }
+    this.afterJump('turn', oldDocTop);
+  }
+
+  /** Every remaining line of the book is on screen (see textEndsOnScreen in logic.ts). */
+  private onLastPage(layout: LineLayout | null): boolean {
+    if (!layout) return false;
+    return textEndsOnScreen(layout.lines, layout.viewport.bottom, this.textBottom());
+  }
+
+  /**
+   * Viewport y of the bottom of the book's text: the last chapter, which the
+   * reader view renders just before its "End of book" marker. Null when that
+   * structure isn't found (then the line layout decides).
+   */
+  private textBottom(): number | null {
+    const end = this.reader.content.querySelector(`:scope > .${CSS_PREFIX}end`);
+    const lastChapter = end?.previousElementSibling;
+    if (!lastChapter) return null;
+    const r = lastChapter.getBoundingClientRect();
+    return r.height > 0 ? r.bottom : null;
   }
 
   private async pageBack(): Promise<void> {
@@ -1197,9 +1259,32 @@ export class AppController {
     this.toasts.show({ id: 'preview', message: 'Camera preview hidden. You can bring it back in Settings.' });
   }
 
+  /**
+   * GazeDot shows only when the host allows it AND `showGazeDot` is on. The
+   * demo must show it regardless (the dot *is* the demo), so while the demo
+   * runs the dot sees a settings view with the flag set; nothing is persisted.
+   */
+  private createGazeDot(): GazeDot {
+    return new GazeDot({
+      bus: this.bus,
+      getSettings: () => {
+        const s = this.store.get();
+        return this.gazeDotForced ? { ...s, showGazeDot: true } : s;
+      },
+    });
+  }
+
   private updateOverlays(): void {
     const s = this.store.get();
     const reading = this.screen === 'reader';
+    const demo = this.sourceKind === 'simulated';
+    if (demo !== this.gazeDotForced) {
+      // The dot reads its setting when mounted, so rebuild it (it's a single element).
+      this.gazeDotForced = demo;
+      this.gazeDot.destroy();
+      this.gazeDot = this.createGazeDot();
+      this.gazeDot.mount(this.root);
+    }
     const camera = this.camera;
     const webcamLive = this.sourceKind === 'webcam' && camera !== null && camera.running && this.phase !== 'calibrating';
     // Lets layouts keep clear of Dewey (e.g. onboarding on a phone).
@@ -1209,8 +1294,7 @@ export class AppController {
     this.preview.setCorner(previewCorner(s.buddyCorner));
     this.preview.attach(webcamLive ? camera : null);
     this.preview.setVisible(reading && webcamLive && s.showCameraPreview);
-    // In the demo the dot is the point: it shows the simulated reader's eyes.
-    this.gazeDot.setVisible(reading && (s.showGazeDot || this.sourceKind === 'simulated'));
+    this.gazeDot.setVisible(reading && (s.showGazeDot || demo));
     this.debug.setVisible(reading && s.showDebugOverlay);
   }
 
@@ -1253,10 +1337,12 @@ export class AppController {
     try {
       result = await overlay.run();
     } finally {
-      overlay.destroy();
       if (this.calibration === overlay) this.calibration = null;
       this.forceCalibration = false;
+      // Un-inert the page before the overlay goes, so focus can return to the reader.
       this.syncModalState();
+      overlay.destroy();
+      if (this.session && (!document.activeElement || document.activeElement === document.body)) this.focusReader();
     }
     if (stale()) return false;
     if (result) {
@@ -1414,6 +1500,10 @@ export class AppController {
       this.bus.on('command', ({ name }) => this.runCommand(name)),
       this.bus.on('settings-changed', ({ settings, changed }) => this.onSettingsChanged(settings, changed)),
       this.bus.on('error', ({ code, message }) => this.showError(code, message)),
+      // Emitted synchronously by ScrollController.turnPage, while `turning` is set.
+      this.bus.on('page-turn', ({ to }) => {
+        if (this.turning) this.turnTarget = to;
+      }),
     );
   }
 
@@ -1496,6 +1586,20 @@ export class AppController {
       this.syncSource();
     }
     if (any(OVERLAY_KEYS)) this.updateOverlays();
+    if (changed.includes('buddyEnabled') && !s.buddyEnabled && !this.settingsPanel.isOpen) this.deweyHidden();
+  }
+
+  /** Dewey hid himself from his own menu: say how to get him back, and keep keyboard paging working. */
+  private deweyHidden(): void {
+    this.toasts.show({
+      id: 'dewey',
+      message: 'Dewey is taking a break. You can bring him back in Settings.',
+      actions: [{ label: 'Undo', primary: true, run: () => this.store.update({ buddyEnabled: true }) }],
+    });
+    // His menu had focus, and it's going away (the browser only drops focus to <body> on the next frame).
+    const active = document.activeElement;
+    const stranded = !active || active === document.body || active.closest(`.${BUDDY_CLASS}`) !== null;
+    if (this.session && this.screen === 'reader' && stranded) this.focusReader();
   }
 
   private showError(code: string, message: string): void {
@@ -1556,6 +1660,13 @@ export class AppController {
     const def = SHORTCUTS.find((d) => d.action === action);
     if (def?.readerOnly && !this.session) return;
     e.preventDefault();
+    if (this.turning && (action === 'page-forward' || action === 'page-back')) {
+      // ScrollController cancels its animation on any navigation key, which would leave
+      // the page stranded halfway. This listener was registered first (constructor vs.
+      // per book), so it can keep the key to itself: forward lands the turn at once,
+      // back lets it finish.
+      e.stopImmediatePropagation();
+    }
     this.bus.emit('command', { name: action });
   };
 
@@ -1583,6 +1694,11 @@ export class AppController {
     if (this.hiddenLong) {
       this.hiddenLong = false;
       this.syncSource();
+    } else if (this.phase === 'running') {
+      // Frames were throttled while hidden: start the no-face clock afresh.
+      const now = performance.now();
+      this.tracking.reset(now);
+      this.refreshTracking(now);
     }
   };
 

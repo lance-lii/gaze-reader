@@ -213,6 +213,18 @@ describe('RemoteFeatureSource', () => {
     expect(hubEnd.peer!.sent).toContainEqual({ type: 'unsubscribe', linger: false });
   });
 
+  it("by default outlasts the offscreen document's 60 s model timeout, so the specific error reaches the reader", async () => {
+    const hub = new FakeHub();
+    const source = new RemoteFeatureSource({ connect: hub.connect, isContextValid: () => true, now: () => hub.localNow });
+    const started = source.start();
+    await flush();
+    await vi.advanceTimersByTimeAsync(60_500); // slow network: the model download times out over there
+    hub.send({ type: 'camera-status', status: { state: 'error', code: 'model-load-failed', message: 'timed out' } });
+    await flush();
+    const err = await started.catch((e: unknown) => e);
+    expect((err as RemoteTrackerError).code).toBe('model-load-failed');
+  });
+
   it('stop() unsubscribes (lingering if asked), disconnects and stops delivering frames', async () => {
     const { hub, source, frames } = setup();
     void source.start();

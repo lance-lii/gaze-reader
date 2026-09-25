@@ -39,18 +39,42 @@ export interface PillHandlers {
 
 const P = CSS_PREFIX;
 const QUIET_AFTER_MS = 4_000;
+const SVG_NS = 'http://www.w3.org/2000/svg';
 
+type Shape = readonly ['path' | 'circle' | 'rect', Readonly<Record<string, string>>];
+
+/**
+ * Icons as data, built with createElementNS: sites that enforce Trusted Types
+ * (much of Google, for one) make `innerHTML = '<svg…'` throw, which would stop
+ * Gaze Reader from starting there at all.
+ */
 const ICONS = {
-  pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>',
-  play: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5l12 7-12 7z"/></svg>',
-  target:
-    '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.5"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>',
-  help: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.2 9a3 3 0 1 1 4.3 2.7c-.9.5-1.5 1.1-1.5 2.1v.4"/><path d="M12 17.5v.5"/></svg>',
-  close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
-  camera:
-    '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="7" width="13" height="10" rx="2"/><path d="M16 11l5-3v8l-5-3z"/></svg>',
-  mouse: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="3" width="10" height="18" rx="5"/><path d="M12 7v3"/></svg>',
-} as const;
+  pause: [['path', { d: 'M8 5v14M16 5v14' }]],
+  play: [['path', { d: 'M7 5l12 7-12 7z' }]],
+  target: [
+    ['circle', { cx: '12', cy: '12', r: '7' }],
+    ['circle', { cx: '12', cy: '12', r: '2.5' }],
+    ['path', { d: 'M12 2v3M12 19v3M2 12h3M19 12h3' }],
+  ],
+  help: [['path', { d: 'M9.2 9a3 3 0 1 1 4.3 2.7c-.9.5-1.5 1.1-1.5 2.1v.4' }], ['path', { d: 'M12 17.5v.5' }]],
+  close: [['path', { d: 'M6 6l12 12M18 6L6 18' }]],
+  camera: [['rect', { x: '3', y: '7', width: '13', height: '10', rx: '2' }], ['path', { d: 'M16 11l5-3v8l-5-3z' }]],
+  mouse: [['rect', { x: '7', y: '3', width: '10', height: '18', rx: '5' }], ['path', { d: 'M12 7v3' }]],
+} as const satisfies Record<string, readonly Shape[]>;
+
+type IconName = keyof typeof ICONS;
+
+function icon(name: IconName): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  for (const [tag, attrs] of ICONS[name] as readonly Shape[]) {
+    const el = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    svg.append(el);
+  }
+  return svg;
+}
 
 const CSS = `
 .${P}pill {
@@ -149,6 +173,9 @@ export class PagePill implements Mountable {
   private readonly notice: HTMLDivElement;
   private readonly help: HTMLDivElement;
   private status: PillStatus = { state: 'starting', source: null, paused: false, detail: null };
+  /** Icons currently shown, so a status change only rebuilds the ones that differ. */
+  private srcIcon: IconName | null | undefined = undefined;
+  private pauseIcon: IconName | null = null;
   private quietTimer: ReturnType<typeof setTimeout> | null = null;
   private noticeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -169,11 +196,11 @@ export class PagePill implements Mountable {
     this.label = span(`${P}pill-label`);
     this.label.setAttribute('role', 'status');
     this.label.setAttribute('aria-live', 'polite');
-    this.pauseBtn = button(ICONS.pause, 'Pause auto-scroll', () => this.handlers.onTogglePause());
-    this.calBtn = button(ICONS.target, 'Recalibrate', () => this.handlers.onRecalibrate());
-    this.helpBtn = button(ICONS.help, 'Keyboard shortcuts', () => this.toggleHelp());
+    this.pauseBtn = button(null, 'Pause auto-scroll', () => this.handlers.onTogglePause());
+    this.calBtn = button('target', 'Recalibrate', () => this.handlers.onRecalibrate());
+    this.helpBtn = button('help', 'Keyboard shortcuts', () => this.toggleHelp());
     this.helpBtn.setAttribute('aria-expanded', 'false');
-    const closeBtn = button(ICONS.close, 'Turn Gaze Reader off on this page', () => this.handlers.onClose());
+    const closeBtn = button('close', 'Turn Gaze Reader off on this page', () => this.handlers.onClose());
     bar.append(dot, this.src, this.label, this.pauseBtn, this.calBtn, this.helpBtn, closeBtn);
 
     this.notice = div(`${P}pill-card ${P}pill-notice`);
@@ -229,7 +256,7 @@ export class PagePill implements Mountable {
       });
       actions.append(b);
     }
-    const dismiss = button(ICONS.close, 'Dismiss', () => this.notify(null));
+    const dismiss = button('close', 'Dismiss', () => this.notify(null));
     this.notice.append(text, actions, dismiss);
     this.notice.hidden = false;
     this.wake();
@@ -266,13 +293,21 @@ export class PagePill implements Mountable {
     this.el.toggleAttribute('data-busy', state === 'starting' || state === 'calibrating');
     this.label.textContent = detail ?? text;
 
-    this.src.innerHTML = source === 'mouse' ? ICONS.mouse : source === 'webcam' ? ICONS.camera : '';
+    const srcIcon: IconName | null = source === 'mouse' ? 'mouse' : source === 'webcam' ? 'camera' : null;
+    if (srcIcon !== this.srcIcon) {
+      this.srcIcon = srcIcon;
+      this.src.replaceChildren(...(srcIcon ? [icon(srcIcon)] : []));
+    }
     const cameraLive = source === 'webcam' && state !== 'error' && state !== 'off';
     this.src.toggleAttribute('data-live', cameraLive);
     this.src.title = source === 'webcam' ? (cameraLive ? 'Camera on (processed on this device)' : 'Camera off') : 'Mouse mode';
 
     const resumeLabel = paused ? 'Resume auto-scroll' : 'Pause auto-scroll';
-    this.pauseBtn.innerHTML = paused ? ICONS.play : ICONS.pause;
+    const pauseIcon: IconName = paused ? 'play' : 'pause';
+    if (pauseIcon !== this.pauseIcon) {
+      this.pauseIcon = pauseIcon;
+      this.pauseBtn.replaceChildren(icon(pauseIcon));
+    }
     this.pauseBtn.setAttribute('aria-label', resumeLabel);
     this.pauseBtn.title = `${resumeLabel} (Alt+Shift+P)`;
     this.pauseBtn.hidden = state === 'error' || state === 'starting';
@@ -353,11 +388,11 @@ function span(className: string): HTMLSpanElement {
   return s;
 }
 
-function button(icon: string, label: string, onClick: () => void): HTMLButtonElement {
+function button(iconName: IconName | null, label: string, onClick: () => void): HTMLButtonElement {
   const b = document.createElement('button');
   b.type = 'button';
   b.className = `${P}pill-btn`;
-  b.innerHTML = icon;
+  if (iconName) b.append(icon(iconName));
   b.title = label;
   b.setAttribute('aria-label', label);
   b.addEventListener('click', (e) => {

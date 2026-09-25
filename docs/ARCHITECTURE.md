@@ -518,3 +518,31 @@ story starring Dewey. Enough length for many page turns.
 
 After A–H: one integrator runs `npm run typecheck`, `npm test`, `npm run build`, `npm run build:ext`,
 fixes seams with minimal edits, and writes `README.md`.
+
+**As built.** Every documented signature above holds. The deviations that were accepted are all
+additive, and each module's header comment explains its own. The ones that cross module
+boundaries:
+
+* `TrackerError` lives in `camera.ts` (re-exported by `faceTracker.ts`). `FEATURE_NAMES` has 27
+  entries and is append-only. Blinks are gated over time by `BlinkGate` (`webcamGazeSource.ts`):
+  a short high score, or a collapsed lid aperture, is a blink. Sustained moderate scores are
+  lowered lids from reading low on the screen, and they stay valid. Calibration uses the same
+  gate and passes `maxBlink = 0.85` to training, so the bottom rows are learned rather than
+  extrapolated.
+* `deserializeGazeModel`/`loadCalibration` take `unknown` plus `{ featureLength, featureNames }`,
+  and `trainGazeModel` returns `{ model, report, diagnostics }`. A prediction is rejected as a
+  tracking glitch only when an *eye* feature is more than 10 calibration SDs out. Head pose and
+  distance are exempt: a reader who sits differently later is not a glitch.
+* `PageEndDetector` refinements, tuned on the simulator: rule 1 needs the reader to have *entered*
+  L; a leaky dwell rides out blinks; it fires only on valid samples; the zones are drift-corrected.
+  After a trigger, rules 1 and 2 wait for the gaze to come back up the page, so a resting mouse or
+  gaze can't page through the book. Bottom-dwell ignores gaze more than a line below the page
+  (that is glance-down's gesture, which the reader can switch off). `notifyScrolled` must be
+  called on every scroll.
+* `lineGeometry` folds glyph-sized fragments that overlap a line into it. Chrome reports an
+  `initial-letter` drop cap half a line above its first line.
+* The `poor` tracking state (app and extension) needs the smoothed confidence to stay low for
+  2.5 s. Lowered lids on the last lines of every page dip it briefly, and that shouldn't flash a
+  warning each time.
+* The extension keeps pause per tab and uses `Alt+Shift+<key>` shortcuts on web pages. It stores
+  `extDevicePixelRatio` with the calibration so that one model works at any site zoom.

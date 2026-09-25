@@ -14,16 +14,42 @@ import type {
  *
  * Rules (L = last fully visible line; any rule fires once every guard passes):
  *  1. line-tracker — the tracker puts ≥ θp on L (or below it) and gaze progress
- *     along L ≥ θx for `dwell`; or, once that has been true, a return-sweep-like
- *     jump back to the left margin (the reader looking for a next line that
- *     isn't there) fires immediately.
+ *     along L ≥ θx (with the gaze still within reach of L) for `dwell`; or, once
+ *     that has been true, a return-sweep-like jump back to the left margin (the
+ *     reader looking for a next line that isn't there) fires immediately.
  *  2. bottom-dwell — drift-corrected gaze at/below L.top − 0.25 pitch in the
- *     right half of L for `Tzone` (fallback while the tracker is unsure).
+ *     right half of L, but still on the page, for `Tzone` (fallback while the
+ *     tracker is unsure).
  *  3. glance-down — gaze at/below the bottom edge for `Tglance` (opt-in gesture).
  *
- * Dwell times are leaky accumulators: time in the condition counts up, time
- * out of it drains 3× as fast, and brief tracking dropouts (blinks) freeze the
- * count. One noisy sample doesn't restart a dwell; a sustained exit does.
+ * Guards: cooldown after any scroll (and after firing); ≥ 60 % valid samples in
+ * the last second; ≥ 4 fixations on the page or ≥ 2.5 s since the last turn
+ * (glance-down exempt). It only ever fires on a valid sample: a rule that
+ * becomes ready during a blink fires on the next valid one.
+ *
+ * Refinements measured on the simulator (see pipeline.test.ts):
+ *  - Dwell times are leaky accumulators: time in the condition counts up, time
+ *    out of it drains 3× as fast, and brief tracking dropouts (blinks) freeze
+ *    the count. One noisy sample doesn't restart a dwell; a sustained exit does.
+ *  - Rule 1 needs the tracker to have *entered* L: to have put the reader there
+ *    right after a return sweep, a jump or a fresh page, or been ≥ 90 % sure of
+ *    it for 3 fixations. Vertical noise can slide the tracker onto L while the
+ *    reader is still finishing L−1; this stops that from turning the page early.
+ *    Any scroll forgets the entry: it belongs to the view it happened in.
+ *  - Doubt (≥ 10 % still on L−1) doubles rule 1's dwell and disables the sweep
+ *    shortcut; ≥ 25 % at the moment of firing anchors the turn at L−1, so an
+ *    early turn repeats a line rather than scrolling unread text away.
+ *  - θx on a short paragraph-final last line is judged against the column
+ *    width (see `endProgress`): "only a few words left" means the same on any line.
+ *  - Glance-down re-arms only after the gaze has come back up onto the page, so
+ *    looking at the keyboard turns one page, not one every cooldown.
+ *  - After firing, rules 1 and 2 wait for the gaze to come back up the page.
+ *    Gaze that stays parked at the bottom right (a resting mouse, eyes that
+ *    didn't follow the turn) would otherwise "reach the end" of every new page
+ *    within seconds and page through the book on its own.
+ *  - Gaze clearly below the page doesn't count for bottom-dwell: that is
+ *    glance-down's gesture, and with glance-down switched off, looking at the
+ *    keyboard or a phone must not turn the page.
  */
 
 export interface PageEndInput {
@@ -80,8 +106,10 @@ export interface PageEndZones {
   lastIndex: number;
   lastLine: TextLine;
   pitch: number;
-  /** Bottom-dwell zone: y ≥ zoneTop and zoneLeft ≤ x ≤ zoneRight. */
+  /** Bottom-dwell zone: zoneTop ≤ y ≤ zoneBottom and zoneLeft ≤ x ≤ zoneRight. */
   zoneTop: number;
+  /** Below this the reader is looking off the page, not dwelling on its last line. */
+  zoneBottom: number;
   zoneLeft: number;
   zoneRight: number;
   /** Glance-down: y ≥ glanceTop. */
@@ -111,6 +139,7 @@ export function pageEndZones(layout: LineLayout | null): PageEndZones | null {
     lastLine: L,
     pitch,
     zoneTop: L.top - 0.25 * pitch,
+    zoneBottom: Math.max(layout.viewport.bottom, L.bottom) + ZONE_BELOW_PAGE_LINES * pitch,
     zoneLeft: L.left + 0.5 * (L.right - L.left),
     zoneRight: Math.max(colRight, L.right) + 0.1 * columnWidth,
     // Keep the glance threshold clear of the last line itself when it sits right at the edge.
@@ -159,6 +188,20 @@ const DOUBT_DWELL_FACTOR = 2;
 const ANCHOR_DOUBT = 0.25;
 /** Glance-down re-arms once the gaze has come back this far above the glance threshold. */
 const GLANCE_REARM_LINES = 1;
+/**
+ * Bottom-dwell only counts gaze down to this many pitches below the page (slack for
+ * vertical noise while reading the last line); further down is a look off the page.
+ */
+const ZONE_BELOW_PAGE_LINES = 1;
+/** After firing, rules 1 and 2 re-arm once the gaze has come back this far above the bottom-dwell zone. */
+const LOOK_UP_LINES = 1;
+/**
+ * Rule 1 only counts live gaze (drift-corrected) no higher than this many pitches above the
+ * last line's top. The tracker moves on completed fixations, so for a fixation's length after
+ * the eyes leave L it still says L — and on a short last line θx is met almost anywhere in the
+ * column. Without this, a peek at the last line mid-page turned the page once the eyes were back.
+ */
+const LAST_LINE_REACH_LINES = 1.5;
 
 type Tri = boolean | null;
 
@@ -207,8 +250,11 @@ export class PageEndDetector {
 
   private armedUntil = -Infinity;
   private armMaxX = -Infinity;
-  private armY = NaN;
+  /** Highest drift-corrected gaze while armed (min y). With the rightmost x, an episode extreme: see isSweep. */
+  private armTopY = Infinity;
   private sweepRun = 0;
+  /** A return sweep off the armed last line was seen; it fires on the next valid sample while armed. */
+  private sweepSeen = false;
   private lastFixCount = -1;
   /** docTop of the line the tracker put the reader on when they last entered a line. */
   private enteredDocTop: number | null = null;
@@ -216,6 +262,8 @@ export class PageEndDetector {
   private settledDocTop: number | null = null;
   private settledRun = 0;
   private glanceArmed = true;
+  /** The gaze has been up the page since the last trigger (rules 1 and 2 wait for it). */
+  private lookedUp = true;
 
   constructor(opts: Partial<PageEndOptions> = {}) {
     this.opts = { ...DEFAULT_PAGE_END_OPTIONS };
@@ -244,6 +292,10 @@ export class PageEndDetector {
     if (!Number.isFinite(t)) return;
     this.lastScrollAt = this.lastScrollAt === null ? t : Math.max(this.lastScrollAt, t);
     this.disarm();
+    // Which line the reader entered belongs to the view they entered it in. After a page back
+    // (or undo) the line entered on the later page sits at or below this page's last line, and
+    // would wave rule 1 through without the reader ever getting there.
+    this.clearEntry();
   }
 
   reset(): void {
@@ -258,16 +310,10 @@ export class PageEndDetector {
     this.vOk = [];
     this.vHead = 0;
     this.vValid = 0;
-    this.armedUntil = -Infinity;
-    this.armMaxX = -Infinity;
-    this.armY = NaN;
-    this.sweepRun = 0;
-    this.lastFixCount = -1;
-    this.enteredDocTop = null;
-    this.entryLeft = 0;
-    this.settledDocTop = null;
-    this.settledRun = 0;
+    this.disarmSweep();
+    this.clearEntry();
     this.glanceArmed = true;
+    this.lookedUp = true;
   }
 
   update(input: PageEndInput): PageEndDecision {
@@ -307,14 +353,15 @@ export class PageEndDetector {
     // fresh page — or by being very sure of it for a while)? A tracker that slides onto the last
     // line mid-line on vertical evidence alone hasn't seen the reader get there; the sweep into it
     // (or a glance back from its end) will show it.
-    let sweep = false;
     if (est && est.fixationsOnPage !== this.lastFixCount) {
-      if (est.lastSaccade === 'return-sweep' && t <= this.armedUntil && this.lastFixCount >= 0) sweep = true;
-      if (est.lastSaccade !== 'forward' && est.lastSaccade !== 'regression') this.entryLeft = ENTRY_FIXATIONS;
+      if (est.lastSaccade === 'return-sweep' && t <= this.armedUntil && this.lastFixCount >= 0) this.sweepSeen = true;
+      const fresh = est.lastSaccade !== 'forward' && est.lastSaccade !== 'regression';
+      if (fresh) this.entryLeft = ENTRY_FIXATIONS;
       const line = layout.lines[est.lineIndex];
       if (line) {
         if (this.entryLeft > 0) {
-          this.enteredDocTop = line.docTop;
+          // The furthest line placed during the entry: a wobble on the corrective saccade doesn't undo an arrival.
+          this.enteredDocTop = fresh || this.enteredDocTop === null ? line.docTop : Math.max(this.enteredDocTop, line.docTop);
           this.entryLeft--;
         }
         const same = this.settledDocTop !== null && Math.abs(this.settledDocTop - line.docTop) < 0.5 * pitch;
@@ -326,29 +373,41 @@ export class PageEndDetector {
     }
     const entered = this.enteredDocTop !== null && this.enteredDocTop >= Lline.docTop - 0.5 * pitch;
 
+    // After a trigger, rules 1 and 2 wait until the gaze has been back up the page (and their
+    // dwells don't build up meanwhile, or they would fire the moment it leaves).
+    if (valid && yc < zones.zoneTop - LOOK_UP_LINES * pitch) this.lookedUp = true;
+    const armed = this.lookedUp;
+
     // Rule 1: on the last line, far enough along it.
     const pAbove = est && L > 0 ? est.posterior[L - 1]! : 0;
     const doubt = pAbove >= DOUBT;
     const dwellMs = doubt ? th.dwellMs * DOUBT_DWELL_FACTOR : th.dwellMs;
     const onLastLine = est !== null && entered && pEnd >= th.minPosterior;
-    const c1: Tri = valid ? onLastLine && progress >= th.minProgress : est ? null : false;
+    const withinReach = yc >= Lline.top - LAST_LINE_REACH_LINES * pitch;
+    const c1: Tri = valid ? armed && onLastLine && withinReach && progress >= th.minProgress : est ? null : false;
     this.lineDwell.step(c1, dt);
 
     // Rule 1b: return sweep after having been (confidently) at the end of the last line.
     if (c1 === true && !doubt) {
       this.armedUntil = t + SWEEP_ARM_MS;
       this.armMaxX = Math.max(this.armMaxX, x);
-      this.armY = yc;
+      this.armTopY = Math.min(this.armTopY, yc);
     }
     if (t > this.armedUntil) this.disarmSweep();
     if (valid && t <= this.armedUntil) {
       this.sweepRun = this.isSweep(x, yc, Lline, zones) ? this.sweepRun + 1 : 0;
-      if (this.sweepRun >= SWEEP_CONFIRM_SAMPLES) sweep = true;
+      if (this.sweepRun >= SWEEP_CONFIRM_SAMPLES) this.sweepSeen = true;
     }
+    const sweep = this.sweepSeen;
 
-    // Rule 2: parked at the bottom right, and the tracker isn't confidently elsewhere.
+    // Rule 2: parked at the bottom right, and the tracker isn't confidently elsewhere. A look
+    // below the page tells it nothing (null: a brief noisy dip is ridden out, a sustained look
+    // away clears it).
     const vetoed = est !== null && est.probability >= ZONE_VETO_CONFIDENCE && est.lineIndex >= 0 && est.lineIndex < L - 1;
-    const c2: Tri = valid ? !vetoed && yc >= zones.zoneTop && x >= zones.zoneLeft && x <= zones.zoneRight : null;
+    const c2: Tri =
+      !valid || yc > zones.zoneBottom
+        ? null
+        : armed && !vetoed && yc >= zones.zoneTop && x >= zones.zoneLeft && x <= zones.zoneRight;
     this.zoneDwell.step(c2, dt);
 
     // Rule 3: deliberate glance below the page; must come back up before it can fire again.
@@ -369,8 +428,10 @@ export class PageEndDetector {
       clamp01(this.zoneDwell.held / th.zoneMs) * 0.6,
       clamp01(this.glanceDwell.held / th.glanceMs) * 0.9,
     );
+    // The entry gate is invisible otherwise: a tracker sure of L with no dwell needs explaining.
+    const notEntered = est !== null && !entered && pEnd >= th.minPosterior ? ' (not entered)' : '';
     const status = (): string =>
-      `L=${L} p(L+)=${fmtP(pEnd)} x=${Number.isFinite(progress) ? fmtP(progress) : '–'} · ` +
+      `L=${L} p(L+)=${fmtP(pEnd)}${notEntered} x=${Number.isFinite(progress) ? fmtP(progress) : '–'} · ` +
       `dwell ${fmtMs(this.lineDwell.held)}/${dwellMs}${doubt ? ' (doubt)' : ''} · zone ${fmtMs(this.zoneDwell.held)}/${th.zoneMs}` +
       (this.opts.glanceDownToTurn ? ` · glance ${fmtMs(this.glanceDwell.held)}/${th.glanceMs}` : '');
 
@@ -408,14 +469,19 @@ export class PageEndDetector {
     }
 
     if (reason === 'none') {
-      const waiting =
-        (lineReady || zoneReady) && !readEnough
+      const waiting = !armed
+        ? 'waiting: gaze has not left the bottom since the last trigger · '
+        : (lineReady || zoneReady) && !readEnough
           ? `waiting: ${fixations}/${PAGE_END_GUARDS.minFixationsOnPage} fixations, ${fmtMs(sinceTurn)}/${PAGE_END_GUARDS.minMsSinceTurn} ms on page · `
           : '';
       return idle(targetLineIndex, waiting + status(), closeness);
     }
+    // Every rule is ready, but this sample is a blink or a dropout: turn on the next valid one.
+    // Nothing is consumed, so the dwells (frozen while invalid) and a seen sweep carry over.
+    if (!valid) return idle(targetLineIndex, `holding: gaze invalid (${reason} ready) · ${status()}`, closeness);
 
     this.lastFireAt = t;
+    this.lookedUp = false;
     this.disarm();
     // A deliberate glance means "next page"; the other rules hedge when the tracker isn't sure.
     const target = reason === 'glance-down' ? targetLineIndex : cautiousTarget;
@@ -447,10 +513,14 @@ export class PageEndDetector {
    * back to the left margin that doesn't go up. From a short paragraph-final
    * line the jump back is short, so there it's "back over half the line and
    * down a bit" — the eyes looking for the next line.
+   *
+   * Movement is measured from the extremes of the arming episode (rightmost x,
+   * highest y). A stricter preset arms on a subset of the samples a looser one
+   * does, so this keeps "relaxed never fires before eager" true by construction.
    */
   private isSweep(x: number, yc: number, L: TextLine, z: PageEndZones): boolean {
     const back = this.armMaxX - x;
-    const dy = yc - this.armY;
+    const dy = yc - this.armTopY;
     if (dy < -SWEEP_MAX_RISE_LINES * z.pitch) return false;
     const w = L.right - L.left;
     if (w < SHORT_LINE_COL * z.columnWidth) {
@@ -462,8 +532,18 @@ export class PageEndDetector {
   private disarmSweep(): void {
     this.armedUntil = -Infinity;
     this.armMaxX = -Infinity;
-    this.armY = NaN;
+    this.armTopY = Infinity;
     this.sweepRun = 0;
+    this.sweepSeen = false;
+  }
+
+  private clearEntry(): void {
+    // -1: the next estimate is examined afresh, but can't count as a sweep across the scroll.
+    this.lastFixCount = -1;
+    this.enteredDocTop = null;
+    this.entryLeft = 0;
+    this.settledDocTop = null;
+    this.settledRun = 0;
   }
 
   private disarm(): void {

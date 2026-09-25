@@ -60,12 +60,12 @@
         </div>
         <p class="calibration" id="calibration" hidden></p>
 
-        <div class="row">
+        <div class="row row--stack">
           <span class="row-text">
             <span class="row-title" id="sensitivity-label">Page turns</span>
             <span class="hint" id="sensitivity-hint"></span>
           </span>
-          <fieldset class="segmented" aria-labelledby="sensitivity-label">
+          <fieldset class="segmented segmented--fill" aria-labelledby="sensitivity-label">
             <label><input type="radio" name="sensitivity" value="relaxed" />Relaxed</label>
             <label><input type="radio" name="sensitivity" value="balanced" />Balanced</label>
             <label><input type="radio" name="sensitivity" value="eager" />Eager</label>
@@ -105,7 +105,11 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2" /><path d="M8 11V8a4 4 0 0 1 8 0v3" /></svg>
           Video never leaves this device.
         </p>
-        <p><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>G</kbd> turns it on or off · <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd> for shortcuts</p>
+        <p>
+          <span class="keys"><kbd>Alt+Shift+G</kbd> on/off</span>
+          <span aria-hidden="true">·</span>
+          <span class="keys"><kbd>Alt+Shift+H</kbd> shortcuts</span>
+        </p>
       </footer>
     </main>
     <script type="module" src="./src/popup.ts"></script>

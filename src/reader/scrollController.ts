@@ -50,6 +50,13 @@ const NAVIGATION_KEYS = new Set([' ', 'Spacebar', 'PageUp', 'PageDown', 'ArrowUp
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 const now = (): number => performance.now();
 
+/** Event time on the performance.now() clock (some engines still report epoch milliseconds). */
+function eventTime(e: Event): number {
+  const t = e.timeStamp;
+  if (!Number.isFinite(t) || t <= 0) return now();
+  return t > 1e12 ? now() - (Date.now() - t) : t;
+}
+
 export function easeInOutCubic(t: number): number {
   const x = clamp(t, 0, 1);
   return x < 0.5 ? 4 * x * x * x : 1 - (-2 * x + 2) ** 3 / 2;
@@ -148,9 +155,9 @@ export class ScrollController {
     };
     const onKeyDown = (e: Event): void => {
       const ke = e as KeyboardEvent;
-      // Only keys pressed after the animation began: the key that *started* a page turn must not cancel it.
-      if (this.anim && NAVIGATION_KEYS.has(ke.key) && ke.timeStamp < this.anim.start) return;
-      if (NAVIGATION_KEYS.has(ke.key)) this.stop();
+      if (!this.anim || !NAVIGATION_KEYS.has(ke.key)) return;
+      // The key whose handler *started* this animation must not cancel it.
+      if (eventTime(ke) >= this.anim.start) this.stop();
     };
     this.listen(this.port.inputTarget, 'wheel', cancelOnInput);
     this.listen(this.port.inputTarget, 'touchstart', cancelOnInput);

@@ -1,6 +1,6 @@
 import { IGNORE_ATTR, Z } from '../core/constants';
 import type { AppSettings, CommandName, EventBus, GazeSourceKind, Mountable, TrackingState } from '../types';
-import { statusPill } from '../app/logic';
+import { pillAlwaysVisible, statusPill } from '../app/logic';
 
 // ─────────────────────────────── Icon set ───────────────────────────────
 // Shared by the shell UI (top bar, library, panels, toasts). Stroke icons on a
@@ -93,11 +93,15 @@ export class Topbar implements Mountable {
     recalibrate: HTMLButtonElement;
     radios: HTMLInputElement[];
   };
+  /** What the owner asked for; effective only on devices that can hover. */
+  private wantAutoHide = false;
   private autoHide = false;
   private concealed = false;
+  /** Pointer y (viewport px) at or above which a hidden bar comes back. */
+  private revealBelowY = 0;
   private pointerInside = false;
   private hideTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly canHover: boolean;
+  private readonly hoverQuery: MediaQueryList | null;
   private author = '';
   private progressText = '';
   private offSettings: (() => void) | null = null;
@@ -113,7 +117,7 @@ export class Topbar implements Mountable {
     el.innerHTML = `
       <div class="gr-topbar__row">
         <div class="gr-topbar__start gr-topbar__fade">
-          <button type="button" class="gr-btn gr-btn--ghost gr-btn--icon-sm" data-cmd="open-library" title="Library (L)">
+          <button type="button" class="gr-btn gr-btn--ghost gr-btn--icon-sm" data-cmd="open-library" aria-label="Back to the library" title="Library (L)">
             ${icon('back')}<span class="gr-topbar__label">Library</span>
           </button>
           <div class="gr-topbar__title">
@@ -135,7 +139,7 @@ export class Topbar implements Mountable {
             ${SOURCES.map(
               (s) => `
               <label class="gr-seg__opt" title="${s.title}">
-                <input type="radio" name="${id}-source" value="${s.kind}" class="gr-sr-only" />
+                <input type="radio" name="${id}-source" value="${s.kind}" class="gr-sr-only" aria-label="${s.title}" />
                 <span class="gr-seg__face">${icon(s.icon)}<span class="gr-seg__text">${s.label}</span></span>
               </label>`,
             ).join('')}
@@ -167,7 +171,8 @@ export class Topbar implements Mountable {
       recalibrate: q('.gr-topbar__recal'),
       radios: [...el.querySelectorAll<HTMLInputElement>('input[type="radio"]')],
     };
-    this.canHover = typeof matchMedia === 'function' && matchMedia('(hover: hover)').matches;
+    // Touch-only devices can't bring a hidden bar back by hovering, so it stays put there.
+    this.hoverQuery = typeof matchMedia === 'function' ? matchMedia('(hover: hover)') : null;
     this.bindEvents();
     this.syncSettings(opts.getSettings());
   }
@@ -198,14 +203,15 @@ export class Topbar implements Mountable {
     pillLabel.textContent = view.label;
     pill.dataset.tone = view.tone;
     pill.dataset.camera = s.cameraOn ? 'on' : 'off';
-    const description = s.detail && s.state === 'error' ? `${view.description} (${s.detail})` : view.description;
+    // "Camera off (Not calibrated)" says what to do next; other states' details repeat the label.
+    const description = s.detail && (s.state === 'error' || s.state === 'off') ? `${view.description} (${s.detail})` : view.description;
     pill.title = description;
     pill.setAttribute('aria-label', `${view.label}. ${description}`);
     const demo = s.kind === 'simulated';
     demoChip.hidden = !demo;
     this.el.dataset.demo = String(demo);
     // Privacy: whenever the camera is on, its indicator never hides.
-    this.el.dataset.persist = s.cameraOn || demo ? 'true' : 'false';
+    this.el.dataset.persist = String(pillAlwaysVisible(s.state, s.kind, s.cameraOn));
   }
 
   /** Reflect settings the bar displays (source switch, pause state, recalibrate availability). */
@@ -222,7 +228,8 @@ export class Topbar implements Mountable {
 
   /** Auto-hide is on while reading. Turning it off shows the bar for good. */
   setAutoHide(on: boolean): void {
-    this.autoHide = on && this.canHover;
+    this.wantAutoHide = on;
+    this.autoHide = on && (this.hoverQuery?.matches ?? false);
     if (this.autoHide) this.reveal();
     else {
       this.clearHideTimer();
@@ -261,14 +268,18 @@ export class Topbar implements Mountable {
       { signal },
     );
     for (const r of this.ui.radios) {
+      // `click`, not `change`: re-picking the checked source must reach the controller,
+      // because that is how the reader retries a webcam that failed to start.
+      // (Arrow-key selection also fires click on the newly checked radio.)
       r.addEventListener(
-        'change',
+        'click',
         () => {
           if (r.checked) this.opts.onSelectSource(r.value as GazeSourceKind);
         },
         { signal },
       );
     }
+    this.hoverQuery?.addEventListener('change', () => this.setAutoHide(this.wantAutoHide), { signal });
     this.el.addEventListener('focusin', () => this.reveal(), { signal });
     this.el.addEventListener('focusout', () => this.scheduleHide(), { signal });
     this.el.addEventListener('pointerenter', () => {
@@ -284,7 +295,8 @@ export class Topbar implements Mountable {
       'pointermove',
       (e) => {
         if (!this.autoHide || !this.concealed || e.pointerType === 'touch') return;
-        if (e.clientY <= this.el.offsetHeight + REVEAL_MARGIN_PX) this.reveal();
+        // revealBelowY is measured once when the bar hides: no layout read per move.
+        if (e.clientY <= this.revealBelowY) this.reveal();
       },
       { signal, passive: true },
     );
@@ -311,6 +323,7 @@ export class Topbar implements Mountable {
 
   private setConcealed(v: boolean): void {
     if (this.concealed === v) return;
+    if (v) this.revealBelowY = this.el.offsetHeight + REVEAL_MARGIN_PX;
     this.concealed = v;
     this.el.dataset.concealed = String(v);
   }
