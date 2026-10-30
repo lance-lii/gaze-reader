@@ -172,7 +172,7 @@ describe('DebugOverlay', () => {
     overlay.mount(host);
     const pitch = layout.linePitch;
     bus.emit('layout', layout);
-    const tracked: TrackedLineEstimate = { ...estimate(5), driftLowY: -0.5 * pitch, driftHighY: 1.25 * pitch, driftSdY: 0.25 * pitch };
+    const tracked: TrackedLineEstimate = { ...estimate(5), driftLowY: -0.5 * pitch, driftHighY: 1.25 * pitch, driftSdY: 0.25 * pitch, gain: 0.12 };
     bus.emit('line-estimate', tracked);
     bus.emit('lighting-state', { flags: ['backlit', 'glare'], distance: 1.234, changedSinceCalibration: true, dominant: 'backlight' });
     bus.emit('gaze', gaze(300, 300, 10_000));
@@ -181,7 +181,7 @@ describe('DebugOverlay', () => {
     overlay.showAppearance({ state: 'watching', residualZ: -1.26, squintZ: null, levelVsCalibration: -0.0123 });
     frames.flush();
     const panel = host.querySelector('.gr-debug-panel')!.textContent!;
-    expect(panel).toMatch(/drift belief -0\.50…\+1\.25 ln {2}sd 0\.25/);
+    expect(panel).toMatch(/drift belief -0\.50…\+1\.25 ln {2}sd 0\.25 {2}gain \+0\.12/);
     expect(panel).toMatch(/light backlit, glare {2}D 1\.23 {2}CHANGED \(backlight\)/);
     expect(panel).toMatch(/lids watching {2}z -1\.3 {2}squint z – {2}level -0\.012/);
     expect(panel).toMatch(/appearance change 3 s ago: lighting · light changed/);

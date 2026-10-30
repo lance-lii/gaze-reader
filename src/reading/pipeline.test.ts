@@ -179,6 +179,21 @@ describe('reading pipeline (simulated reader → fixations → lines → page en
     }
   });
 
+  it('turns safely when the gaze is stretched or squashed 15 % about the viewport centre (sitting nearer or further back than at calibration)', () => {
+    // A fresh page: the tracker hasn't learned the gain yet (it learns it as the reader moves down).
+    for (const scale of [1.15, 0.85]) {
+      for (const seed of SEEDS) {
+        const v = makeReadingPage(seed).viewport;
+        const c = (v.top + v.bottom) / 2;
+        const run = runPage(seed, { ...specScenario(seed), mutate: (s) => ({ ...s, y: c + scale * (s.y - c) }) });
+        const label = `scale ${scale} seed ${seed}`;
+        expect(run.fire, label).not.toBeNull();
+        expect(run.fire!.t, label).toBeGreaterThanOrEqual(run.reachedT);
+        expect(run.fire!.trueLine, label).toBeGreaterThanOrEqual(run.fire!.decision.targetLineIndex);
+      }
+    }
+  });
+
   it('stays safe under harsher, webcam-like conditions (correlated noise, blinks, calibration bias)', () => {
     let fired = 0;
     for (const seed of SEEDS) {

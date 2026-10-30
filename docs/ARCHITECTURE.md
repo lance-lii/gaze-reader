@@ -263,8 +263,8 @@ export class LineTracker {
   onSample(s: GazeSample): LineEstimate | null; // cheap update of progressX from the live gaze
   afterPageTurn(resumeLineIndex: number): void;  // prior on the resume line; re-anchors the drift
   appearanceChangedAt(t: number): void;          // the gaze bias may have jumped at t: keep the line, re-learn the drift
-  reset(opts?: { keepDrift?: boolean }): void;
-  readonly estimate: LineEstimate | null;        // a TrackedLineEstimate (σ_y, excursions, drift belief range)
+  reset(opts?: { keepDrift?: boolean; calibrated?: boolean }): void;
+  readonly estimate: LineEstimate | null;        // a TrackedLineEstimate (σ_y, excursions, drift belief range, gain)
 }
 
 // pageEndDetector.ts
@@ -308,13 +308,16 @@ visible line is being read":
   lamp's squint exceeds, and then the tracker locked onto the wrong line and "learned" a drift that
   fit it). "Line 7 with +0.5 lines of drift" and "line 8 with −0.5" stay separate hypotheses until
   the page tells them apart (the top of the page, a paragraph gap, a short line, a return sweep).
-  `driftY` in the estimate is the drift of the most likely line; `TrackedLineEstimate` also gives
-  the 2–98 % belief range (`driftLowY/driftHighY`) and `driftSdY`. Drift lives only in the reading
+  The drift is the offset at the viewport's centre; a learned vertical *gain* (below) adds the part
+  that grows with the distance from it. `driftY` in the estimate is the offset at the most likely
+  line (drift + gain share); `TrackedLineEstimate` also gives the 2–98 % belief range
+  (`driftLowY/driftHighY`, at that line), `driftSdY` and `gain`. Drift lives only in the reading
   layer; GazeSample is never modified (the gaze dot and Dewey's eyes subtract `driftY` for display).
-* *Emission*: `N(y − drift; line.centerY, σ_y²)` (+ a small floor) with `σ_y = sigmaYLines ×
-  linePitch` (default 0.9, adapted from the residuals of confident fixations only while the drift
-  is pinned, clamped 0.4–3 lines), times a horizontal plausibility factor (penalize x far outside
-  the line's [left, right] — matters for short last lines of paragraphs).
+* *Emission*: `N(y − drift − gain·u; line.centerY, σ_y²)` (+ a small floor), `u` = the line's
+  distance below the viewport's centre in lines, with `σ_y = sigmaYLines × linePitch` (default 0.9,
+  adapted from the residuals of confident fixations only while the drift is pinned, clamped 0.4–3
+  lines), times a horizontal plausibility factor (penalize x far outside the line's [left, right] —
+  matters for short last lines of paragraphs).
 * *Line transition*, chosen by the saccade kind between consecutive fixations (`LINE_TRANSITIONS`):
   forward → stay 0.886 / next 0.073 / prev 0.031; regression → stay 0.877 / prev 0.082 / next
   0.031; **return-sweep → next 0.75 / next+1 0.08 / stay 0.07 / prev 0.03**; jump → 60 % uniform +
@@ -322,10 +325,29 @@ visible line is being read":
   vertical step mid-line isn't cheaply explained as skipping lines). A jump *down* while the eyes
   keep moving along the line is 30 % treated as the bias stepping; a look away and straight back is
   rolled back as an excursion.
-* *Drift transition*: a slow random walk (driftRate × 0.8 lines per fixation) plus a small chance of
-  a sudden shift. Fresh start: N(0, 0.5 lines) with 30 % spread uniformly (calibration is usually
-  right, but the light may differ from calibration); right after a new calibration
-  (`reset({ calibrated: true })`, which the app and the extension use then) the Gaussian alone.
+* *Drift transition*: a slow random walk (driftRate × 0.8 lines per fixation: 0.06 at the default
+  driftRate 0.075; 1.0 and 1.1 used 0.15) plus a small chance of a sudden shift. While the gain is
+  still unknown the walk is faster (its variance gets 0.3 × the gain's: 0.08 lines per fixation at
+  a fresh start, back to ≈ 0.06 once a page or two have pinned the gain), so the drift can follow a
+  stretch the gain hasn't learned yet. Fresh start: N(0, 0.5 lines) with 30 % spread uniformly
+  (calibration is usually right, but the light may differ from calibration); right after a new
+  calibration (`reset({ calibrated: true })`, which the app and the extension use then) the
+  Gaussian alone.
+* *Gain*: webcam gaze is often stretched or squashed about the middle of the screen — the reader
+  sits nearer or further back than at calibration, so the top reads high and the bottom low (or the
+  reverse); the accuracy check calls it "off near the top and bottom". A two-state Kalman filter
+  (offset at the centre, gain; prior: no gain, SD 0.1; clamped to ±0.3) learns it from the raw
+  residuals of fairly confident fixations (line ≥ 60 % sure, drift SD ≤ 1 line, not past the first
+  or last line, not a sweep or a jump), from how the offset changes as the reader moves down the
+  page and across page turns. Its offset may jump by 1 line at a page turn, 3 at an appearance
+  change, and by as much as the line model's own drift when that moves ≥ 1.5 lines (a re-read of
+  which line the reader is on): a wrong page must not read as a gain. The line model takes the
+  gain in steps of a drift bin at the furthest line, shifting every (line, drift) hypothesis so that
+  what it predicts at its own line stays put. Kept by `reset({ keepDrift })` and through appearance
+  changes, forgotten by a full reset. Why it exists: without it the drift's random walk had to follow
+  a gain error's y-dependent drift (0.15 lines per line at 15 %), so the walk had to be fast — and a
+  fast walk lets "line k − 3 with +3 lines of drift" explain unstructured, gapless text as well as
+  "line k, no drift" (spurious drifts, early and missed turns in steady light).
 * *Layout changes*: on scroll/resize, carry the posterior across by matching `docTop`; on
   `page-turn`, `afterPageTurn(resume)` puts the prior on the resume line and **re-anchors the drift**
   (half of the belief reset to uniform), so a drift learned on a wrong line can't survive turns.
@@ -335,15 +357,38 @@ visible line is being read":
 * *Excursions*: fixations well off the text for every drift in the 2–98 % belief range don't move
   the reading state.
 * `reset({ keepDrift })`: a new book with the same gaze source and calibration keeps the learned
-  drift (softened); a new calibration starts over.
+  drift (softened) and gain; a new calibration starts over.
 * `progressX` = (x − line.left)/(line.right − line.left) clamped 0..1 using the latest fixation or
   (in `onSample`) the smoothed gaze when valid.
 
 Measured on the simulator (src/reading/offsets.test.ts guards, bench/reading scoreboard, 168 page
-turns per row): constant offsets of ±2 to ±4 lines keep 95–99.5 % of fixations on the true line
+turns per row): constant offsets of ±2 to ±4 lines keep 94–99.6 % of fixations on the true line
 with no early or missed turns (1.0: 0–5 %, every turn early or missed from ±2 lines); steps of ±2
-to ±4 lines with the appearance event 99.5 %, no bad turns; no offset 99.4 → 99.5 %. Known limit:
-horizontal offsets ≥ 200 px.
+to ±4 lines with the appearance event reported 2.3 s late 98.6–99.2 %, no bad turns; no offset 99.6 %; a 15 % stretch
+or squash about the centre 97.8 / 94.4 %, no bad turns (before the gain: 91.4 / 92.1 %, and 80 %
+right after a turn, now 97.0 / 94.5 %). Horizontal offsets of ±200 px miss 5 / 3 turns (was 22 / 11).
+
+On the app's gapless layouts, gain + slow drift against 1.1 (driftRate 0.15, no gain), as
+on-line % and early / unsafe / missed turns of 168:
+
+| row | 1.1 | now |
+|---|---|---|
+| app, long ¶ · noise 1.2 | 84.4 %, 0 / 1 / 2 | 93.5 %, 0 / 0 / 0 |
+| app, long ¶ · no offset | 93.5 %, 0 / 0 / 1 | 99.1 %, 0 / 0 / 0 |
+| app, long ¶ · noise 1.4 | 77.2 %, 0 / 2 / 7 | 86.7 %, 0 / 1 / 2 |
+| app · noise 1.6 | 76.8 %, 0 / 1 / 10 | 79.8 %, 0 / 0 / 8 |
+| one ¶ · noise 1.2 | 69.3 %, 0 / 5 / 6 | 83.3 %, 0 / 1 / 3 |
+| one ¶ · harsh | 69.7 %, 0 / 7 / 2 | 81.6 %, 0 / 3 / 1 |
+| app, long ¶ · constant +2 | 73.7 %, 3 / 20 / 0 | 76.6 %, 2 / 18 / 0 |
+| app, long ¶ · constant +3 | 63.1 %, 21 / 26 / 0 | 74.5 %, 17 / 27 / 0 |
+| app · constant +3 | 90.9 %, 1 / 2 / 0 | 92.9 %, 0 / 0 / 0 |
+
+Known limits: on long gapless paragraphs a constant +2 / +3 still turns most *first* pages early —
+"the reader started 3 lines down, no offset" fits a fresh page as well as "line 0, 3 lines of
+offset", and only the bottom of the page tells them apart (the next pages are fine); a 15 %
+stretch on long gapless paragraphs is still mostly lost (≈ 50 % on the line); under correlated
+noise (harsh) the slower walk turns 1–2 pages of 168 one line early in three gapped rows that had
+none.
 
 **Page-end detection.** Let `L` = last fully visible line. Fire when any holds (and all guards pass):
 1. **line-tracker**: `posterior[L] ≥ θp` and `progressX ≥ θx` held for ≥ `dwell` ms — or the

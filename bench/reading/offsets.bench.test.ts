@@ -72,9 +72,15 @@ import {
  * noise, on long gapless paragraphs and on one-paragraph pages, the ±5-line tracker sometimes sits a
  * line or more away from the reader with a matching spurious drift ("line k − 3, +3" explains
  * unstructured text as well as "line k, 0"). The page-end detector clamps an unpinned drift to
- * ±1.5 pitches, which halves the damage; the root cause (the drift's random walk also has to carry
- * the y-dependent drift of a gain error, so it can't be slowed down) is a follow-up: model the gain
- * separately, then lower driftRate to ≈ 0.075.
+ * ±1.5 pitches, which halves the damage. Since the vertical gain is modelled separately the
+ * drift's random walk is half as fast (driftRate 0.15 → 0.075), which made this rarer: one ¶ at
+ * noise 1.2 went from 69 % on the line and 0 / 5 / 6 early / unsafe / missed turns to 83 % and
+ * 0 / 1 / 3; app, long ¶ at noise 1.2 from 84 % and 0 / 1 / 2 to 93.5 % and none. On long gapless
+ * paragraphs a constant +2 / +3 still turns most first pages early: "the reader started 3 lines
+ * down, no offset" fits a fresh page as well as "line 0, 3 lines of offset", and only the bottom
+ * of the page tells them apart. A 15 % stretch on long gapless paragraphs is still mostly lost.
+ * The slower walk costs a little under correlated noise on the gapped document: three harsh rows
+ * that had no bad turn turn 1–2 pages of 168 one line early (the reader on the next-to-last line).
  */
 
 const SEEDS = Array.from({ length: 24 }, (_, i) => i + 1);
@@ -149,6 +155,8 @@ const APP_SCENARIOS: readonly SessionScenario[] = [
   { label: 'noise 1.4', schedule: noOffset, extra: { noiseLines: 1.4 } },
   { label: 'harsh (wander .3, blinks 15)', schedule: noOffset, extra: HARSH },
   offset(2), offset(-2), offset(3), offset(-3),
+  { label: 'scale 1.15', schedule: scaled(1.15) },
+  { label: 'scale 0.85', schedule: scaled(0.85) },
   step(3), withEvent(3, 2300), step(-3), withEvent(-3, 2300),
   falseAlarms(0.75),
   falseAlarms(1.2),
@@ -166,15 +174,14 @@ const STEADY_SCENARIOS: ReadonlyArray<readonly [doc: string, scenario: SessionSc
 /**
  * Known limits: how many more early + unsafe turns (of 168) than 1.0 a row may have. Everything
  * else must be at most 1.0's + 2 (steady rows) or no worse than 1.0 (app layouts at noise 1.2 / 1.4
- * and harsh). Measured when these were set (24 seeds): one ¶ harsh 1.0 1 → new 7 (0 / 7 / 2),
- * one ¶ noise 1.2 0 → 5 (0 / 5 / 6); app, long ¶ noise 1.4 1 → 2, harsh 1 → 2 (1.0 without the
- * detector's drift clamp: 5 and 2, and 11 / 5 on one ¶).
+ * and harsh). Measured when these were set (24 seeds): one ¶ harsh 1.0 1 → new 3 (0 / 3 / 1),
+ * one ¶ noise 1.2 0 → 1 (0 / 1 / 3); app, long ¶ noise 1.4 and harsh 1 → 1. Before the gain was
+ * modelled (driftRate 0.15): 7, 5, 2 and 2; 1.0 without the detector's drift clamp: 5 and 2, and
+ * 11 / 5 on one ¶.
  */
 const KNOWN_EXCESS: Readonly<Record<string, number>> = {
-  'one ¶ · harsh (wander .3, blinks 15)': 6,
-  'one ¶ · noise 1.2': 5,
-  'app, long ¶ · noise 1.4': 1,
-  'app, long ¶ · harsh (wander .3, blinks 15)': 1,
+  'one ¶ · harsh (wander .3, blinks 15)': 2,
+  'one ¶ · noise 1.2': 1,
 };
 
 interface PageScenario {
@@ -316,6 +323,12 @@ describe('reading layer vs gaze offsets (scoreboard)', () => {
     const headline = ['constant +2', 'constant -2', ...EVENT_DELAYS.flatMap((d) => [`step +3 + event (${d / 1000} s)`, `step +4 + event (${d / 1000} s)`])];
     for (const label of headline) expect(bad(n(label)) + n(label).missed, label).toBe(0);
     expect(n('constant +2').onLine).toBeGreaterThan(0.9);
+    // A 15 % stretch or squash about the centre: the gain is learned, so the drift can stay slow
+    // (before: the same turns, but only 80 % on the line right after them; now ≥ 94 %).
+    for (const label of ['scale 1.15', 'scale 0.85']) {
+      expect(bad(n(label)) + n(label).missed, label).toBe(0);
+      expect(n(label).onLineAfterTurn, label).toBeGreaterThanOrEqual(0.9);
+    }
     // A report 2.3 s late works as one on time: no missed turn after a step up (before: 3–6 of 168).
     for (const dy of [-3, -4]) expect(n(`step ${dy} + event (2.3 s)`).missed, `step ${dy}`).toBe(0);
   });
@@ -325,10 +338,11 @@ describe('reading layer vs gaze offsets (scoreboard)', () => {
     const n = (doc: string, label: string): SessionSummary => cache.get(key(doc, label, NEW))!;
     const o = (doc: string, label: string): SessionSummary => cache.get(key(doc, label, OLD))!;
     // The lighting rows on the app layout, at today's level (1.0: every turn early or missed).
-    expect(bad(n('app', 'constant +3')), 'app constant +3').toBeLessThanOrEqual(3);
-    expect(n('app', 'constant +3').missed, 'app constant +3').toBe(0);
-    expect(bad(n('app', 'constant -3')) + n('app', 'constant -3').missed, 'app constant -3').toBe(0);
-    for (const label of ['constant +2', 'constant -2']) expect(bad(n('app', label)) + n('app', label).missed, `app ${label}`).toBe(0);
+    for (const label of ['constant +2', 'constant -2', 'constant +3', 'constant -3']) {
+      expect(bad(n('app', label)) + n('app', label).missed, `app ${label}`).toBe(0);
+    }
+    // A 15 % stretch or squash: the first pages, before the gain is learned, can cost a turn or a few.
+    for (const label of ['scale 1.15', 'scale 0.85']) expect(bad(n('app', label)) + n('app', label).missed, `app ${label}`).toBeLessThanOrEqual(4);
     // Steady light at high noise: no more early or unsafe turns than 1.0 (known limits excepted).
     for (const doc of ['app', 'app, long ¶']) {
       for (const label of ['noise 1.2', 'noise 1.4', 'harsh (wander .3, blinks 15)']) {

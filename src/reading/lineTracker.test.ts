@@ -19,17 +19,19 @@ function fix(t: number, x: number, y: number): Fixation {
 /**
  * Idealized reading fixations over lines [from, to]: 8 per line, then a return sweep.
  * `offsetPx`/`dxPx`: a constant gaze bias; `step`: the vertical bias changes by `px` from the
- * `after`-th fixation on (mid-line, like a light switched on). `t` is when the next fixation would start.
+ * `after`-th fixation on (mid-line, like a light switched on); `scale`: gaze stretched (> 1) or
+ * squashed about the viewport's centre. `t` is when the next fixation would start.
  */
 function readLines(
   layout: LineLayout,
   from: number,
   to: number,
-  opts: { offsetPx?: number; dxPx?: number; jitterPx?: number; seed?: number; t0?: number; step?: { after: number; px: number } } = {},
+  opts: { offsetPx?: number; dxPx?: number; jitterPx?: number; seed?: number; t0?: number; step?: { after: number; px: number }; scale?: number } = {},
 ): { fixations: Fixation[]; truth: number[]; t: number } {
   const rng = mulberry32(opts.seed ?? 1);
   const fixations: Fixation[] = [];
   const truth: number[] = [];
+  const centreY = (layout.viewport.top + layout.viewport.bottom) / 2;
   let t = opts.t0 ?? 0;
   for (let i = from; i <= to; i++) {
     const l = layout.lines[i]!;
@@ -37,7 +39,8 @@ function readLines(
     for (let k = 0; k < n; k++) {
       const x = l.left + ((k + 0.4) / n) * (l.right - l.left) + (opts.dxPx ?? 0);
       const stepPx = opts.step && fixations.length >= opts.step.after ? opts.step.px : 0;
-      const y = l.centerY + (opts.offsetPx ?? 0) + stepPx + (opts.jitterPx ?? 0) * gaussian(rng);
+      const yc = centreY + (opts.scale ?? 1) * (l.centerY - centreY);
+      const y = yc + (opts.offsetPx ?? 0) + stepPx + (opts.jitterPx ?? 0) * gaussian(rng);
       fixations.push(fix(t, x, y));
       truth.push(i);
       t += 260;
@@ -362,6 +365,71 @@ describe('LineTracker under large gaze offsets (lighting)', () => {
     expect(accuracy(tracker, fixations.slice(0, 8), truth.slice(0, 8))).toBeGreaterThanOrEqual(0.875);
     expect(accuracy(tracker, fixations.slice(8), truth.slice(8))).toBe(1);
     expect(lines(tracker.estimate!)).toBeCloseTo(2, 0);
+  });
+
+  /** Reads `pages` pages of the document from the top, turning each the way the controller does. */
+  const readPages = (
+    tracker: LineTracker,
+    pages: number,
+    opts: { scale?: number; offsetPx?: number },
+  ): { acc: number[]; layout: LineLayout; t: number } => {
+    let layout = page;
+    let from = 0;
+    let t = 0;
+    const acc: number[] = [];
+    tracker.setLayout(layout, 'initial');
+    for (let p = 0; p < pages; p++) {
+      const last = lastFullyVisibleIndex(layout);
+      const r = readLines(layout, from, last, { ...opts, jitterPx: 0.15 * pitch, seed: p + 1, t0: t });
+      acc.push(accuracy(tracker, r.fixations, r.truth));
+      t = r.t + 1000;
+      if (p === pages - 1) break;
+      const anchor = layout.lines[last]!.docTop;
+      layout = doc.layoutAt(anchor - 0.35 * pitch, { viewport });
+      tracker.setLayout(layout, 'page-turn');
+      from = layout.lines.findIndex((l) => l.docTop > anchor);
+      tracker.afterPageTurn(from);
+    }
+    return { acc, layout, t };
+  };
+  const gainOf = (tracker: LineTracker): number => (tracker.estimate as TrackedLineEstimate).gain!;
+
+  it('learns a vertical gain: gaze stretched or squashed 15 % about the viewport centre (sitting nearer or further back)', () => {
+    for (const scale of [1.15, 0.85]) {
+      const tracker = new LineTracker();
+      const { acc, layout } = readPages(tracker, 3, { scale });
+      expect(gainOf(tracker), `scale ${scale}`).toBeCloseTo(scale - 1, 1);
+      expect(acc[2], `scale ${scale}`).toBeGreaterThan(0.95);
+      // driftY is the offset at the reader's line (the last one): the gain's share of it included.
+      const last = layout.lines[lastFullyVisibleIndex(layout)]!;
+      const expected = ((scale - 1) * (last.centerY - (viewport.top + viewport.bottom) / 2)) / pitch;
+      expect(lines(tracker.estimate!), `scale ${scale}`).toBeCloseTo(expected, 0);
+    }
+  });
+
+  it('learns no gain from a constant offset, and forgets the gain on a full reset only', () => {
+    const steady = new LineTracker();
+    readPages(steady, 3, { offsetPx: 2 * pitch });
+    expect(Math.abs(gainOf(steady))).toBeLessThan(0.03);
+    expect(lines(steady.estimate!)).toBeCloseTo(2, 0);
+
+    const stretched = (): LineTracker => {
+      const tracker = new LineTracker();
+      readPages(tracker, 3, { scale: 1.15 });
+      return tracker;
+    };
+    const fresh = stretched();
+    fresh.reset();
+    fresh.setLayout(page, 'initial');
+    fresh.onFixation(fix(0, page.lines[0]!.left + 50, page.lines[0]!.centerY));
+    expect(Math.abs(gainOf(fresh))).toBeLessThan(0.02);
+    // Another book with the same calibration: the head is where it was.
+    const kept = stretched();
+    const learnt = gainOf(kept);
+    kept.reset({ keepDrift: true });
+    kept.setLayout(page, 'initial');
+    kept.onFixation(fix(0, page.lines[0]!.left + 50, page.lines[0]!.centerY));
+    expect(gainOf(kept)).toBeCloseTo(learnt, 1);
   });
 
   it('keeps the line and re-learns the drift when the camera reports an appearance change', () => {
