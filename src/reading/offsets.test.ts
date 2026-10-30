@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { APP_DOC, APP_DOC_LONG, NEW, constant, noOffset, quantile, stepAt, type Schedule } from '../../bench/reading/harness';
+import { APP_DOC, APP_DOC_LONG, NEW, constant, noOffset, quantile, scaled, stepAt, type Schedule } from '../../bench/reading/harness';
 import { runSession, summarizeSessions, type SessionConfig, type SessionSummary } from '../../bench/reading/session';
 import { READING_ORDERS, runInterrupted, runPage } from '../../bench/reading/page';
 import { lastFullyVisibleIndex, makeReadingPage, withBlockGap } from './testLayouts';
@@ -45,6 +45,32 @@ describe('reading layer under gaze offsets (fast guards; full scoreboard in benc
       expect(s.onLine, `offset ${dy}`).toBeGreaterThanOrEqual(0.88);
       expect(badTurns(s) + s.missed, `offset ${dy}`).toBe(0);
     }
+  });
+
+  it('learns a 15 % vertical stretch or squash about the centre (sitting nearer or further back than at calibration)', () => {
+    // The offset grows towards the top and bottom of the page (±1.5 lines at the edges) and jumps
+    // by 3 lines at every turn. The gain is learned on the side, so the drift can stay slow; until
+    // it is, the drift walks faster. Before the gain was modelled the first fixations after a turn
+    // were 80 % on the line (168 turns); now 94–97 %.
+    for (const scale of [1.15, 0.85]) {
+      const s = sessions(scaled(scale));
+      expect(s.onLine, `${scale}`).toBeGreaterThanOrEqual(0.92);
+      expect(s.onLineAfterTurn, `${scale}`).toBeGreaterThanOrEqual(0.9);
+      expect(badTurns(s) + s.missed, `${scale}`).toBe(0);
+      // The app's layout (no paragraph gaps): the first page, before the gain is learned, can cost a turn.
+      const app = sessions(scaled(scale), { doc: APP_DOC });
+      expect(app.onLine, `app ${scale}`).toBeGreaterThanOrEqual(0.88);
+      expect(badTurns(app) + app.missed, `app ${scale}`).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it('keeps steady light on long gapless paragraphs from learning a spurious drift (noise 1.2)', () => {
+    // "Line k − 3 with +3 lines of drift" explains a gapless page as well as "line k, no drift"
+    // unless the drift is slow. Before the gain was modelled (driftRate 0.15): 84 % on the line,
+    // 0 / 1 / 2 early / unsafe / missed of 168 turns; now 93 %, none.
+    const s = sessions(noOffset, { doc: APP_DOC_LONG, noiseLines: 1.2 });
+    expect(s.onLine).toBeGreaterThanOrEqual(0.88);
+    expect(badTurns(s) + s.missed).toBe(0);
   });
 
   it('applies an appearance report that arrives 2.3 s late (the lid monitor) at the change: no missed turn after a 4-line step up', () => {

@@ -31,9 +31,22 @@ import { classifySaccade } from '../signal/fixations';
  * light read high. A range narrower than the bias forces the tracker onto the
  * wrong line, where it then "learns" a drift that fits that line.
  *
- * - Emission: N(y − drift; line.centerY, σ_y²) (+ a small floor so one wild
- *   fixation can't wipe out the posterior), times a horizontal plausibility
- *   factor that penalizes x far outside the line (short paragraph-final lines).
+ * The drift is the offset at the viewport's centre. Gaze is also often
+ * stretched or squashed about the centre (the reader sits nearer or further
+ * back than at calibration: the top reads high and the bottom low), so the
+ * offset at a line is drift + gain × (the line's distance below the centre, in
+ * lines), with the gain learned on the side by a small Kalman filter (see
+ * GAIN_*). That lets the drift's random walk be slow: when it also had to
+ * follow a gain error's y-dependent drift it had to be fast, and a fast walk
+ * lets "line k − 3 with +3 lines of drift" explain unstructured text as well
+ * as "line k, no drift" — on gapless pages in steady light the tracker then
+ * learned spurious drifts of a line or more.
+ *
+ * - Emission: N(y − drift − gain × u; line.centerY, σ_y²), u = the line's
+ *   distance below the viewport's centre in lines (+ a small floor so one
+ *   wild fixation can't wipe out the posterior), times a horizontal
+ *   plausibility factor that penalizes x far outside the line (short
+ *   paragraph-final lines).
  * - Line transitions by saccade kind (LINE_TRANSITIONS): forward → mostly
  *   stay; regression → stay or back one; return sweep → next line; jump → 60 %
  *   uniform + 40 % where dy points. The remaining mass is spread uniformly; it
@@ -43,8 +56,10 @@ import { classifySaccade } from '../signal/fixations';
  *   along the line is partly the gaze bias stepping (the drift shifts, the
  *   line stays), and a long leftward saccade out of the right half that lands
  *   too far right for a return sweep (a horizontal gaze offset) is partly one.
- * - Drift transitions: a slow Gaussian random walk (driftRate × 0.8 lines per
- *   fixation) plus a small chance of a sudden shift (the head moved). On a
+ * - Drift transitions: a slow Gaussian random walk (driftRate × 0.8 = 0.06 lines
+ *   per fixation; faster while the gain is still unknown, so the drift can
+ *   follow a stretch not learned yet) plus a small chance of a sudden shift
+ *   (the head moved). On a
  *   fresh start the drift prior is N(0, 0.5 lines) with 30 % spread uniformly:
  *   calibration is usually right, but light can differ from calibration. Right
  *   after a new calibration (reset({ calibrated: true })) the light is the
@@ -53,6 +68,13 @@ import { classifySaccade } from '../signal/fixations';
  *   so half of the drift belief is reset to uniform and the first fixations on
  *   the new page pin it again. A drift learned on a wrong line can't survive
  *   every turn.
+ * - The gain carries over page turns, appearance changes and
+ *   reset({ keepDrift }). It learns from how the offset changes as the reader
+ *   moves down the page and across turns (the offset at the centre carries over
+ *   while the reader's line moves ~20 lines up), but a turn, an appearance
+ *   change, or the line model re-reading which line the reader is on lets the
+ *   filter's offset jump instead, so a page read on a wrong line doesn't teach
+ *   a gain.
  * - The camera side can report that the eyes' appearance changed (a light was
  *   switched on, squinting, glare; `appearanceChangedAt`): the tracker keeps
  *   the line and re-learns the drift from there. Reports come seconds late
@@ -78,27 +100,36 @@ import { classifySaccade } from '../signal/fixations';
  * line of drift; ~95 % with correlated noise and blinks; constant offsets of
  * ±4 lines and steps of ±4 lines with the appearance event (reported 2.3 or
  * 8 s late) without an early page turn, and without a missed one when the
- * report takes 2.3 s (1.0: every turn early or missed from ±2 lines on).
+ * report takes 2.3 s (1.0: every turn early or missed from ±2 lines on); a
+ * 15 % stretch or squash about the centre 94–98 %, no bad turn (before the
+ * gain was modelled 91–92 %, and 80 % right after a turn against 94–97 %).
  * Without the event, downward steps of 2–3 lines still turn on time; upward
  * steps can miss a turn or two (the safe direction).
  * The app's reader has no paragraph gaps (less to pin the drift with): with
- * 3–9-line paragraphs, constant ±2 / ±3 lines cost at most 1 / 2 / 0 early /
- * unsafe / missed turns; an unreported step of +3 costs 3 / 10 / 0, one of −3
- * 23 missed turns (0 with the event). With 12–30-line paragraphs a constant +3
- * keeps 63 % on the line and turns 47 of 168 pages early or unsafe.
- * Known limits: a horizontal offset of ≥ 200 px defeats return-sweep detection
- * and misses ~1 turn in 8; in steady light at high noise on long gapless or
- * single paragraphs, the tracker sometimes learns a spurious 1–4-line drift
- * (a line or more away from the reader; one ¶, noise 1.2: 5 of 168 turns
- * unsafe against 1.0's 0). The drift's random walk also has to follow the
- * y-dependent drift of a gain error, so it can't be slowed down until the
- * gain is modelled separately.
+ * 3–9-line paragraphs, constant ±2 / ±3 lines cost no early, unsafe or missed
+ * turn; an unreported step of +3 costs 3 / 7 / 0 early / unsafe / missed
+ * turns, one of −3 21 missed turns (0 with the event). With 12–30-line
+ * paragraphs, steady light at noise 1.2 keeps 93.5 % on the line with no bad
+ * turn (driftRate 0.15 with no gain: 84 %, 0 / 1 / 2), no noise 99 % (93.5 %).
+ * Known limits: a horizontal offset of ±200 px weakens return-sweep detection
+ * (5 and 3 of 168 turns missed); in steady light at high noise on single
+ * paragraphs the tracker still sometimes learns a spurious drift (one ¶, noise
+ * 1.2: 83 % on the line, 1 of 168 turns unsafe and 3 missed; before 69 %,
+ * 5 and 6). On long gapless paragraphs a constant +2 / +3 still turns most
+ * first pages early (20 and 44 of 168 turns early or unsafe; 74.5 % on the
+ * line at +3, before 63 %): "the reader started 3 lines down" fits a fresh
+ * page as well as "3 lines of offset" until its bottom. Under correlated
+ * noise the slow walk turns a page one line early now and then (1–2 of 168 in
+ * three of the gapped document's harsh rows, which had none).
  */
 
 export interface LineTrackerOptions {
   /** Initial vertical emission σ, in lines (adapted online, clamped 0.4–3). */
   sigmaYLines: number;
-  /** How fast the drift may wander: the random-walk step is driftRate × 0.8 lines per fixation (σ; 0.12 lines at the default). */
+  /**
+   * How fast the drift may wander: the random-walk step is driftRate × 0.8 lines per fixation (σ;
+   * 0.06 lines at the default), more while the vertical gain is still unknown.
+   */
   driftRate: number;
   /** Drift range modeled, ± lines (0–10; the grid has at most 81 bins, 0.125 lines apart at the default). */
   maxDriftLines: number;
@@ -106,7 +137,7 @@ export interface LineTrackerOptions {
 
 export const DEFAULT_LINE_TRACKER_OPTIONS: Readonly<LineTrackerOptions> = Object.freeze({
   sigmaYLines: 0.9,
-  driftRate: 0.15,
+  driftRate: 0.075,
   maxDriftLines: 5,
 });
 
@@ -125,6 +156,12 @@ export interface TrackedLineEstimate extends LineEstimate {
   driftHighY?: number;
   /** SD of the drift that goes with the most likely line, px (NaN when unknown): how well driftY is pinned. */
   driftSdY?: number;
+  /**
+   * Vertical gain the line model uses: the offset grows by this many lines per line below the
+   * viewport's centre (0.15: gaze stretched 15 % about the centre). driftY, driftLowY and
+   * driftHighY include it (they are the offset at the most likely line).
+   */
+  gain?: number;
 }
 
 export function isTrackedLineEstimate(e: LineEstimate | null | undefined): e is TrackedLineEstimate {
@@ -206,8 +243,10 @@ const GLANCE_BACK_FIXATIONS = 2;
 /** Drift grid resolution, lines; the grid never exceeds MAX_DRIFT_BINS (coarser steps for wider ranges). */
 const DRIFT_STEP_LINES = 0.125;
 const MAX_DRIFT_BINS = 81;
-/** Random-walk step per fixation = driftRate × this, in lines. */
+/** Random-walk step per fixation = driftRate × this, in lines... */
 const DRIFT_WALK_PER_RATE = 0.8;
+/** ...its σ rounded to this, lines (the kernel is rebuilt only when it moves a step). */
+const WALK_SD_STEP = 0.002;
 /** Per-fixation probability that the drift jumps anywhere on the grid (head movement). */
 const DRIFT_JUMP = 0.004;
 /** Drift prior on a fresh start: N(0, σ) in lines (calibration is decent but rarely perfect)... */
@@ -224,6 +263,60 @@ const DRIFT_PRIOR_SIGMA_LINES = 0.5;
 const DRIFT_PRIOR_UNIFORM = 0.3;
 /** Quantile that bounds the drifts still "believed possible" (excursion test, σ-learning gate, diagnostics). */
 const DRIFT_TAIL = 0.02;
+
+/**
+ * Vertical gain: webcam gaze is often stretched or squashed about the middle of the screen (the
+ * reader sits nearer or further back than at calibration: the top reads high and the bottom low,
+ * or the other way round), so the offset grows with the distance from the viewport's centre:
+ * offset(line) = drift + gain × u, u = (line.centerY − centre) / pitch. The drift grid holds the
+ * offset at the centre; the gain is a scalar learned by a two-state Kalman filter (the offset at
+ * the centre, the gain) from the raw residuals of fairly confident fixations, as the reader moves
+ * down the page. Prior: no gain, SD 0.1 (a 10 % stretch).
+ */
+const GAIN_PRIOR_SD = 0.1;
+/** Random walk of the gain, per fixation (posture changes slowly). */
+const GAIN_WALK = 0.001;
+/** The gain the line model uses is clamped to ± this. */
+const MAX_GAIN = 0.3;
+/**
+ * The filter's own offset (lines): its prior SD, how far it may jump at an appearance change, and
+ * at a page turn — the line before the turn may have been wrong, and one wrong page must not read
+ * as a gain (a 3-line error at the bottom of a page looks like a 0.15 gain once the turn
+ * re-anchors the line; taken at face value it cost the next page).
+ */
+const GAIN_OFFSET_PRIOR_SD = 3;
+const GAIN_OFFSET_JUMP_SD = 3;
+const GAIN_OFFSET_TURN_SD = 1;
+/**
+ * Fixations the filter learns from: the line at least this sure, its drift pinned to within this
+ * SD (lines), not past the first or last line (see plausibleAtEdge), not a sweep or a jump. Looser
+ * than σ learning: on gapless text under a gain error the line is rarely more than 80 % sure, and
+ * the gain is what would make it so...
+ */
+const GAIN_LEARN_CONFIDENCE = 0.6;
+const GAIN_LEARN_MAX_DRIFT_SD = 1;
+/** ...with innovations clipped to this many SDs (a glance or a wrong line moves it a bounded step). */
+const GAIN_MAX_INNOVATION_SD = 2.5;
+/**
+ * When the line model's drift moved at least this much (lines) since the filter last learned, the
+ * filter's offset may have moved as much: the line model re-read which line the reader is on
+ * ("line k + 3, no drift" became "line k, +3"). Taken as a slope, that switch alone taught a
+ * fresh page under a constant 3-line offset a gain of 0.085. Not for one-line slips: under a gain
+ * not learned yet those are what the gain explains (from 0.25 lines, a 15 % stretch on the app's
+ * layout cost 6 more early or unsafe turns of 168).
+ */
+const GAIN_REF_JUMP_LINES = 1.5;
+/**
+ * The line model takes the filter's gain once it moved a drift bin's worth at the furthest line
+ * (each change re-bins the joint by a fraction of a bin, which blurs it like extra drift).
+ */
+const GAIN_APPLY_MIN_LINES = DRIFT_STEP_LINES;
+/**
+ * While the gain is still unknown the drift has to follow its ramp: the drift walk's variance per
+ * fixation gets this share of the gain's (σ_gain 0.1 at a fresh start: 0.08 lines per fixation
+ * instead of 0.06; a page or two pin the gain to ≈ 0.03 and the walk is back to ≈ 0.06).
+ */
+const GAIN_WALK_SHARE = 0.3;
 
 /** Additive floor on the vertical likelihood: one wild fixation can shift the odds by at most ~1/floor. */
 const EMISSION_FLOOR = 0.01;
@@ -311,6 +404,19 @@ const FALLBACK_PITCH_PX = 40;
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 const clamp01 = (v: number): number => clamp(v, 0, 1);
 
+/** The gain filter: mean of (offset at the viewport's centre, gain) and its covariance, in lines. Replaced, never mutated. */
+interface GainFilter {
+  d: number;
+  g: number;
+  pdd: number;
+  pdg: number;
+  pgg: number;
+  /** The line model's drift (at the centre, for its most likely line) when the filter last learned. */
+  ref: number;
+}
+
+const freshGainFilter = (): GainFilter => ({ d: 0, g: 0, pdd: GAIN_OFFSET_PRIOR_SD ** 2, pdg: 0, pgg: GAIN_PRIOR_SD ** 2, ref: NaN });
+
 /** The tracker's state just before a jump, kept for a fixation or two in case the eyes come straight back. */
 interface GlanceSnapshot {
   /** The fixation the eyes jumped away from, and the one they jumped to. */
@@ -327,6 +433,8 @@ interface GlanceSnapshot {
   driftLo: number;
   driftHi: number;
   driftSdLines: number;
+  gainFilter: GainFilter;
+  gain: number;
   lastSaccade: SaccadeKind | null;
   progressX: number;
 }
@@ -343,6 +451,8 @@ interface TrackerSnapshot {
   driftLo: number;
   driftHi: number;
   driftSdLines: number;
+  gainFilter: GainFilter;
+  gain: number;
   sigmaLines: number;
   residVar: number;
   fixCount: number;
@@ -362,8 +472,8 @@ export class LineTracker {
   private readonly opts: LineTrackerOptions;
   /** Drift grid (lines), symmetric around 0. */
   private readonly grid: Float64Array;
-  /** Random-walk kernel over drift bins (odd length, centered). */
-  private readonly walk: Float64Array;
+  /** Random-walk kernel over drift bins (odd length, centered) and its σ in WALK_SD_STEPs; see walkKernel. */
+  private walk: { step: number; kernel: Float64Array } | null = null;
 
   private layout: LineLayout | null = null;
   /** Indices (into layout.lines) of the readable lines, top to bottom. */
@@ -383,6 +493,9 @@ export class LineTracker {
   private driftHi = 0;
   /** SD of the drift given the most likely line, lines (how well the data pin the drift for it). */
   private driftSdLines = Infinity;
+  /** The gain filter, and the gain the line model uses (the filter's, clamped, updated in steps). */
+  private gainFilter: GainFilter = freshGainFilter();
+  private gain = 0;
   private sigmaLines: number;
   /** EMA of squared drift-corrected residuals, lines². */
   private residVar: number;
@@ -422,7 +535,6 @@ export class LineTracker {
     const step = half > 0 ? this.opts.maxDriftLines / half : 0;
     this.grid = new Float64Array(2 * half + 1);
     for (let b = 0; b < this.grid.length; b++) this.grid[b] = (b - half) * step;
-    this.walk = gaussianKernel(step > 0 ? (this.opts.driftRate * DRIFT_WALK_PER_RATE) / step : 0);
     this.driftBelief = this.driftPrior();
     this.updateDriftRange();
   }
@@ -541,6 +653,8 @@ export class LineTracker {
       this.driftLo = glance.driftLo;
       this.driftHi = glance.driftHi;
       this.driftSdLines = glance.driftSdLines;
+      this.gainFilter = glance.gainFilter;
+      this.gain = glance.gain;
       this.lastSaccade = glance.lastSaccade;
       this.progressX = glance.progressX;
       this.prevFix = glance.from;
@@ -570,6 +684,8 @@ export class LineTracker {
           driftLo: this.driftLo,
           driftHi: this.driftHi,
           driftSdLines: this.driftSdLines,
+          gainFilter: this.gainFilter,
+          gain: this.gain,
           lastSaccade: this.lastSaccade,
           progressX: this.progressX,
         };
@@ -582,6 +698,7 @@ export class LineTracker {
       this.predict(kind, ignoreDy ? 0 : (f.y - this.prevFix.y) / pitch, dxCol, sweepLike);
     }
     this.dyUntrusted = false;
+    this.gainTimeStep();
 
     const sigma = this.sigmaLines;
     const yL = f.y / pitch;
@@ -589,7 +706,7 @@ export class LineTracker {
     let total = 0;
     for (let k = 0; k < m; k++) {
       const line = lines[this.states[k]!]!;
-      const base = yL - line.centerY / pitch;
+      const base = yL - line.centerY / pitch - this.gain * this.centreLines(line);
       const h = horizontalPlausibility(f.x, line, columnWidth, pitch);
       for (let b = 0; b < D; b++) {
         const z = (base - this.grid[b]!) / sigma;
@@ -615,6 +732,15 @@ export class LineTracker {
       ) {
         this.residVar += SIGMA_RATE * (e * e - this.residVar);
         this.sigmaLines = clamp(Math.sqrt(this.residVar) * SIGMA_INFLATE, SIGMA_MIN_LINES, SIGMA_MAX_LINES);
+      }
+      if (
+        this.post[best]! >= GAIN_LEARN_CONFIDENCE &&
+        this.driftSdLines <= GAIN_LEARN_MAX_DRIFT_SD &&
+        kind !== 'return-sweep' &&
+        kind !== 'jump' &&
+        this.plausibleAtEdge(e, best)
+      ) {
+        this.learnGain((f.y - line.centerY) / pitch, this.centreLines(line), this.driftY / pitch - this.gainAt(best));
       }
       this.progressX = progressAlong(line, f.x);
     }
@@ -665,6 +791,10 @@ export class LineTracker {
     // the known line, turn after turn.
     this.driftBelief = mixWithUniform(this.driftBelief, PAGE_TURN_KEEP_DRIFT);
     this.joint = this.seed(w);
+    // The gain carries over (the head didn't move); the offset may have been learned on a wrong line.
+    // That allowance is all a turn gets: the line model's drift re-pinned on the new page moves by
+    // as much as a gain not learned yet predicts, which is just what the filter should see.
+    this.gainFilter = { ...this.gainFilter, pdd: this.gainFilter.pdd + GAIN_OFFSET_TURN_SD ** 2, ref: NaN };
     this.clearPrevFix();
     this.history = [];
     this.lastSaccade = null;
@@ -745,6 +875,10 @@ export class LineTracker {
     // A kept drift may predate a reported appearance change, so that still applies (at the next
     // fixation); a full reset (a new calibration) starts from "calibration is about right" and forgets it.
     if (!opts.keepDrift) this.pendingChanges = [];
+    // The kept drift is the offset at the centre under the gain learned so far: keep that too.
+    const gf = this.gainFilter;
+    this.gainFilter = opts.keepDrift ? { ...freshGainFilter(), g: gf.g, pgg: gf.pgg } : freshGainFilter();
+    if (!opts.keepDrift) this.gain = 0;
     this.sigmaLines = this.opts.sigmaYLines;
     this.residVar = (this.sigmaLines / SIGMA_INFLATE) ** 2;
     this.fixCount = 0;
@@ -761,6 +895,98 @@ export class LineTracker {
   private pitch(): number {
     const p = this.layout?.linePitch;
     return p !== undefined && Number.isFinite(p) && p > 0 ? p : FALLBACK_PITCH_PX;
+  }
+
+  /** How far the line is below the viewport's centre, in lines (the gain's lever arm). */
+  private centreLines(line: TextLine): number {
+    const v = this.layout?.viewport;
+    if (!v || !Number.isFinite(line.centerY)) return 0;
+    const u = (line.centerY - (v.top + v.bottom) / 2) / this.pitch();
+    return Number.isFinite(u) ? u : 0;
+  }
+
+  /** The gain's share of the offset at layout line `i`, lines (0 without a line). */
+  private gainAt(i: number): number {
+    const line = i >= 0 ? this.layout?.lines[i] : undefined;
+    return line ? this.gain * this.centreLines(line) : 0;
+  }
+
+  /**
+   * The drift's random-walk kernel: driftRate × 0.8 lines per fixation, faster while the gain is
+   * still unknown (GAIN_WALK_SHARE: the drift then has to follow the gain's ramp). σ is rounded to
+   * WALK_SD_STEP, so the kernel is a function of the state (a replay predicts exactly as the first
+   * pass did) and is rebuilt only when σ moved a step.
+   */
+  private walkKernel(): Float64Array {
+    if (this.grid.length < 2) return Float64Array.of(1);
+    const base = this.opts.driftRate * DRIFT_WALK_PER_RATE;
+    const step = Math.round(Math.sqrt(base * base + GAIN_WALK_SHARE * this.gainFilter.pgg) / WALK_SD_STEP);
+    if (this.walk?.step === step) return this.walk.kernel;
+    const kernel = gaussianKernel((step * WALK_SD_STEP) / (this.grid[1]! - this.grid[0]!));
+    this.walk = { step, kernel };
+    return kernel;
+  }
+
+  /** The gain filter's prediction for one more fixation: its offset walks like the drift, its gain barely. */
+  private gainTimeStep(): void {
+    const gf = this.gainFilter;
+    const q = (this.opts.driftRate * DRIFT_WALK_PER_RATE) ** 2;
+    this.gainFilter = { ...gf, pdd: gf.pdd + q, pgg: gf.pgg + GAIN_WALK ** 2 };
+  }
+
+  /**
+   * One confident fixation for the gain filter: `r` lines below its line's centre, the line `u`
+   * lines below the viewport's centre (r = offset + gain × u + noise); `drift`: the line model's
+   * drift at the centre for that line. The line model then follows the new gain.
+   */
+  private learnGain(r: number, u: number, drift: number): void {
+    let gf = this.gainFilter;
+    const moved = drift - gf.ref;
+    if (Math.abs(moved) >= GAIN_REF_JUMP_LINES) gf = { ...gf, pdd: gf.pdd + moved * moved };
+    const ph0 = gf.pdd + u * gf.pdg;
+    const ph1 = gf.pdg + u * gf.pgg;
+    const s = ph0 + u * ph1 + this.sigmaLines ** 2;
+    if (!(s > 0) || !Number.isFinite(r) || !Number.isFinite(u)) return;
+    const lim = GAIN_MAX_INNOVATION_SD * Math.sqrt(s);
+    const e = clamp(r - (gf.d + gf.g * u), -lim, lim);
+    const k0 = ph0 / s;
+    const k1 = ph1 / s;
+    this.gainFilter = {
+      d: gf.d + k0 * e,
+      g: gf.g + k1 * e,
+      pdd: gf.pdd - k0 * ph0,
+      pdg: gf.pdg - k0 * ph1,
+      pgg: gf.pgg - k1 * ph1,
+      ref: Number.isFinite(drift) ? drift : gf.ref,
+    };
+    this.applyGain(clamp(this.gainFilter.g, -MAX_GAIN, MAX_GAIN), u);
+  }
+
+  /**
+   * The line model takes the gain `next`, keeping what every (line, drift) hypothesis predicts at its
+   * own line (drift' = drift − Δgain × u): only lines further away see the change. Small changes
+   * wait until they add up. `uRef`: where the gain filter's reference drift was taken (it moves too).
+   */
+  private applyGain(next: number, uRef: number): void {
+    const delta = next - this.gain;
+    const layout = this.layout;
+    const m = this.states.length;
+    const D = this.grid.length;
+    if (!layout || m === 0 || D < 2) {
+      this.gain = next;
+      return;
+    }
+    const u = this.states.map((i) => this.centreLines(layout.lines[i]!));
+    let maxU = 0;
+    for (const v of u) maxU = Math.max(maxU, Math.abs(v));
+    if (!(Math.abs(delta) * maxU >= GAIN_APPLY_MIN_LINES)) return;
+    const step = this.grid[1]! - this.grid[0]!;
+    const out = new Float64Array(this.joint.length);
+    for (let k = 0; k < m; k++) shiftRow(this.joint, out, k * D, D, (-delta * u[k]!) / step);
+    this.joint = out;
+    this.gain = next;
+    this.gainFilter = { ...this.gainFilter, ref: this.gainFilter.ref - delta * uRef };
+    this.summarize();
   }
 
   private clearPrevFix(): void {
@@ -794,6 +1020,8 @@ export class LineTracker {
       driftLo: this.driftLo,
       driftHi: this.driftHi,
       driftSdLines: this.driftSdLines,
+      gainFilter: this.gainFilter,
+      gain: this.gain,
       sigmaLines: this.sigmaLines,
       residVar: this.residVar,
       fixCount: this.fixCount,
@@ -814,6 +1042,8 @@ export class LineTracker {
     this.driftLo = s.driftLo;
     this.driftHi = s.driftHi;
     this.driftSdLines = s.driftSdLines;
+    this.gainFilter = s.gainFilter;
+    this.gain = s.gain;
     this.sigmaLines = s.sigmaLines;
     this.residVar = s.residVar;
     this.fixCount = s.fixCount;
@@ -845,6 +1075,8 @@ export class LineTracker {
     }
     this.driftBelief = mixWithUniform(this.driftBelief, APPEARANCE_KEEP_DRIFT);
     this.joint = this.seed(lineW);
+    // The gain filter's offset may have jumped too; the gain (the head's distance) stays.
+    this.gainFilter = { ...this.gainFilter, pdd: this.gainFilter.pdd + GAIN_OFFSET_JUMP_SD ** 2 };
     if (this.prevFix) this.dyUntrusted = true;
     this.glance = null;
     this.summarize();
@@ -905,9 +1137,9 @@ export class LineTracker {
     const first = lines[this.states[0]!]!;
     const last = lines[this.states[this.states.length - 1]!]!;
     // Off the text for every drift still believed possible: above the text even with the lowest
-    // plausible drift, or below it even with the highest.
-    if (f.y - this.driftLo * pitch < first.centerY - EXCURSION_LINES * pitch) return true;
-    if (f.y - this.driftHi * pitch > last.centerY + EXCURSION_LINES * pitch) return true;
+    // plausible drift, or below it even with the highest (each at that line's gain offset).
+    if (f.y - (this.driftLo + this.gain * this.centreLines(first)) * pitch < first.centerY - EXCURSION_LINES * pitch) return true;
+    if (f.y - (this.driftHi + this.gain * this.centreLines(last)) * pitch > last.centerY + EXCURSION_LINES * pitch) return true;
     const c = this.column;
     const margin = EXCURSION_COLUMN * Math.max(c.right - c.left, pitch);
     return f.x < c.left - margin || f.x > c.right + margin;
@@ -916,6 +1148,14 @@ export class LineTracker {
   /** A confident fixation's residual is fit to learn σ from (not a glance past the first/last line). */
   private plausible(e: number, best: number): boolean {
     if (!(Math.abs(e) <= LEARN_MAX_RESIDUAL_LINES)) return false;
+    return this.plausibleAtEdge(e, best);
+  }
+
+  /**
+   * Not past the first or last line by more than half a line (drift-corrected residual `e`): the
+   * edges absorb, so a tracker ahead of the reader sits on the last line while the gaze runs on below it.
+   */
+  private plausibleAtEdge(e: number, best: number): boolean {
     if (best === this.states[this.states.length - 1] && e > 0.5) return false;
     if (best === this.states[0] && e < -0.5) return false;
     return true;
@@ -963,7 +1203,7 @@ export class LineTracker {
       for (let k = 0; k < m; k++) out[k * D + b] = out[k * D + b]! + next[k]!;
     }
     // Drift random walk (+ a small chance of a sudden shift), row by row.
-    const walk = this.walk;
+    const walk = this.walkKernel();
     const r = (walk.length - 1) / 2;
     const row = new Float64Array(D);
     for (let k = 0; k < m; k++) {
@@ -1029,7 +1269,7 @@ export class LineTracker {
       }
       if (w > 0) {
         const mu = s / w;
-        this.driftY = mu * this.pitch();
+        this.driftY = (mu + this.gainAt(best)) * this.pitch();
         this.driftSdLines = Math.sqrt(Math.max(0, s2 / w - mu * mu));
       }
     }
@@ -1067,6 +1307,7 @@ export class LineTracker {
   private publish(t: number): TrackedLineEstimate {
     const best = argmax(this.post);
     const pitch = this.pitch();
+    const g = this.gainAt(best);
     this.est = {
       t,
       lineIndex: best,
@@ -1078,9 +1319,10 @@ export class LineTracker {
       fixationsOnPage: this.fixCount,
       sigmaYPx: this.sigmaYPx,
       excursions: this.excursions,
-      driftLowY: this.driftLo * pitch,
-      driftHighY: this.driftHi * pitch,
+      driftLowY: (this.driftLo + g) * pitch,
+      driftHighY: (this.driftHi + g) * pitch,
       driftSdY: Number.isFinite(this.driftSdLines) ? this.driftSdLines * pitch : NaN,
+      gain: this.gain,
     };
     return this.est;
   }
@@ -1160,6 +1402,21 @@ function mixWithUniform(belief: Float64Array, keep: number): Float64Array {
   const k = z > 0 ? clamp01(keep) : 0;
   for (let b = 0; b < D; b++) out[b] = (z > 0 ? (k * Math.max(0, belief[b]!)) / z : 0) + (1 - k) / D;
   return out;
+}
+
+/** Row `src[off … off + D)` moved by `s` bins (fractional: split between neighbours) into `out`; mass past the ends piles up there. */
+function shiftRow(src: Float64Array, out: Float64Array, off: number, D: number, s: number): void {
+  for (let b = 0; b < D; b++) {
+    const v = src[off + b]!;
+    if (v === 0) continue;
+    const p = b + s;
+    const lo = Math.floor(p);
+    const frac = p - lo;
+    const i0 = off + clamp(lo, 0, D - 1);
+    const i1 = off + clamp(lo + 1, 0, D - 1);
+    out[i0] = out[i0]! + v * (1 - frac);
+    out[i1] = out[i1]! + v * frac;
+  }
 }
 
 /** Normalized Gaussian kernel with σ in bins (a delta for σ ≈ 0), truncated at 3σ. */

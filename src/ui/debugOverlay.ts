@@ -31,7 +31,8 @@ import { pageEndZones } from '../reading/pageEndDetector';
  *
  * With a tracked estimate (TrackedLineEstimate) it also shows the drift belief:
  * the 2–98 % range of vertical offsets the line tracker still allows, as a
- * bracket around the drift-corrected gaze and in the panel.
+ * bracket around the drift-corrected gaze and in the panel (with the learned
+ * vertical gain).
  *
  * Draws only while visible, at most once per animation frame, on a canvas
  * backed at devicePixelRatio. Never intercepts the pointer.
@@ -601,7 +602,9 @@ export class DebugOverlay implements Mountable {
       if (range) {
         const inLines = (v: number): string => (pitch > 0 ? signed(v / pitch, 2) : '–');
         const sd = Number.isFinite(range.sd) && pitch > 0 ? `  sd ${(range.sd / pitch).toFixed(2)}` : '';
-        out.push(`drift belief ${inLines(range.low)}…${inLines(range.high)} ln${sd}`);
+        const g = isTrackedLineEstimate(e) ? e.gain : undefined;
+        const gain = g !== undefined && Number.isFinite(g) ? `  gain ${signed(g, 2)}` : '';
+        out.push(`drift belief ${inLines(range.low)}…${inLines(range.high)} ln${sd}${gain}`);
       }
       const away = isTrackedLineEstimate(e) ? `  off-text ${e.excursions}` : '';
       out.push(`fixations on page ${e.fixationsOnPage}${away}`);
