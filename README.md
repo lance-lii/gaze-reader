@@ -211,8 +211,9 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
 ```
 
 1. **Eye features.** For each video frame, the app measures where the centre of each iris (the
-   mean of MediaPipe's five iris points) sits relative to the eye corners. It adds head pose and
-   the model's "look up/down/in/out" blendshape scores. Lid aperture and blink scores are still
+   mean of MediaPipe's five iris points) sits relative to the eye corners. It adds head tilt and
+   position and the model's "look up/down/in/out" blendshape scores. Head turns need no extra
+   input: the iris-to-corner measure already includes them. Lid aperture and blink scores are still
    measured, for blink detection and to notice squinting, but the gaze model ignores them: light
    moves the lids. Blinks, and frames where the eyes are closed, are dropped.
 2. **Calibration** fits a ridge regression from those features to screen coordinates, with a few
@@ -367,9 +368,10 @@ docs/ARCHITECTURE.md        Module contracts and design notes
   the iris moves the iris-based gaze more than it moved 1.0's lid-based gaze. The lighting and
   eyelid thresholds were tuned on simulations and a synthetic face, not yet on many real webcams:
   diagnostics recordings (see [Lighting](#lighting)) are the way to check them.
-- **Posture drift.** Calibration assumes you sit roughly as you did while calibrating. The model
-  compensates for window moves and learns slow vertical drift, but after a big change in posture
-  it's best to recalibrate. The web app doesn't compensate for page zoom, fullscreen or toolbar
+- **Posture drift.** Calibration assumes you sit roughly as you did while calibrating. Turning or
+  tilting your head moves the gaze about a line per 4° (in simulation), and leaning 6 cm in or
+  back about a line; the reading model learns that kind of offset as you read. The model also
+  compensates for window moves, but after a big change in posture it's best to recalibrate. The web app doesn't compensate for page zoom, fullscreen or toolbar
   changes; it notices them and offers a quick 5-dot refresh instead (the extension compensates for
   zoom).
 - **Not validated at scale.** The page-end rules were tuned against a simulated reader with noise,

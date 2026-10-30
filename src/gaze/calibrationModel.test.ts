@@ -634,17 +634,17 @@ describe('gaze-excluded features (the lids)', () => {
     expect(custom.diagnostics.excludedFeatures).toEqual([2]);
   });
 
-  it('covers exactly the lid-driven entries of FEATURE_NAMES, never the 5-point iris, eyeLook or posture', () => {
+  it('covers exactly the lid-driven entries of FEATURE_NAMES and head yaw/pitch, never the 5-point iris, eyeLook, roll or head position', () => {
     const all: readonly string[] = FEATURE_NAMES;
     for (const name of GAZE_EXCLUDED_FEATURES) expect(all).toContain(name);
     expect([...GAZE_EXCLUDED_FEATURES].sort()).toEqual(
-      ['eyeBlinkLeft', 'eyeBlinkRight', 'rightOpen', 'leftOpen', 'rightLidY', 'leftLidY', 'rightV', 'leftV', 'meanV', 'rightU', 'leftU', 'meanU'].sort(),
+      ['eyeBlinkLeft', 'eyeBlinkRight', 'rightOpen', 'leftOpen', 'rightLidY', 'leftLidY', 'rightV', 'leftV', 'meanV', 'rightU', 'leftU', 'meanU', 'yaw', 'pitch'].sort(),
     );
     const used = FEATURE_NAMES.filter((n) => !GAZE_EXCLUDED_FEATURES.has(n));
     expect(used).toEqual(
-      expect.arrayContaining(['rightU5', 'rightVc5', 'leftU5', 'leftVc5', 'meanU5', 'meanVc5', 'eyeLookUpLeft', 'eyeLookDownRight', 'eyeLookInLeft', 'eyeLookOutRight', 'yaw', 'pitch', 'ty', 'faceScale']),
+      expect.arrayContaining(['rightU5', 'rightVc5', 'leftU5', 'leftVc5', 'meanU5', 'meanVc5', 'eyeLookUpLeft', 'eyeLookDownRight', 'eyeLookInLeft', 'eyeLookOutRight', 'roll', 'tx', 'ty', 'tz', 'faceScale']),
     );
-    expect(used).toHaveLength(21);
+    expect(used).toHaveLength(19);
   });
 });
 

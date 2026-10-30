@@ -3,6 +3,24 @@
 All notable changes to Gaze Reader are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+Steadier tracking. Readers found the tracker "very buggy": the gaze dot trembled, the reading
+position sat a line or two off after shifting in the chair, and page turns came early or late.
+
+### Web app and extension
+
+- **Head turns no longer throw the gaze off.** The calibration used to read head turn and tilt as
+  extra gaze cues, but during calibration the head barely moves, so what it learned was mostly
+  noise. Sitting with your chin 4° lower then moved the gaze 1.5–2.3 lines in simulation, and a 4°
+  turn 70–120 px sideways. The iris-to-corner measure already includes where the head points, so
+  the model now leaves head turn and tilt out: the same chin drop moves it 0.9–1.4 lines, the turn
+  about 43 px, and calibration accuracy is as good or better. Recalibrate once to get it (older
+  calibrations keep working as before).
+- **A steadier gaze dot.** The dot now rests on the word you're reading instead of trembling around
+  it, and still hops along with your eyes. This changes only what you see; page turning works as
+  before.
+
 ## 1.1.0 (unreleased, 2026-09-25)
 
 Lighting robustness. Beta readers found that "if there's light then it sometimes offsets where

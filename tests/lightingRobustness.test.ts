@@ -10,15 +10,33 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  GAZE_EXCLUDED_FEATURES,
   GAZE_MODEL_KIND,
   calibrationUpgradeNeeded,
   deserializeGazeModel,
   measureOffset,
   refineGazeModel,
+  trainGazeModel,
 } from '../src/gaze/calibrationModel';
 import { FEATURE_NAMES } from '../src/gaze/features';
 import type { LightingSignature } from '../src/types';
-import { QUICK_TARGETS, READING_POINTS, VIEW, WORLDS, calibrationSession, pairedReadingFrames, type WorldName } from '../bench/lighting/faceSim';
+import {
+  BASE_POSE,
+  DEG,
+  QUICK_TARGETS,
+  READING_POINTS,
+  VIEW,
+  WORLDS,
+  calibrationSession,
+  frameFeatures,
+  gauss,
+  headFollow,
+  makeFrame,
+  pairedReadingFrames,
+  rng,
+  type Pose,
+  type WorldName,
+} from '../bench/lighting/faceSim';
 import { LINE_PX, NEW_CONFIG, OLD_CONFIG, mean, measureShift, trainConfig } from '../bench/lighting/harness';
 
 const SEEDS = [1, 2, 3];
@@ -145,5 +163,71 @@ describe('calibration environment', () => {
     const after = measureOffset(refreshed, reading, { maxBlink: 0.85 });
     expect(Math.abs(after.offsetYPx)).toBeLessThan(Math.max(10, Math.abs(before.offsetYPx)));
     expect(Math.abs(after.offsetYPx) / LINE_PX).toBeLessThan(0.75);
+  });
+});
+
+/**
+ * Posture after calibration (the scoreboard is bench/lighting/posture.bench.test.ts). Head yaw and
+ * pitch are not gaze features: the corner-referenced iris already measures gaze relative to the
+ * camera, and weights fitted to calibration's tiny head movements turned a reader's 4° chin drop
+ * into 1.6–2.3 lines of offset.
+ */
+describe('posture robustness of the gaze model', () => {
+  // Calibrations vary a lot here (with yaw/pitch, 4 of 24 W1 calibrations happen to compensate a
+  // chin drop better), so the guard averages over 8.
+  const POSTURE_SEEDS = [1, 2, 3, 4, 5, 6, 7, 8];
+  /** Mean over calibrations of |that calibration's mean shift| on the reading grid (each reader has one calibration). */
+  const shift = (excluded: readonly string[], world: WorldName, delta: Partial<Pose>): { dx: number; dy: number } => {
+    const noise = WORLDS[world].noise;
+    const dx: number[] = [];
+    const dy: number[] = [];
+    for (const seed of POSTURE_SEEDS) {
+      const { model } = trainGazeModel(calibrationSession(seed, { noise }), {
+        viewport: { ...VIEW },
+        maxBlink: 0.85,
+        featureNames: FEATURE_NAMES,
+        excludedFeatures: excluded,
+      });
+      const r = rng(seed * 101);
+      const sx: number[] = [];
+      const sy: number[] = [];
+      for (const target of READING_POINTS) {
+        for (let i = 0; i < 2; i++) {
+          const f = frameFeatures(makeFrame(target, headFollow(target, { ...BASE_POSE, ...delta }), { h: 0.1 * DEG * gauss(r), v: 0.1 * DEG * gauss(r) }, {}, r, noise));
+          const p = f && model.predictScreenFromVector(f.vector);
+          if (!p) continue;
+          sx.push(p.x - target.x);
+          sy.push(p.y - target.y);
+        }
+      }
+      dx.push(Math.abs(mean(sx)));
+      dy.push(Math.abs(mean(sy)) / LINE_PX);
+    }
+    return { dx: mean(dx), dy: mean(dy) };
+  };
+  const withHeadRotation = [...GAZE_EXCLUDED_FEATURES].filter((n) => n !== 'yaw' && n !== 'pitch');
+
+  it('excludes head yaw and pitch from the gaze, and keeps roll and head position', () => {
+    expect(GAZE_EXCLUDED_FEATURES.has('yaw')).toBe(true);
+    expect(GAZE_EXCLUDED_FEATURES.has('pitch')).toBe(true);
+    for (const name of ['roll', 'tx', 'ty', 'tz', 'faceScale']) expect(GAZE_EXCLUDED_FEATURES.has(name)).toBe(false);
+  });
+
+  it('a 4° chin drop after calibration moves the gaze at most 1.35 lines (1.6+ with yaw/pitch as features)', () => {
+    for (const world of ['W1', 'W3'] as const) {
+      const now = shift([...GAZE_EXCLUDED_FEATURES], world, { pitch: 8 * DEG });
+      const before = shift(withHeadRotation, world, { pitch: 8 * DEG });
+      expect(now.dy, world).toBeLessThanOrEqual(1.35);
+      expect(before.dy, `${world} with yaw/pitch`).toBeGreaterThan(now.dy + 0.3);
+    }
+  });
+
+  it('a 4° head turn moves the gaze at most 60 px sideways (70+ with yaw/pitch as features)', () => {
+    for (const world of ['W1', 'W3'] as const) {
+      const now = shift([...GAZE_EXCLUDED_FEATURES], world, { yaw: 4 * DEG });
+      const before = shift(withHeadRotation, world, { yaw: 4 * DEG });
+      expect(now.dx, world).toBeLessThanOrEqual(60);
+      expect(before.dx, `${world} with yaw/pitch`).toBeGreaterThan(now.dx + 15);
+    }
   });
 });
