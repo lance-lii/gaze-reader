@@ -20,6 +20,15 @@ position sat a line or two off after shifting in the chair, and page turns came 
 - **A steadier gaze dot.** The dot now rests on the word you're reading instead of trembling around
   it, and still hops along with your eyes. This changes only what you see; page turning works as
   before.
+- **Fewer wrong-line page turns on long paragraphs.** Sitting nearer or further back than at
+  calibration stretches the gaze about the middle of the screen: the top reads high and the bottom
+  low. The reading layer had to chase that with a fast-moving offset, and a fast-moving offset let
+  it settle a line or more away from you on pages with no paragraph breaks. It now learns the
+  stretch on its own as you read, so the offset can move half as fast. In simulation, long
+  gapless paragraphs keep 93.5 % of fixations on the right line instead of 84 %, with no early
+  or missed turn; single-paragraph pages 83 % instead of 69 %; and on web articles (the extension)
+  a 15 % stretch costs no turn and keeps 94–98 % on the line. Not yet fixed: if gaze reads 2–3 lines low from the start, the first page of a
+  long paragraph still often turns early. The debug overlay shows the learned stretch ("gain").
 
 ## 1.1.0 (unreleased, 2026-09-25)
 
