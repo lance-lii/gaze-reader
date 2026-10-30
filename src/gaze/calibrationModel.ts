@@ -115,6 +115,16 @@ const POSTURE_FEATURES: ReadonlySet<string> = new Set<FeatureName>(['yaw', 'pitc
  * - rightV/leftV/meanV: iris measured from the lid midpoint, so a lid move shifts them 3× more
  *   than gaze does.
  * - rightU/leftU/meanU: the single-point iris; superseded by the 5-point rightU5/leftU5/meanU5.
+ * - yaw/pitch: head rotation. The eye corners sit close to the eyeball's centre of rotation in
+ *   depth, so the corner-referenced iris already measures where the eyes point relative to the
+ *   camera, head turn included. During calibration the head barely turns (tenths of a degree), so
+ *   the weights fitted to yaw and pitch were mostly noise, and a reader who later sat with their
+ *   chin 4° lower read 1.5–2.3 lines low (bench/lighting/posture.bench.test.ts). Without them the
+ *   same 4° moves the gaze 1.0–1.4 lines (and a 4° turn 43 px instead of 70–120 px), and the
+ *   cross-validated calibration error is equal or better in every world. Roll stays: the features
+ *   are measured in a face-aligned frame, which rolls with the head. Head translation (tx, ty, tz,
+ *   faceScale) stays too: leaning in or back changes the angle to the screen, and those weights
+ *   halve the shift it causes.
  */
 export const GAZE_EXCLUDED_FEATURES: ReadonlySet<string> = new Set<FeatureName>([
   'eyeBlinkLeft',
@@ -129,6 +139,8 @@ export const GAZE_EXCLUDED_FEATURES: ReadonlySet<string> = new Set<FeatureName>(
   'rightU',
   'leftU',
   'meanU',
+  'yaw',
+  'pitch',
 ]);
 const MAD_TO_SD = 1.4826;
 /** Leys et al. (2013) call 2.5 robust SDs "moderately conservative" — our default. */

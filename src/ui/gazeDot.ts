@@ -14,6 +14,9 @@ import { PINNED_MIN_PROBABILITY } from '../app/logic';
  * webcam gaze can sit lines away from the text; the tracker corrects for that,
  * and a dot at the uncorrected position would contradict the page turns the
  * reader sees. The debug overlay still shows the raw signal.
+ *
+ * On top of that, a DotStabilizer keeps the dot still through fixational jitter and lets saccades
+ * through, so the dot rests on the word being read instead of trembling around it.
  */
 
 export interface GazeDotOptions {
@@ -21,6 +24,8 @@ export interface GazeDotOptions {
   getSettings: () => AppSettings;
   /** Subtract the line tracker's drift (default true). */
   correctDrift?: boolean;
+  /** Hold the dot still through fixational jitter (DotStabilizer; default true). */
+  stabilize?: boolean;
 }
 
 /**
@@ -72,6 +77,83 @@ export class DriftCorrection {
   }
 }
 
+export interface DotStabilizerOptions {
+  /** Moves up to this far from the dot are followed slowly (fixational jitter), px. */
+  holdPx: number;
+  /** Moves this far or further are followed almost at once (a saccade), px. */
+  jumpPx: number;
+  /** Time constants for the two ends; in between they blend geometrically, ms. */
+  slowMs: number;
+  fastMs: number;
+  /** After a saccade the dot keeps following fast this long, so it lands instead of creeping the last few px, ms. */
+  landMs: number;
+  /** A gap longer than this (invalid gaze, hidden dot) starts over at the next sample, ms. */
+  resetAfterMs: number;
+}
+
+/**
+ * A reading saccade is 7–9 characters (≈ 80–100 px at the default 22 px text), so `jumpPx` lets it
+ * through at once; the smoothed webcam gaze still wobbles by ≈ 20–40 px while the eyes rest on a
+ * word, which stays inside `holdPx`.
+ */
+export const DEFAULT_DOT_STABILIZER: Readonly<DotStabilizerOptions> = Object.freeze({
+  holdPx: 30,
+  jumpPx: 80,
+  slowMs: 300,
+  fastMs: 25,
+  landMs: 120,
+  resetAfterMs: 300,
+});
+
+/**
+ * Display-only steadiness for the dot. The gaze samples are already One Euro-smoothed, but webcam
+ * iris jitter still makes the dot tremble while the eyes rest on a word, which reads as "buggy"
+ * even when the tracking is fine. This follows small moves slowly and large ones (saccades) almost
+ * at once, so the dot sits still on a word and hops with the eyes. Nothing in the reading layer
+ * sees it.
+ */
+export class DotStabilizer {
+  private readonly opts: DotStabilizerOptions;
+  private x = Number.NaN;
+  private y = Number.NaN;
+  private t = Number.NEGATIVE_INFINITY;
+  private fastUntil = Number.NEGATIVE_INFINITY;
+
+  constructor(opts: Partial<DotStabilizerOptions> = {}) {
+    this.opts = { ...DEFAULT_DOT_STABILIZER, ...opts };
+  }
+
+  update(x: number, y: number, t: number): { x: number; y: number } {
+    const { holdPx, jumpPx, slowMs, fastMs, landMs, resetAfterMs } = this.opts;
+    const dt = t - this.t;
+    // No usable clock (a first sample, a gap, time standing still or running backwards): show it as is.
+    if (!Number.isFinite(this.x) || !Number.isFinite(this.y) || !(dt > 0) || dt > resetAfterMs) {
+      this.x = x;
+      this.y = y;
+      this.t = t;
+      this.fastUntil = Number.NEGATIVE_INFINITY;
+      return { x, y };
+    }
+    const d = Math.hypot(x - this.x, y - this.y);
+    let k = jumpPx > holdPx ? Math.min(1, Math.max(0, (d - holdPx) / (jumpPx - holdPx))) : d > holdPx ? 1 : 0;
+    if (k >= 1) this.fastUntil = t + landMs;
+    else if (t < this.fastUntil) k = 1;
+    const tau = slowMs * (fastMs / slowMs) ** k;
+    const a = 1 - Math.exp(-dt / tau);
+    this.x += a * (x - this.x);
+    this.y += a * (y - this.y);
+    this.t = t;
+    return { x: this.x, y: this.y };
+  }
+
+  reset(): void {
+    this.x = Number.NaN;
+    this.y = Number.NaN;
+    this.t = Number.NEGATIVE_INFINITY;
+    this.fastUntil = Number.NEGATIVE_INFINITY;
+  }
+}
+
 const P = CSS_PREFIX;
 const SIZE = 18;
 const HALF = SIZE / 2;
@@ -113,6 +195,7 @@ export class GazeDot implements Mountable {
   private settingVisible: boolean;
   private latest: GazeSample | null = null;
   private readonly drift: DriftCorrection | null;
+  private readonly stabilizer: DotStabilizer | null;
   private raf: number | null = null;
   private destroyed = false;
   /**
@@ -129,6 +212,7 @@ export class GazeDot implements Mountable {
     this.getSettings = opts.getSettings;
     this.settingVisible = readFlag(opts.getSettings);
     this.drift = opts.correctDrift === false ? null : new DriftCorrection();
+    this.stabilizer = opts.stabilize === false ? null : new DotStabilizer();
   }
 
   /** Whether the dot layer is currently shown (setting on and not hidden by the host). */
@@ -157,7 +241,10 @@ export class GazeDot implements Mountable {
         this.bus.on('line-estimate', (e) => this.drift?.noteEstimate(e)),
         // A new calibration starts the reading layer's drift over.
         this.bus.on('calibration', ({ phase }) => {
-          if (phase === 'start') this.drift?.reset();
+          if (phase === 'start') {
+            this.drift?.reset();
+            this.stabilizer?.reset();
+          }
         }),
         this.bus.on('settings-changed', ({ settings, changed }) => {
           if (changed.includes('showGazeDot')) {
@@ -205,7 +292,13 @@ export class GazeDot implements Mountable {
   }
 
   private onGaze(s: GazeSample): void {
-    this.latest = this.drift ? this.drift.correct(s) : s;
+    const c = this.drift ? this.drift.correct(s) : s;
+    if (this.stabilizer && c.valid && Number.isFinite(c.x) && Number.isFinite(c.y)) {
+      const p = this.stabilizer.update(c.x, c.y, c.t);
+      this.latest = { ...c, x: p.x, y: p.y };
+    } else {
+      this.latest = c;
+    }
     this.schedule();
   }
 

@@ -4,7 +4,7 @@ import type { GazeSample, LineEstimate } from '../types';
 import { createEventBus } from '../core/events';
 import { createSettingsStore } from '../core/settings';
 import { IGNORE_ATTR } from '../core/constants';
-import { DriftCorrection, GazeDot } from './gazeDot';
+import { DotStabilizer, DriftCorrection, GazeDot } from './gazeDot';
 
 /** Manual animation frames: the test decides when a frame happens. */
 function manualFrames() {
@@ -260,3 +260,77 @@ describe('DriftCorrection', () => {
   });
 });
 
+
+describe('DotStabilizer', () => {
+  /** Deterministic jitter: a sum of incommensurate sines, ±`amp` px. */
+  const jitter = (i: number, amp: number): number => amp * (0.6 * Math.sin(i * 1.7) + 0.4 * Math.sin(i * 0.53 + 1));
+  const sd = (a: readonly number[]): number => {
+    const m = a.reduce((p, q) => p + q, 0) / a.length;
+    return Math.sqrt(a.reduce((p, q) => p + (q - m) ** 2, 0) / a.length);
+  };
+
+  it('holds still through fixational jitter: several times steadier than its input', () => {
+    const s = new DotStabilizer();
+    const inX: number[] = [];
+    const outX: number[] = [];
+    const outY: number[] = [];
+    for (let i = 0; i < 60; i++) {
+      const x = 400 + jitter(i, 25);
+      const y = 300 + jitter(i + 17, 25);
+      const p = s.update(x, y, i * 33);
+      if (i >= 15) {
+        inX.push(x);
+        outX.push(p.x);
+        outY.push(p.y);
+      }
+    }
+    expect(sd(outX)).toBeLessThan(sd(inX) / 3);
+    expect(Math.abs(outX.reduce((p, q) => p + q, 0) / outX.length - 400)).toBeLessThan(6);
+    expect(Math.abs(outY.reduce((p, q) => p + q, 0) / outY.length - 300)).toBeLessThan(6);
+  });
+
+  it('lets a reading saccade through within a frame or two', () => {
+    const s = new DotStabilizer();
+    for (let i = 0; i < 10; i++) s.update(400, 300, i * 33);
+    const a = s.update(495, 300, 330); // one 95 px forward saccade
+    expect(a.x).toBeGreaterThan(460);
+    const b = s.update(495, 300, 363);
+    expect(b.x).toBeGreaterThan(480);
+  });
+
+  it('starts over after a gap, and shows the first sample (or a stalled clock) as is', () => {
+    const s = new DotStabilizer();
+    expect(s.update(100, 100, 0)).toEqual({ x: 100, y: 100 });
+    s.update(110, 100, 33);
+    expect(s.update(600, 500, 1000)).toEqual({ x: 600, y: 500 }); // after a blink or a look away
+    expect(s.update(620, 500, 1000)).toEqual({ x: 620, y: 500 }); // no time has passed
+    s.reset();
+    expect(s.update(5, 6, 1100)).toEqual({ x: 5, y: 6 });
+  });
+
+  it('steadies the dot itself, and can be switched off (stabilize: false)', () => {
+    const frames = manualFrames();
+    const run = (stabilize: boolean): number[] => {
+      const bus = createEventBus();
+      const store = createSettingsStore(bus, { persist: false, initial: { showGazeDot: true } });
+      const dot = new GazeDot({ bus, getSettings: store.get, correctDrift: false, stabilize });
+      const host = document.createElement('div');
+      document.body.appendChild(host);
+      dot.mount(host);
+      const el = host.querySelector<HTMLElement>('.gr-gaze-dot')!;
+      const xs: number[] = [];
+      for (let i = 0; i < 40; i++) {
+        const x = 300 + jitter(i, 25);
+        bus.emit('gaze', { t: i * 33, x, y: 300, rawX: x, rawY: 300, valid: true, confidence: 1, source: 'webcam' });
+        frames.flush();
+        const m = /translate3d\(([-\d.]+)px/.exec(el.style.transform);
+        if (i >= 10 && m) xs.push(Number(m[1]));
+      }
+      dot.destroy();
+      return xs;
+    };
+    expect(sd(run(true))).toBeLessThan(sd(run(false)) / 3);
+    vi.restoreAllMocks();
+    document.body.innerHTML = '';
+  });
+});

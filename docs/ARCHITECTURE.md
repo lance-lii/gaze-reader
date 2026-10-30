@@ -163,7 +163,8 @@ features are now corner-referenced iris features with a 5-point iris centre (mea
 (`rightU5, rightVc5, leftU5, leftVc5, meanU5, meanVc5`, appended to FEATURE_NAMES). The lid-driven
 or superseded features (`eyeBlinkLeft/Right, rightOpen, leftOpen, rightLidY, leftLidY, rightV,
 leftV, meanV, rightU, leftU, meanU`, `GAZE_EXCLUDED_FEATURES`) are still extracted (blink gating,
-the eyelid monitor, diagnostics) but get exactly zero weight. `eyeLook*` and head pose stay. A 10 %
+the eyelid monitor, diagnostics) but get exactly zero weight. `eyeLook*`, head roll and head position
+(`tx, ty, tz, faceScale`) stay; head yaw and pitch are excluded too (see *Head rotation* below). A 10 %
 squint now moves the gaze 0.2–1.1 lines with the simulator's default 60/40 lower/upper-lid split.
 When the upper lid alone drops (the typical light response above), it moves 0.5–2.8 lines (1.0:
 1.7–5.5). The residual comes from the `eyeLook*` scores' lid coupling, and the reading layer's
@@ -171,6 +172,19 @@ drift tracking and the accuracy check / quick refresh absorb it. Cross-validated
 is equal or better in every simulated world, but per-frame vertical spread rose in 4 of 5 (e.g. W1
 24.7 → 30.0 px) (bench/lighting). `EyeFeatures.squint` carries MediaPipe's eyeSquint score for the
 eyelid monitor, never the model.
+
+**Head rotation is not a gaze feature** (revised after 1.1). The eye corners sit close to the
+eyeball's centre of rotation in depth, so the corner-referenced iris vector in the image already
+measures where the eyes point relative to the camera, head turn included. During calibration the
+head turns only tenths of a degree, so ridge weights on yaw and pitch were fitted to noise, and a
+reader who later sat with their chin 4° lower read 1.5–2.3 lines low; a 4° turn moved the gaze
+70–122 px. `yaw` and `pitch` are therefore in `GAZE_EXCLUDED_FEATURES`: the same chin drop now
+moves the gaze 0.9–1.4 lines, the turn ≈ 43 px, and cross-validated calibration error is equal or
+better in all five worlds (bench/lighting/posture.bench.test.ts; guards in
+tests/lightingRobustness.test.ts). Roll stays (the features are measured in a face-aligned frame,
+which rolls with the head), and so does head position: leaning in or back changes the angle to the
+screen. Posture features enter linearly and stay clamped at ±6 calibration SDs; unclamped, the
+position weights extrapolate worse.
 
 MediaPipe 1.0.1 facts (verified in `node_modules/@mediapipe/tasks-vision/vision.d.ts`):
 `FilesetResolver.forVisionTasks(basePath)`, `FaceLandmarker.createFromOptions(fileset,
@@ -434,7 +448,11 @@ tinted by posterior, drift-corrected gaze marker, bottom-dwell/glance zones, and
 eyelid monitor's residual z, the last appearance change and accuracy check, last decision detail).
 Throttle drawing to rAF. Gaze dot: small, soft, semi-transparent circle following the smoothed gaze
 **minus the line tracker's drift** (what the reader sees matches the reading layer; hidden when
-invalid). Dewey's eyes get the same drift-corrected gaze (the app hands his Buddy a bus view,
+invalid), through a display-only `DotStabilizer`: moves within 30 px of the dot (fixational jitter
+of the webcam gaze) are followed with a 300 ms time constant, moves of 80 px or more (a reading
+saccade) with 25 ms and for 120 ms after, so the dot rests on the word and hops with the eyes. The
+reading layer never sees it (a heavier One Euro filter in the pipeline was tried and costs missed
+turns: minCutoff 0.3–0.6 Hz missed 28–42 of 168 turns at noise 1.6 vs 10). Dewey's eyes get the same drift-corrected gaze (the app hands his Buddy a bus view,
 `correctedGazeBus`, whose 'gaze' listeners receive corrected samples).
 
 ### D · Reader — `src/reader/{sanitize,bookLoader,epub,pdf,library,readerView,lineGeometry,scrollController}.ts`
@@ -642,8 +660,8 @@ boundaries:
 
 * `TrackerError` lives in `camera.ts` (re-exported by `faceTracker.ts`). `FEATURE_NAMES` has 33
   entries (27 in 1.0, plus the six 5-point iris features) and is append-only; the 12 lid-driven or
-  superseded ones are extracted but excluded from the gaze model (see *Vertical gaze must not come
-  from the lids*). Blinks are gated over time by `BlinkGate` (`webcamGazeSource.ts`):
+  superseded ones, and head yaw and pitch, are extracted but excluded from the gaze model (see
+  *Vertical gaze must not come from the lids* and *Head rotation is not a gaze feature*). Blinks are gated over time by `BlinkGate` (`webcamGazeSource.ts`):
   a short high score, or a collapsed lid aperture, is a blink. Sustained moderate scores are
   lowered lids from reading low on the screen, and they stay valid. Calibration uses the same
   gate and passes `maxBlink = 0.85` to training, so the bottom rows are learned rather than
