@@ -378,6 +378,60 @@ describe('CalibrationOverlay — standard flow', () => {
     overlay.destroy();
   });
 
+  describe('starts the dots over when the viewport changes (regression: old and new positions mixed)', () => {
+    const setWindow = (o: { width?: number; height?: number; dpr?: number; screenX?: number }): void => {
+      const define = (name: string, value: number) => Object.defineProperty(window, name, { configurable: true, value });
+      define('innerWidth', o.width ?? VW);
+      define('innerHeight', o.height ?? VH);
+      define('devicePixelRatio', o.dpr ?? 1);
+      define('screenX', o.screenX ?? 0);
+    };
+    afterEach(() => setWindow({}));
+
+    async function calibrateWith(change: () => void, when: 'targets' | 'validating') {
+      const ctx = setup();
+      const done = ctx.overlay.run();
+      await startCalibration(ctx);
+      const points = () => ctx.events.filter((e) => e.phase === 'point' && e.message === undefined).map((e) => e.index);
+      if (when === 'targets') await advanceUntil(() => points().length >= 4, 60_000, 50);
+      else await advanceUntil(() => ctx.root.dataset.phase === 'validating', 120_000, 50);
+      change();
+      await advanceUntil(() => ctx.root.dataset.phase === 'results', 240_000, 250);
+      ctx.q<HTMLButtonElement>('[data-action="use"]').click();
+      const result = await done;
+      ctx.sim.stop();
+      ctx.overlay.destroy();
+      const seen = points();
+      const restart = seen.lastIndexOf(0);
+      return { result, before: seen.slice(0, restart), after: seen.slice(restart) };
+    }
+
+    it('a window moved to another screen (no event at all)', async () => {
+      const { before, after } = await calibrateWith(() => setWindow({ screenX: 1440 }), 'targets');
+      expect(before.length).toBeGreaterThanOrEqual(4);
+      expect(after).toEqual([...STANDARD_TARGETS.keys()]);
+    });
+
+    it('a resized window', async () => {
+      const { before, after, result } = await calibrateWith(() => {
+        setWindow({ width: 900 });
+        window.dispatchEvent(new Event('resize'));
+      }, 'targets');
+      expect(before.length).toBeGreaterThanOrEqual(4);
+      expect(after).toEqual([...STANDARD_TARGETS.keys()]);
+      expect(result?.model.viewport).toEqual({ width: 900, height: VH });
+    });
+
+    it('a zoom, even during the check dots after training', async () => {
+      const { before, after } = await calibrateWith(() => {
+        setWindow({ width: Math.round(VW / 1.1), height: Math.round(VH / 1.1), dpr: 1.1 });
+        window.dispatchEvent(new Event('resize'));
+      }, 'validating');
+      expect(before).toEqual([...STANDARD_TARGETS.keys()]); // the first pass was complete, and is discarded
+      expect(after).toEqual([...STANDARD_TARGETS.keys()]);
+    });
+  });
+
   it('stores the light and the eyelids of the calibration with the model', async () => {
     const ctx = setup();
     ctx.sim.reader.lighting = light({ side: 0.3 });
