@@ -14,12 +14,16 @@ import {
   loadBookFromUrl,
   markdownToHtml,
   matchChapterLine,
+  renderEmphasis,
   smartenPunctuation,
   stripGutenberg,
   tameShouting,
   textOfNode,
   titleFromFileName,
 } from './bookLoader';
+import { mulberry32 } from '../reading/simulatedReader';
+import story from '../../public/samples/dewey-and-the-midnight-library.md?raw';
+import guide from '../../public/samples/secret-life-of-reading-eyes.md?raw';
 
 // pdf.js itself isn't under test here: a stand-in shows whether a file was routed to the PDF parser.
 vi.mock('./pdf', () => ({
@@ -944,6 +948,34 @@ describe('long runs of spaces (regression: quadratic regexes froze the tab)', ()
     fast(() => markdownToHtml('# a' + spaces + 'b'));
     fast(() => markdownToHtml('a' + spaces + 'b'));
     fast(() => markdownToHtml('a' + spaces + 'b' + spaces + '\nc'));
+  });
+
+  it('renders a paragraph full of emphasis markers that never close quickly', () => {
+    for (const opener of ['***', '**', '__', '*', '_', '~~']) fast(() => markdownToHtml(`${opener}a `.repeat(30_000)));
+    // One closer at the very end: the first opener pairs with it, once.
+    fast(() => expect(markdownToHtml(`${'**a '.repeat(30_000)}b**`)).toMatch(/^<p><strong>a /));
+  });
+
+  it('renders emphasis exactly as the plain regexes did, on any input', () => {
+    // The chain renderEmphasis replaced, verbatim.
+    const plainRegexes = (s: string): string =>
+      s
+        .replace(/\*\*\*(?=\S)([\s\S]*?\S)\*\*\*/g, '<strong><em>$1</em></strong>')
+        .replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, '<strong>$1</strong>')
+        .replace(/(^|[^\p{L}\p{N}_])__(?=\S)([\s\S]*?\S)__(?![\p{L}\p{N}_])/gu, '$1<strong>$2</strong>')
+        .replace(/\*(?=[^\s*])([\s\S]*?[^\s*])\*/g, '<em>$1</em>')
+        .replace(/(^|[^\p{L}\p{N}_])_(?=[^\s_])([\s\S]*?[^\s_])_(?![\p{L}\p{N}_])/gu, '$1<em>$2</em>')
+        .replace(/~~(?=\S)([\s\S]*?\S)~~/g, '<s>$1</s>')
+        .replace(/\n/g, ' ');
+    const pieces = ['*', '**', '***', '_', '__', '~~', '~', 'a', 'é', '7', ' ', '\n', '.', '&amp;', '𝒜', '😀', ' '];
+    const rng = mulberry32(42);
+    for (let n = 0; n < 6000; n++) {
+      const length = n < 5000 ? Math.floor(rng() * 24) : 100 + Math.floor(rng() * 300);
+      let s = '';
+      for (let i = 0; i < length; i++) s += pieces[Math.floor(rng() * pieces.length)];
+      expect(renderEmphasis(s), JSON.stringify(s)).toBe(plainRegexes(s));
+    }
+    for (const paragraph of `${story}\n\n${guide}`.split(/\n\s*\n/)) expect(renderEmphasis(paragraph)).toBe(plainRegexes(paragraph));
   });
 
   it('loads Gutenberg text with a huge run of blank lines quickly', () => {
