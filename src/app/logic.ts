@@ -669,6 +669,16 @@ export function cameraErrorInfo(code: TrackerErrorCode): CameraErrorInfo {
   }
 }
 
+/** The camera stopped mid-session (froze, or its track ended) and restarting it once didn't help. */
+export function cameraStoppedInfo(): CameraErrorInfo {
+  return {
+    title: 'The camera stopped',
+    message: 'It stopped sending pictures: unplugged, switched off, or taken by another app. Try again, or read with your mouse for now.',
+    buddyLine: 'The camera went quiet on me. Shall we try again?',
+    retryable: true,
+  };
+}
+
 // ────────────────────────────── Calibration fit ─────────────────────────────
 
 /**
