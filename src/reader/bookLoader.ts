@@ -1,5 +1,5 @@
 import type { Book, BookFormat } from '../types';
-import { sanitizeToElement } from './sanitize';
+import { sanitizeToElement, textDirection } from './sanitize';
 
 // ───────────────────────────────── Errors ──────────────────────────────────
 
@@ -1300,7 +1300,12 @@ function parseHtmlDocument(
   const root = opts.mainContent ? extractMainContent(doc) : doc.body ?? doc.documentElement;
   stripBoilerplate(root);
   const container = sanitizeToElement(root, { baseUrl: opts.baseUrl });
-  return { title, author, drafts: splitIntoChapters(container) };
+  const drafts = splitIntoChapters(container);
+  // A right-to-left page declares its direction on <html>, <body> or the article, which the
+  // sanitizer never sees (it keeps their children). Left to right is the reader's own.
+  const dir = textDirection(root.closest('[dir]')?.getAttribute('dir'));
+  if (dir && dir !== 'ltr') for (const d of drafts) d.html = `<div dir="${dir}">${d.html}</div>`;
+  return { title, author, drafts };
 }
 
 // ───────────────────────────── Decoding & sniffing ─────────────────────────────

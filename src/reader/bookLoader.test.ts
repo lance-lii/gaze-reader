@@ -530,6 +530,15 @@ describe('HTML → Book', () => {
     expect(all).toContain('<a href="#gr-src-faq">FAQ</a>');
   });
 
+  it('keeps a right-to-left base direction declared on <html> or <body> (regression: rendered left to right)', () => {
+    const page = (htmlAttrs: string, bodyAttrs: string): string =>
+      `<!doctype html><html lang="he"${htmlAttrs}><head><title>ספר</title></head><body${bodyAttrs}><p>שלום עולם, זהו ספר ארוך מספיק כדי להיות תוכן של ממש.</p></body></html>`;
+    const dirOf = (html: string): string | null => fragment(html).querySelector('p')?.closest('[dir]')?.getAttribute('dir') ?? null;
+    expect(dirOf(loadBookFromText(page(' dir="rtl"', ''), { format: 'html' }).chapters[0]!.html)).toBe('rtl');
+    expect(dirOf(loadBookFromText(page('', ' dir="rtl"'), { format: 'html' }).chapters[0]!.html)).toBe('rtl');
+    expect(dirOf(loadBookFromText(page(' dir="ltr"', ''), { format: 'html' }).chapters[0]!.html)).toBeNull();
+  });
+
   it('uses a pasted fragment as is and splits it at repeated headings', () => {
     const b = loadBookFromText('<h2>One</h2><p>First part text.</p><h2>Two</h2><p>Second part text.</p>', { format: 'html' });
     expect(b.chapters.map((c) => c.title)).toEqual(['One', 'Two']);
