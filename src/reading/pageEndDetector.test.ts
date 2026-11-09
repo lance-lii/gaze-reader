@@ -420,6 +420,16 @@ describe('PageEndDetector', () => {
     expect(rig.run(3000, lookDown, unsure(L))).toBeNull();
   });
 
+  it('forgets the end of the last line on a scroll, so a look down right after a turn doesn\'t turn the next page too', () => {
+    const lookDown = { x: 500, y: viewport.bottom + 300 };
+    const unsure = estimate(L, { p: 0.4, fix: 30 });
+    const rig = new Rig();
+    rig.run(300, { x: xAt(L, 0.9), y: line(L).centerY }, unsure);
+    rig.det.notifyScrolled(rig.t); // the page turned (a key, the line tracker): a new last line
+    rig.run(200, { x: xAt(0, 0.1), y: line(0).centerY }, unsure); // a look at the top of the new page…
+    expect(rig.run(4000, lookDown, unsure)).toBeNull(); // …and straight down at the keyboard
+  });
+
   it('respects the cooldown after any scroll', () => {
     const rig = new Rig();
     rig.enter(L);
