@@ -4,9 +4,10 @@
  * jsdom can't do stubbed (layout measurement, the network, canvas, the camera).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AppEvents, AppSettings, EventBus, FeatureFrame, GazeModel, LightingSignature, LineLayout, PageEndDecision, TextLine } from '../types';
+import type { AppEvents, AppSettings, Book, EventBus, FeatureFrame, GazeModel, LightingSignature, LineLayout, PageEndDecision, TextLine } from '../types';
 import type { AccuracyCheckResult, CalibrationResult } from '../ui/calibrationOverlay';
 import { AppearanceMonitor } from '../gaze/appearance';
+import { GAZE_MODEL_KIND, GAZE_MODEL_VERSION, deserializeGazeModel } from '../gaze/calibrationModel';
 import { CameraFeatureSource } from '../gaze/faceTracker';
 import { LightingWatch, type LightingWatchUpdate } from '../gaze/lighting';
 import { LineTracker } from '../reading/lineTracker';
@@ -14,6 +15,8 @@ import { parseRecording } from './diagnostics';
 import { GuidanceGate, SustainedFlags } from './logic';
 import { FEATURE_NAMES } from '../gaze/features';
 import { MouseGazeSource } from '../gaze/mouseGazeSource';
+import { loadBookFromText } from '../reader/bookLoader';
+import { getBook, listBooks, saveBook, saveProgress } from '../reader/library';
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
 import { PageEndDetector } from '../reading/pageEndDetector';
@@ -142,6 +145,8 @@ function stubCamera() {
       for (const cb of [...listeners]) cb(f);
     },
     subscribers: () => listeners.size,
+    /** Whether the camera (light) is on. */
+    running: () => running,
   };
 }
 
@@ -205,6 +210,30 @@ describe('AppController', () => {
     moveMouse(420, 320);
     await sleep(120);
     expect(gaze.length).toBe(before);
+  });
+
+  it('re-importing a book that this version renders differently reopens its entry and position (regression: a duplicate)', async () => {
+    const text = 'A story about lamps, glasses and books. '.repeat(120);
+    // What an earlier version saved for the same text: the same source, a different rendering (and id).
+    const earlier = loadBookFromText(text, { source: 'paste' });
+    await saveBook({ ...earlier, id: 'earlier-render', chapters: [{ title: null, html: '<p>An earlier rendering of the story.</p>' }] });
+    await saveProgress({ bookId: 'earlier-render', fraction: 0.4, updatedAt: Date.now() });
+    const entries = (await listBooks()).length;
+    const opened = record(app, 'book-opened');
+    await openPastedText(text);
+    expect(opened.at(-1)).toMatchObject({ id: 'earlier-render', resumed: true });
+    expect((await listBooks()).length).toBe(entries);
+  });
+
+  it('keeps books saved before they had a source key, and adds the key when one is opened again', async () => {
+    const text = 'Notes on reading glasses and the light. '.repeat(120);
+    const legacy: Partial<Book> = loadBookFromText(text, { source: 'paste' });
+    delete legacy.sourceKey; // saved by a version without it
+    await saveBook(legacy as Book);
+    const entries = (await listBooks()).length;
+    await openPastedText(text);
+    expect((await listBooks()).length).toBe(entries);
+    expect((await getBook(legacy.id!))?.sourceKey).toBeTruthy();
   });
 
   describe('at the end of the book', () => {
@@ -530,6 +559,64 @@ describe('AppController', () => {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
     }
   });
+
+  describe('browser zoom (regression: one zoom step went unnoticed)', () => {
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+    /** Ctrl + / Ctrl − in Chrome and Firefox: the viewport shrinks or grows in CSS px and the pixel ratio follows. */
+    const zoomTo = (zoom: number): void => {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: Math.round(width / zoom) });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: Math.round(height / zoom) });
+      Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: zoom });
+    };
+    /** A real saved calibration (it records the pixel ratio it was made at): 100 % zoom, this window. */
+    const ridgeModel = (): GazeModel => {
+      const n = FEATURE_NAMES.length;
+      const model = deserializeGazeModel({
+        version: GAZE_MODEL_VERSION,
+        kind: GAZE_MODEL_KIND,
+        featureLength: n,
+        mean: new Array<number>(n).fill(0),
+        std: new Array<number>(n).fill(1),
+        quad: [],
+        expMean: new Array<number>(n).fill(0),
+        expStd: new Array<number>(n).fill(1),
+        wx: new Array<number>(n).fill(0),
+        bx: 500,
+        wy: new Array<number>(n).fill(0),
+        by: 400,
+        lambda: 1,
+        trainedAt: 1000,
+        viewport: { width, height },
+        origin: { x: 0, y: 0 },
+        chromeTop: null,
+        dprAtCalibration: 1,
+      });
+      if (!model) throw new Error('the test model did not deserialize');
+      return model;
+    };
+
+    afterEach(() => zoomTo(1));
+
+    it('offers the 5-dot refresh after a single zoom step while reading', async () => {
+      zoomTo(1);
+      await readWithWebcam(ridgeModel());
+      expect(overlays.modes).toEqual([]); // the calibration fits this window: no dots on opening
+      // 110 %: the viewport is 9 % smaller, inside the size check's tolerance, yet every prediction
+      // is now 10 % too far from the viewport's corner (about 2 lines at the bottom of the page).
+      zoomTo(1.1);
+      window.dispatchEvent(new Event('resize'));
+      await until(() => /Window size changed/.test(toastText()), 'the refresh suggestion');
+      expect(toastButton('Refresh now')).toBeDefined();
+    });
+
+    it('starts with the quick refresh when the page zoom differs from the calibration’s', async () => {
+      zoomTo(0.9);
+      overlays.run = () => Promise.resolve(null); // the reader skips it: reading goes on with the old model
+      await readWithWebcam(ridgeModel());
+      expect(overlays.modes).toEqual(['quick']);
+    });
+  });
   // ───────────────────────── Lighting, guidance, accuracy check, diagnostics ─────────────────────────
 
   const SIGNATURE: LightingSignature = {
@@ -597,6 +684,35 @@ describe('AppController', () => {
   };
 
   const toastButton = (label: string) => [...document.querySelectorAll<HTMLButtonElement>('.gr-toast__actions button')].find((b) => b.textContent === label);
+
+  it('webcam: the camera runs only while a book is open, never in the library (privacy)', async () => {
+    const { camera } = await readWithWebcam(calibratedModel(), { open: false });
+    await sleep(200);
+    expect(camera.running()).toBe(false);
+    await openPastedText();
+    await until(() => camera.running() && camera.subscribers() >= 2, 'the camera to run for the book');
+    app.bus.emit('command', { name: 'open-library' });
+    await until(() => document.documentElement.dataset.screen === 'library', 'the library');
+    expect(camera.running()).toBe(false);
+    expect(camera.subscribers()).toBe(0);
+  });
+
+  it('webcam: a tab hidden for a minute switches the camera off, and coming back switches it on (privacy)', async () => {
+    // A minute is long for a test: the controller's 60-s "hidden" timer runs at once.
+    const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, ms?: number) =>
+      realSetTimeout(handler, ms === 60_000 ? 20 : ms)) as unknown as typeof setTimeout);
+    const { camera } = await readWithWebcam(calibratedModel());
+    expect(camera.running()).toBe(true);
+    let hidden = true;
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await until(() => !camera.running(), 'the camera to stop');
+    expect(camera.subscribers()).toBe(0);
+    hidden = false;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await until(() => camera.running() && camera.subscribers() >= 2, 'the camera to come back');
+  });
 
   it('webcam: reports the light every second; a changed light re-learns the reading offset and offers a touch-up at a pause', async () => {
     let next: LightingWatchUpdate | null = null;

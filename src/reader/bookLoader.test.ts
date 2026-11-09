@@ -14,12 +14,16 @@ import {
   loadBookFromUrl,
   markdownToHtml,
   matchChapterLine,
+  renderEmphasis,
   smartenPunctuation,
   stripGutenberg,
   tameShouting,
   textOfNode,
   titleFromFileName,
 } from './bookLoader';
+import { mulberry32 } from '../reading/simulatedReader';
+import story from '../../public/samples/dewey-and-the-midnight-library.md?raw';
+import guide from '../../public/samples/secret-life-of-reading-eyes.md?raw';
 
 // pdf.js itself isn't under test here: a stand-in shows whether a file was routed to the PDF parser.
 vi.mock('./pdf', () => ({
@@ -450,6 +454,21 @@ describe('markdownToHtml', () => {
     expect(markdownToHtml('---\ntitle: X\nauthor: "Y"\n---\n\nBody')).toBe('<p>Body</p>');
     expect(markdownToHtml('---\n\nJust a rule.\n\n---\n')).toBe('<hr>\n<p>Just a rule.</p>\n<hr>');
   });
+
+  it('lets an ordered list interrupt a paragraph only when it starts at 1 (regression: a year at a line start split it)', () => {
+    // CommonMark example 304: hard-wrapped prose stays one paragraph.
+    expect(markdownToHtml('The war finally ended in\n1945. Then the long peace came.')).toBe('<p>The war finally ended in 1945. Then the long peace came.</p>');
+    expect(markdownToHtml('Steps:\n1. one\n2. two')).toBe('<p>Steps:</p>\n<ol><li>one</li><li>two</li></ol>');
+    expect(markdownToHtml('Bullets:\n- a')).toBe('<p>Bullets:</p>\n<ul><li>a</li></ul>');
+  });
+
+  it('opens a tilde fence whose info string has backticks (regression: the rest of the book became code)', () => {
+    const html = markdownToHtml('~~~ js `x`\ncode\n~~~\n\nAfter the code, the story goes on.');
+    expect(html).toContain('<pre><code>code</code></pre>');
+    expect(html).toContain('<p>After the code, the story goes on.</p>');
+    // After backticks the info string may not contain one (CommonMark): that is no fence.
+    expect(markdownToHtml('``` a`b\nnot code')).not.toContain('<pre>');
+  });
 });
 
 describe('Markdown → Book', () => {
@@ -530,6 +549,15 @@ describe('HTML → Book', () => {
     expect(all).toContain('<a href="#gr-src-faq">FAQ</a>');
   });
 
+  it('keeps a right-to-left base direction declared on <html> or <body> (regression: rendered left to right)', () => {
+    const page = (htmlAttrs: string, bodyAttrs: string): string =>
+      `<!doctype html><html lang="he"${htmlAttrs}><head><title>ספר</title></head><body${bodyAttrs}><p>שלום עולם, זהו ספר ארוך מספיק כדי להיות תוכן של ממש.</p></body></html>`;
+    const dirOf = (html: string): string | null => fragment(html).querySelector('p')?.closest('[dir]')?.getAttribute('dir') ?? null;
+    expect(dirOf(loadBookFromText(page(' dir="rtl"', ''), { format: 'html' }).chapters[0]!.html)).toBe('rtl');
+    expect(dirOf(loadBookFromText(page('', ' dir="rtl"'), { format: 'html' }).chapters[0]!.html)).toBe('rtl');
+    expect(dirOf(loadBookFromText(page(' dir="ltr"', ''), { format: 'html' }).chapters[0]!.html)).toBeNull();
+  });
+
   it('uses a pasted fragment as is and splits it at repeated headings', () => {
     const b = loadBookFromText('<h2>One</h2><p>First part text.</p><h2>Two</h2><p>Second part text.</p>', { format: 'html' });
     expect(b.chapters.map((c) => c.title)).toEqual(['One', 'Two']);
@@ -592,6 +620,25 @@ describe('loadBookFromFile', () => {
     const html = await loadBookFromFile(new File(['<html><body><p>Hi there, reader.</p></body></html>'], 'page.htm'));
     expect(html.format).toBe('html');
     expect(chapterText(html, 0)).toBe('Hi there, reader.');
+  });
+
+  it('opens XHTML whose head has self-closed tags (regression: <title/> swallowed the whole body)', async () => {
+    const body = '<body><h1>Chapter One</h1><p>It began with a lamp and a book.</p></body></html>';
+    const xml = '<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/xhtml">';
+    for (const head of ['<head><title/></head>', '<head><title>T</title><script type="text/javascript" src="x.js"/></head>']) {
+      const book = await loadBookFromFile(new File([xml + head + body], 'chapter1.xhtml', { type: 'application/xhtml+xml' }));
+      expect(book.chapters.map((c) => fragment(c.html).textContent).join(' ')).toContain('It began with a lamp and a book.');
+    }
+  });
+
+  it('keys a book on its source, so a copy rendered differently can be recognised', async () => {
+    const text = 'The same words, opened twice. '.repeat(40);
+    const pasted = loadBookFromText(text);
+    const retitled = loadBookFromText(text, { title: 'Another title' }); // another rendering, another id
+    expect(retitled.id).not.toBe(pasted.id);
+    expect(retitled.sourceKey).toBe(pasted.sourceKey);
+    expect(loadBookFromText(`${text}More.`).sourceKey).not.toBe(pasted.sourceKey);
+    expect((await loadBookFromFile(new File([text], 'same.txt'))).sourceKey).toBe(pasted.sourceKey); // the same bytes
   });
 
   it('sniffs an EPUB by its bytes, whatever the extension', async () => {
@@ -901,6 +948,40 @@ describe('long runs of spaces (regression: quadratic regexes froze the tab)', ()
     fast(() => markdownToHtml('# a' + spaces + 'b'));
     fast(() => markdownToHtml('a' + spaces + 'b'));
     fast(() => markdownToHtml('a' + spaces + 'b' + spaces + '\nc'));
+  });
+
+  it('renders a paragraph full of emphasis markers that never close quickly', () => {
+    for (const opener of ['***', '**', '__', '*', '_', '~~']) fast(() => markdownToHtml(`${opener}a `.repeat(30_000)));
+    // One closer at the very end: the first opener pairs with it, once.
+    fast(() => expect(markdownToHtml(`${'**a '.repeat(30_000)}b**`)).toMatch(/^<p><strong>a /));
+  });
+
+  it('renders emphasis exactly as the plain regexes did, on any input', () => {
+    // The chain renderEmphasis replaced, verbatim.
+    const plainRegexes = (s: string): string =>
+      s
+        .replace(/\*\*\*(?=\S)([\s\S]*?\S)\*\*\*/g, '<strong><em>$1</em></strong>')
+        .replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, '<strong>$1</strong>')
+        .replace(/(^|[^\p{L}\p{N}_])__(?=\S)([\s\S]*?\S)__(?![\p{L}\p{N}_])/gu, '$1<strong>$2</strong>')
+        .replace(/\*(?=[^\s*])([\s\S]*?[^\s*])\*/g, '<em>$1</em>')
+        .replace(/(^|[^\p{L}\p{N}_])_(?=[^\s_])([\s\S]*?[^\s_])_(?![\p{L}\p{N}_])/gu, '$1<em>$2</em>')
+        .replace(/~~(?=\S)([\s\S]*?\S)~~/g, '<s>$1</s>')
+        .replace(/\n/g, ' ');
+    const pieces = ['*', '**', '***', '_', '__', '~~', '~', 'a', 'é', '7', ' ', '\n', '.', '&amp;', '𝒜', '😀', ' '];
+    const rng = mulberry32(42);
+    for (let n = 0; n < 6000; n++) {
+      const length = n < 5000 ? Math.floor(rng() * 24) : 100 + Math.floor(rng() * 300);
+      let s = '';
+      for (let i = 0; i < length; i++) s += pieces[Math.floor(rng() * pieces.length)];
+      expect(renderEmphasis(s), JSON.stringify(s)).toBe(plainRegexes(s));
+    }
+    for (const paragraph of `${story}\n\n${guide}`.split(/\n\s*\n/)) expect(renderEmphasis(paragraph)).toBe(plainRegexes(paragraph));
+  });
+
+  it('loads Gutenberg text with a huge run of blank lines quickly', () => {
+    fast(() => loadBookFromText(`*** START OF THE PROJECT GUTENBERG EBOOK X ***\n${'\n'.repeat(100_000)}Hello world, this is the book.`, { format: 'txt' }));
+    // The end marker still ends the book.
+    expect(stripGutenberg('*** START OF X ***\nThe story.\n\n\n  End of the Project Gutenberg EBook of X\nLicence.').body).not.toMatch(/End of|Licence/);
   });
 
   it('loads an HTML book whose link has a huge run of spaces quickly', () => {

@@ -168,6 +168,7 @@ function setup(opts: { settings?: Partial<AppSettings>; calibration?: unknown; s
     isContextValid: () => contextValid,
     openSetup: () => undefined,
     onEnded: () => undefined,
+    isTrustedKey: () => true, // the tests' key events are synthetic
   };
   let clock = 1_000;
   const hubSend = (msg: HubToTab) => hubEnds.at(-1)!.postMessage(msg);

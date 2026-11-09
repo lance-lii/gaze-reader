@@ -130,6 +130,12 @@ export function sanitizeId(raw: string, prefix: string = SANITIZE_ID_PREFIX): st
   return prefixedId(raw, resolveOptions({ idPrefix: prefix }).idPrefix);
 }
 
+/** A `dir` attribute value the sanitizer keeps ('ltr', 'rtl' or 'auto'), or null. */
+export function textDirection(raw: string | null | undefined): 'ltr' | 'rtl' | 'auto' | null {
+  const dir = (raw ?? '').trim().toLowerCase();
+  return dir === 'ltr' || dir === 'rtl' || dir === 'auto' ? dir : null;
+}
+
 function decodeFragment(fragment: string): string {
   try {
     return decodeURIComponent(fragment);
@@ -456,8 +462,11 @@ function pruneEmpty(root: Node): void {
   for (let i = candidates.length - 1; i >= 0; i--) {
     const el = candidates[i];
     if (el.id || el.querySelector('br, hr, [id]')) continue;
-    if (/\S/.test(el.textContent ?? '')) continue;
-    el.remove();
+    const text = el.textContent ?? '';
+    if (/\S/.test(text)) continue;
+    // A whitespace-only inline element (<span> </span>) may be the only space between two words.
+    if (text && !BLOCK_OUTPUT.has(el.localName)) el.replaceWith(text);
+    else el.remove();
   }
 }
 

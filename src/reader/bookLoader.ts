@@ -1,5 +1,5 @@
 import type { Book, BookFormat } from '../types';
-import { sanitizeToElement } from './sanitize';
+import { sanitizeToElement, textDirection } from './sanitize';
 
 // ───────────────────────────────── Errors ──────────────────────────────────
 
@@ -100,6 +100,25 @@ export function hashId(text: string): string {
     hi = newHi >>> 0;
   }
   return ((BigInt(hi) << 32n) | BigInt(lo)).toString(36);
+}
+
+/**
+ * Book.sourceKey for a source's bytes: their length and a 53-bit hash (cyrb53), in base 36. Fast
+ * enough for a 200 MB PDF (hashId's 64-bit FNV-1a would take seconds there), and wide enough that
+ * two different sources in one library practically never share a key.
+ */
+export function sourceKeyOf(bytes: Uint8Array): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < bytes.length; i++) {
+    h1 = Math.imul(h1 ^ bytes[i], 2654435761);
+    h2 = Math.imul(h2 ^ bytes[i], 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `${bytes.length.toString(36)}-${(4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)}`;
 }
 
 const BLOCK_BOUNDARY = new Set([
@@ -480,7 +499,8 @@ function quantile(values: number[], q: number): number {
 const GUTENBERG_START = /^[^\n]*\*{3}\s*START OF[^\n]*$/im;
 const GUTENBERG_END = /^[^\n]*\*{3}\s*END OF[^\n]*$/im;
 const GUTENBERG_OLD_START = /^\*END\*THE SMALL PRINT[^\n]*$/im;
-const GUTENBERG_END_LINE = /^\s*End of (?:the |this )?Project Gutenberg/im;
+// [ \t]*, not \s*: with the m flag \s* would run across a whole run of blank lines from every line in it.
+const GUTENBERG_END_LINE = /^[ \t]*End of (?:the |this )?Project Gutenberg/im;
 const PRODUCED_BY = /^(?:produced by|e-?text prepared by|transcribed (?:from|by)|this e-?book was produced|updated editions will replace|\[?transcriber)/i;
 
 interface GutenbergInfo {
@@ -863,7 +883,8 @@ function parsePlainText(raw: string): ParsedText {
 
 // ───────────────────────────────── Markdown ─────────────────────────────────
 
-const FENCE_RE = /^( {0,3})(`{3,}|~{3,})[^`]*$/;
+// After a backtick fence the info string may not contain a backtick; after a tilde fence it may.
+const FENCE_RE = /^( {0,3})(`{3,}(?=[^`]*$)|~{3,})/;
 // Trailing blanks and the optional closing #s are stripped by atxText: folding them into this
 // regex, as `(.*?)(?:[ \t]+#+)?[ \t]*$`, backtracks quadratically on a long run of spaces.
 const ATX_RE = /^ {0,3}(#{1,6})(?:[ \t]+(.*))?$/;
@@ -896,6 +917,16 @@ function startsBlock(line: string): boolean {
 function isListStart(line: string): boolean {
   const m = LIST_RE.exec(line);
   return !!m && (m[4] ?? '').trim().length > 0;
+}
+
+/**
+ * Whether a line ends the paragraph before it. As startsBlock, except that an ordered list must
+ * start at 1 to interrupt a paragraph (CommonMark): "…ended in\n1945. Then…" is one paragraph.
+ */
+function interruptsParagraph(line: string): boolean {
+  if (!startsBlock(line)) return false;
+  const m = LIST_RE.exec(line);
+  return !m || !/^\d/.test(m[2]) || Number.parseInt(m[2], 10) === 1;
 }
 
 function stripColumns(line: string, n: number): string {
@@ -954,16 +985,53 @@ function renderInlineInto(src: string, slots: Slots): string {
     },
   );
 
-  s = escapeHtml(smartenPunctuation(s));
-  s = s
-    .replace(/\*\*\*(?=\S)([\s\S]*?\S)\*\*\*/g, '<strong><em>$1</em></strong>')
-    .replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|[^\p{L}\p{N}_])__(?=\S)([\s\S]*?\S)__(?![\p{L}\p{N}_])/gu, '$1<strong>$2</strong>')
-    .replace(/\*(?=[^\s*])([\s\S]*?[^\s*])\*/g, '<em>$1</em>')
-    .replace(/(^|[^\p{L}\p{N}_])_(?=[^\s_])([\s\S]*?[^\s_])_(?![\p{L}\p{N}_])/gu, '$1<em>$2</em>')
-    .replace(/~~(?=\S)([\s\S]*?\S)~~/g, '<s>$1</s>')
-    .replace(/\n/g, ' ');
-  return s;
+  return renderEmphasis(escapeHtml(smartenPunctuation(s)));
+}
+
+/** End of the last `delim` in `s` that `closes` accepts as a closing delimiter, or -1. */
+function lastCloserEnd(s: string, delim: string, closes: (at: number) => boolean): number {
+  for (let at = s.lastIndexOf(delim); at > 0; at = s.lastIndexOf(delim, at - 1)) {
+    if (closes(at)) return at + delim.length;
+  }
+  return -1;
+}
+
+const spaceAt = (s: string, i: number): boolean => /\s/.test(s[i] ?? '');
+const wordAt = (s: string, i: number): boolean => i < s.length && /[\p{L}\p{N}_]/u.test(String.fromCodePoint(s.codePointAt(i)!));
+
+/** `s.replace(re, replacement)` applied to `s[0, end)` only; `s` unchanged when `end` is -1. */
+function replaceBefore(s: string, end: number, re: RegExp, replacement: string): string {
+  return end < 0 ? s : s.slice(0, end).replace(re, replacement) + s.slice(end);
+}
+
+/**
+ * Bold, italics and strike-through (escaped HTML in, HTML out). Each is a lazy "opener … closer"
+ * regex. An opener with any closer after it matches at the first one, so only openers past the
+ * last closer fail, and each of those rescanned to the end of the paragraph: quadratic on a
+ * paragraph of unmatched "**". Each regex now sees the text up to its last closer only, which holds
+ * every match: the same output for any input, in linear time.
+ */
+export function renderEmphasis(html: string): string {
+  let s = html;
+  const plain = (delim: string): number => lastCloserEnd(s, delim, (at) => !spaceAt(s, at - 1));
+  s = replaceBefore(s, plain('***'), /\*\*\*(?=\S)([\s\S]*?\S)\*\*\*/g, '<strong><em>$1</em></strong>');
+  s = replaceBefore(s, plain('**'), /\*\*(?=\S)([\s\S]*?\S)\*\*/g, '<strong>$1</strong>');
+  // A closer that passes its (?![\p{L}\p{N}_]) in the whole text also passes it at the cut.
+  s = replaceBefore(
+    s,
+    lastCloserEnd(s, '__', (at) => !spaceAt(s, at - 1) && !wordAt(s, at + 2)),
+    /(^|[^\p{L}\p{N}_])__(?=\S)([\s\S]*?\S)__(?![\p{L}\p{N}_])/gu,
+    '$1<strong>$2</strong>',
+  );
+  s = replaceBefore(s, lastCloserEnd(s, '*', (at) => s[at - 1] !== '*' && !spaceAt(s, at - 1)), /\*(?=[^\s*])([\s\S]*?[^\s*])\*/g, '<em>$1</em>');
+  s = replaceBefore(
+    s,
+    lastCloserEnd(s, '_', (at) => s[at - 1] !== '_' && !spaceAt(s, at - 1) && !wordAt(s, at + 1)),
+    /(^|[^\p{L}\p{N}_])_(?=[^\s_])([\s\S]*?[^\s_])_(?![\p{L}\p{N}_])/gu,
+    '$1<em>$2</em>',
+  );
+  s = replaceBefore(s, plain('~~'), /~~(?=\S)([\s\S]*?\S)~~/g, '<s>$1</s>');
+  return s.replace(/\n/g, ' ');
 }
 
 function renderInline(src: string): string {
@@ -1128,7 +1196,7 @@ function renderMdBlocks(lines: string[], tight: boolean, depth = 0): string {
         i++;
         break;
       }
-      if (startsBlock(lines[i])) break;
+      if (interruptsParagraph(lines[i])) break;
       para.push(lines[i].replace(/^[ \t]+/, ''));
       i++;
     }
@@ -1300,7 +1368,12 @@ function parseHtmlDocument(
   const root = opts.mainContent ? extractMainContent(doc) : doc.body ?? doc.documentElement;
   stripBoilerplate(root);
   const container = sanitizeToElement(root, { baseUrl: opts.baseUrl });
-  return { title, author, drafts: splitIntoChapters(container) };
+  const drafts = splitIntoChapters(container);
+  // A right-to-left page declares its direction on <html>, <body> or the article, which the
+  // sanitizer never sees (it keeps their children). Left to right is the reader's own.
+  const dir = textDirection(root.closest('[dir]')?.getAttribute('dir'));
+  if (dir && dir !== 'ltr') for (const d of drafts) d.html = `<div dir="${dir}">${d.html}</div>`;
+  return { title, author, drafts };
 }
 
 // ───────────────────────────── Decoding & sniffing ─────────────────────────────
@@ -1459,11 +1532,26 @@ interface TextParseOptions {
   bookFormat?: BookFormat;
 }
 
+const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+
+/**
+ * XHTML self-closing tags (<title/>, <script src="x"/>) mean something else to an HTML parser:
+ * "<title/>" opens a title that swallows the whole body. In markup that declares itself XHTML,
+ * expand them first (as epub.ts does for its chapters; it isn't imported here, to stay lazy).
+ */
+function expandXhtmlSelfClosing(text: string): string {
+  const head = text.slice(0, 2000);
+  if (!/^\ufeff?\s*<\?xml/.test(head) && !/<html[^>]*\sxmlns\s*=\s*["']http:\/\/www\.w3\.org\/1999\/xhtml["']/i.test(head)) return text;
+  return text.replace(/<([A-Za-z][\w:.-]*)(\s[^<>]*?)?\/>/g, (whole, tag: string, attrs?: string) =>
+    VOID_TAGS.has(tag.toLowerCase()) ? whole : `<${tag}${attrs ?? ''}></${tag}>`,
+  );
+}
+
 function parseTextContent(text: string, opts: TextParseOptions): ParsedBook {
   let parsed: ParsedText;
   if (opts.format === 'html') {
     if (typeof DOMParser === 'undefined') throw new BookLoadError('parse', 'Reading HTML needs a browser.');
-    const doc = new DOMParser().parseFromString(text, 'text/html');
+    const doc = new DOMParser().parseFromString(expandXhtmlSelfClosing(text), 'text/html');
     const fullDocument = opts.mainContent ?? /<(?:html|body)[\s>]|<!doctype/i.test(text.slice(0, 2000));
     parsed = parseHtmlDocument(doc, { baseUrl: opts.baseUrl, mainContent: fullDocument });
   } else if (opts.format === 'md') {
@@ -1485,8 +1573,8 @@ function parseTextContent(text: string, opts: TextParseOptions): ParsedBook {
   );
 }
 
-function stamp(parsed: ParsedBook, source: Book['source']): Book {
-  return { ...parsed, source, addedAt: Date.now() };
+function stamp(parsed: ParsedBook, source: Book['source'], sourceKey?: string): Book {
+  return { ...parsed, source, addedAt: Date.now(), ...(sourceKey ? { sourceKey } : {}) };
 }
 
 async function parseBytes(
@@ -1557,7 +1645,9 @@ export async function loadBookFromFile(file: File): Promise<Book> {
   }
   const bytes = new Uint8Array(buffer);
   const kind = sniffKind(bytes, file.name, file.type);
-  return stamp(await parseBytes(bytes, kind, { fallbackTitle: titleFromFileName(file.name) }), 'file');
+  // Keyed before parsing: pdf.js detaches the buffer it is handed.
+  const sourceKey = sourceKeyOf(bytes);
+  return stamp(await parseBytes(bytes, kind, { fallbackTitle: titleFromFileName(file.name) }), 'file', sourceKey);
 }
 
 /** Builds a book from pasted or programmatic text. `opts.title` wins over any detected title. */
@@ -1568,7 +1658,7 @@ export function loadBookFromText(
   if (!text || !text.trim()) throw new BookLoadError('empty', 'There’s no text to read yet — paste some first.');
   const format = opts.format ?? detectTextFormat(text);
   const parsed = parseTextContent(text, { format, explicitTitle: opts.title, fallbackTitle: 'Pasted text' });
-  return stamp(parsed, opts.source ?? 'paste');
+  return stamp(parsed, opts.source ?? 'paste', sourceKeyOf(new TextEncoder().encode(text)));
 }
 
 function normalizeUserUrl(input: string): URL {
@@ -1747,12 +1837,13 @@ export async function loadBookFromUrl(
   }
   const kind = sniffKind(fetched.bytes, finalUrl.pathname, fetched.contentType);
   const charset = /charset\s*=\s*["']?([\w.:-]+)/i.exec(fetched.contentType)?.[1] ?? null;
+  const sourceKey = sourceKeyOf(fetched.bytes);
   const parsed = await parseBytes(fetched.bytes, kind, {
     fallbackTitle: titleFromUrl(finalUrl),
     charset,
     baseUrl: finalUrl.href,
   });
-  return stamp(parsed, 'url');
+  return stamp(parsed, 'url', sourceKey);
 }
 
 // ──────────────────────────────── Sample books ────────────────────────────────
