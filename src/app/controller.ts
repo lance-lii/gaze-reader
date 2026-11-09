@@ -44,6 +44,7 @@ import {
   currentChromeTop,
   loadCalibration,
   modelChromeTop,
+  modelZoomChanged,
   saveCalibration,
   savedCalibrationNeedsUpgrade,
 } from '../gaze/calibrationModel';
@@ -1941,7 +1942,8 @@ export class AppController {
    * toolbar or bookmarks bar), which shifts every prediction with the window origin unchanged.
    */
   private calibrationFit(model: GazeModel): 'fits' | 'size' | 'origin' {
-    if (!calibrationFitsViewport(model.viewport, this.viewportSize())) return 'size';
+    // One zoom step changes the viewport by less than the size check tolerates; the pixel ratio tells.
+    if (!calibrationFitsViewport(model.viewport, this.viewportSize()) || modelZoomChanged(model)) return 'size';
     if (!calibrationOriginFits(modelChromeTop(model), currentChromeTop(), this.layout?.linePitch)) return 'origin';
     return 'fits';
   }

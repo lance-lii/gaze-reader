@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppEvents, AppSettings, EventBus, FeatureFrame, GazeModel, LightingSignature, LineLayout, PageEndDecision, TextLine } from '../types';
 import type { AccuracyCheckResult, CalibrationResult } from '../ui/calibrationOverlay';
 import { AppearanceMonitor } from '../gaze/appearance';
+import { GAZE_MODEL_KIND, GAZE_MODEL_VERSION, deserializeGazeModel } from '../gaze/calibrationModel';
 import { CameraFeatureSource } from '../gaze/faceTracker';
 import { LightingWatch, type LightingWatchUpdate } from '../gaze/lighting';
 import { LineTracker } from '../reading/lineTracker';
@@ -529,6 +530,64 @@ describe('AppController', () => {
     } finally {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
     }
+  });
+
+  describe('browser zoom (regression: one zoom step went unnoticed)', () => {
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+    /** Ctrl + / Ctrl − in Chrome and Firefox: the viewport shrinks or grows in CSS px and the pixel ratio follows. */
+    const zoomTo = (zoom: number): void => {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: Math.round(width / zoom) });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: Math.round(height / zoom) });
+      Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: zoom });
+    };
+    /** A real saved calibration (it records the pixel ratio it was made at): 100 % zoom, this window. */
+    const ridgeModel = (): GazeModel => {
+      const n = FEATURE_NAMES.length;
+      const model = deserializeGazeModel({
+        version: GAZE_MODEL_VERSION,
+        kind: GAZE_MODEL_KIND,
+        featureLength: n,
+        mean: new Array<number>(n).fill(0),
+        std: new Array<number>(n).fill(1),
+        quad: [],
+        expMean: new Array<number>(n).fill(0),
+        expStd: new Array<number>(n).fill(1),
+        wx: new Array<number>(n).fill(0),
+        bx: 500,
+        wy: new Array<number>(n).fill(0),
+        by: 400,
+        lambda: 1,
+        trainedAt: 1000,
+        viewport: { width, height },
+        origin: { x: 0, y: 0 },
+        chromeTop: null,
+        dprAtCalibration: 1,
+      });
+      if (!model) throw new Error('the test model did not deserialize');
+      return model;
+    };
+
+    afterEach(() => zoomTo(1));
+
+    it('offers the 5-dot refresh after a single zoom step while reading', async () => {
+      zoomTo(1);
+      await readWithWebcam(ridgeModel());
+      expect(overlays.modes).toEqual([]); // the calibration fits this window: no dots on opening
+      // 110 %: the viewport is 9 % smaller, inside the size check's tolerance, yet every prediction
+      // is now 10 % too far from the viewport's corner (about 2 lines at the bottom of the page).
+      zoomTo(1.1);
+      window.dispatchEvent(new Event('resize'));
+      await until(() => /Window size changed/.test(toastText()), 'the refresh suggestion');
+      expect(toastButton('Refresh now')).toBeDefined();
+    });
+
+    it('starts with the quick refresh when the page zoom differs from the calibration’s', async () => {
+      zoomTo(0.9);
+      overlays.run = () => Promise.resolve(null); // the reader skips it: reading goes on with the old model
+      await readWithWebcam(ridgeModel());
+      expect(overlays.modes).toEqual(['quick']);
+    });
   });
   // ───────────────────────── Lighting, guidance, accuracy check, diagnostics ─────────────────────────
 
