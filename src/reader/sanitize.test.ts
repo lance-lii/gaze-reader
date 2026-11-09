@@ -290,6 +290,15 @@ describe('sanitizeHtml — attributes and structure', () => {
     expect(sanitizeHtml('<p id="t"></p><p><br></p>')).toBe('<p id="gr-src-t"></p><p><br></p>');
   });
 
+  it('keeps the space of a whitespace-only inline element (regression: words glued together)', () => {
+    // InDesign / Calibre EPUBs put styled spaces in spans; Word HTML uses nbsp "spacerun" spans.
+    expect(sanitizeHtml('<p>The<span class="CharOverride-1"> </span>quick brown fox.</p>')).toBe('<p>The quick brown fox.</p>');
+    expect(sanitizeHtml("<p>One<span style='mso-spacerun:yes'>&nbsp;</span>two</p>")).toBe('<p>One&nbsp;two</p>');
+    expect(sanitizeHtml('<p>a<em><b> </b></em>b</p>')).toBe('<p>a b</p>');
+    // A block holding nothing but such a space is still a spacer.
+    expect(sanitizeHtml('<p><span> </span></p><p>x</p>')).toBe('<p>x</p>');
+  });
+
   it('flattens pathological nesting without overflowing the stack', () => {
     // Built bottom-up (jsdom's own parser recurses per level; browsers cap parser depth anyway).
     let node: Element = document.createElement('span');
