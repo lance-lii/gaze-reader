@@ -128,6 +128,13 @@ export const PAGE_END_GUARDS = Object.freeze({
   validityWindowMs: 1000,
   /** Minimum fraction of valid gaze samples in that window. */
   minValidFraction: 0.6,
+  /**
+   * ...and at least this many valid samples in it (both ends count: 6 is 5 a second). Slower
+   * tracking (an overloaded or throttled camera) finds no fixations to follow the lines with, and
+   * in the end-to-end harness at 2–4 frames a second glance-down then turned pages at a phone
+   * glance (5 an hour).
+   */
+  minValidSamples: 6,
   /** Enough reading on this page: this many fixations... */
   minFixationsOnPage: 4,
   /** ...or this long since the last turn (glance-down is exempt from both). */
@@ -542,6 +549,12 @@ export class PageEndDetector {
       return idle(
         targetLineIndex,
         `tracking lost: ${Math.round(validFraction * 100)}% valid in last ${PAGE_END_GUARDS.validityWindowMs} ms (need ${Math.round(PAGE_END_GUARDS.minValidFraction * 100)}%)`,
+      );
+    }
+    if (this.vValid < PAGE_END_GUARDS.minValidSamples) {
+      return idle(
+        targetLineIndex,
+        `tracking too slow: ${this.vValid} valid samples in last ${PAGE_END_GUARDS.validityWindowMs} ms (need ${PAGE_END_GUARDS.minValidSamples})`,
       );
     }
     const fixations = est?.fixationsOnPage ?? 0;

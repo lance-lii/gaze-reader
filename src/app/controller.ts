@@ -148,6 +148,10 @@ const HIDDEN_STOP_MS = 60_000;
 const CAMERA_STALL_MS = 5000;
 /** A camera that stops again this soon after being restarted on its own is reported, not restarted. */
 const CAMERA_RESTART_MIN_GAP_MS = 60_000;
+/** Below this many frames a second gaze can't follow the lines (the page-end detector waits for 5 valid samples a second)… */
+const SLOW_CAMERA_FPS = 5;
+/** …and after this long at that rate the reader is told why pages don't turn. */
+const SLOW_CAMERA_MS = 5000;
 const SCROLL_SETTLE_MS = 120;
 const SAVE_POSITION_MS = 1000;
 const ESTIMATE_EMIT_MS = 100;
@@ -292,6 +296,8 @@ export class AppController {
   private lastCameraRestartAt = Number.NEGATIVE_INFINITY;
   /** The camera the reading started with, to notice a switch to another one. */
   private cameraDeviceId: string | null = null;
+  private slowCameraSince: number | null = null;
+  private slowCameraShown = false;
   /** undefined = not loaded from storage yet. */
   private model: GazeModel | null | undefined = undefined;
   private savedCalibration = false;
@@ -1587,9 +1593,31 @@ export class AppController {
 
   /** Frames stopped arriving while the camera runs and the tab is visible: it froze (often after the laptop slept). */
   private watchCamera(now: number): void {
-    if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !this.camera?.running) return;
-    if (now - this.lastCameraFrameAt < CAMERA_STALL_MS) return;
-    this.recoverCamera(new Error('The camera stopped sending pictures.'));
+    const camera = this.camera;
+    if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !camera?.running) {
+      this.slowCameraSince = null;
+      return;
+    }
+    if (now - this.lastCameraFrameAt >= CAMERA_STALL_MS) {
+      this.recoverCamera(new Error('The camera stopped sending pictures.'));
+      return;
+    }
+    // Frames still come, but too few to follow the lines (an overloaded or throttled machine).
+    const fps = camera.fps;
+    if (!(fps > 0 && fps < SLOW_CAMERA_FPS)) {
+      this.slowCameraSince = null;
+      return;
+    }
+    this.slowCameraSince ??= now;
+    if (this.slowCameraShown || now - this.slowCameraSince < SLOW_CAMERA_MS) return;
+    this.slowCameraShown = true;
+    this.toasts.show({
+      id: 'slow-camera',
+      tone: 'warn',
+      title: 'The camera is running slowly',
+      message: `About ${Math.max(1, Math.round(fps))} pictures a second is too few to follow your reading, so pages won’t turn on their own until it speeds up. Closing other apps or tabs, or plugging in a laptop, usually helps.`,
+      durationMs: 15_000,
+    });
   }
 
   /**

@@ -127,7 +127,7 @@ function stubCamera() {
   const listeners = new Set<(f: FeatureFrame) => void>();
   const errorListeners = new Set<(err: TrackerError) => void>();
   const startErrors: unknown[] = [];
-  const state = { deviceId: null as string | null };
+  const state = { deviceId: null as string | null, fps: 0 };
   const start = vi.spyOn(CameraFeatureSource.prototype, 'start').mockImplementation(async () => {
     const err = startErrors.shift();
     if (err) throw err;
@@ -146,6 +146,7 @@ function stubCamera() {
     };
   });
   vi.spyOn(CameraFeatureSource.prototype, 'deviceId', 'get').mockImplementation(() => state.deviceId);
+  vi.spyOn(CameraFeatureSource.prototype, 'fps', 'get').mockImplementation(() => state.fps);
   vi.spyOn(CameraFeatureSource.prototype, 'onFrame').mockImplementation((cb) => {
     listeners.add(cb);
     return () => {
@@ -170,7 +171,7 @@ function stubCamera() {
       running = false;
       for (const cb of [...errorListeners]) cb(err);
     },
-    /** What the camera reports: its device id. */
+    /** What the camera reports: its device id, and frames a second. */
     state,
   };
 }
@@ -865,6 +866,22 @@ describe('AppController', () => {
     expect(toastText()).not.toMatch(/connection/);
     expect(liveToastButton('Try again')).toBeUndefined();
     expect(toastButton('Use my mouse')).toBeTruthy();
+  });
+
+  it('webcam: a camera too slow to follow the lines says why pages don\'t turn, once', async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    const { camera } = await readWithWebcam(calibratedModel());
+    camera.state.fps = 3;
+    for (let i = 0; i < 4; i++) {
+      skew += 2000;
+      camera.emit(webcamFrame()); // frames still come, a few a second
+      await sleep(300);
+    }
+    await until(() => /The camera is running slowly/.test(toastText()), 'the slow-camera toast');
+    expect(toastText()).toMatch(/About 3 pictures a second/);
+    expect(camera.running()).toBe(true);
   });
 
   it('webcam: reports the light every second; a changed light re-learns the reading offset and offers a touch-up at a pause', async () => {

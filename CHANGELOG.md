@@ -36,6 +36,11 @@ position sat a line or two off after shifting in the chair, and page turns came 
   line, where you finish the page. In the new end-to-end simulation (`npm run eval`), unintended
   page turns fell from 12.9 to 7.2 an hour, for one more missed turn in a hundred. The extension's
   page mode, which has no lines to follow, still turns on any look down.
+- **No page turns on tracking too slow to follow you.** Below about 5 frames a second (an
+  overloaded or throttled machine) there are no fixations to follow the lines with, and in the
+  end-to-end simulation a glance at a phone then turned the page about 5 times an hour. Page turns
+  now wait until tracking is fast enough again, and the web app says why after 5 seconds. At 10
+  frames a second and above nothing changes.
 - **Calibration starts over when the window changes.** Resizing or zooming the window, or moving it
   to another screen, in the middle of the dots mixed dots from before and after the change into one
   calibration, which then read your gaze in the wrong place. The dots now start over from the first

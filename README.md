@@ -239,7 +239,8 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
      last two lines.
 
    Guards prevent false turns: a cooldown after every scroll, enough valid tracking in the last
-   second, some reading on the new page, and never a turn during a blink. After a turn, the
+   second (and tracking fast enough to follow the lines: at least 5 frames a second), some
+   reading on the new page, and never a turn during a blink. After a turn, the
    detector waits for your eyes to come back up the page, so a resting gaze or mouse can't page
    through the book on its own.
 6. **Scrolling** puts the next unread line near the top (keeping 1 line of context by default)
