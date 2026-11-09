@@ -450,6 +450,13 @@ describe('markdownToHtml', () => {
     expect(markdownToHtml('---\ntitle: X\nauthor: "Y"\n---\n\nBody')).toBe('<p>Body</p>');
     expect(markdownToHtml('---\n\nJust a rule.\n\n---\n')).toBe('<hr>\n<p>Just a rule.</p>\n<hr>');
   });
+
+  it('lets an ordered list interrupt a paragraph only when it starts at 1 (regression: a year at a line start split it)', () => {
+    // CommonMark example 304: hard-wrapped prose stays one paragraph.
+    expect(markdownToHtml('The war finally ended in\n1945. Then the long peace came.')).toBe('<p>The war finally ended in 1945. Then the long peace came.</p>');
+    expect(markdownToHtml('Steps:\n1. one\n2. two')).toBe('<p>Steps:</p>\n<ol><li>one</li><li>two</li></ol>');
+    expect(markdownToHtml('Bullets:\n- a')).toBe('<p>Bullets:</p>\n<ul><li>a</li></ul>');
+  });
 });
 
 describe('Markdown → Book', () => {
