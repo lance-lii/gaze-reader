@@ -130,6 +130,12 @@ export function sanitizeId(raw: string, prefix: string = SANITIZE_ID_PREFIX): st
   return prefixedId(raw, resolveOptions({ idPrefix: prefix }).idPrefix);
 }
 
+/** A `dir` attribute value the sanitizer keeps ('ltr', 'rtl' or 'auto'), or null. */
+export function textDirection(raw: string | null | undefined): 'ltr' | 'rtl' | 'auto' | null {
+  const dir = (raw ?? '').trim().toLowerCase();
+  return dir === 'ltr' || dir === 'rtl' || dir === 'auto' ? dir : null;
+}
+
 function decodeFragment(fragment: string): string {
   try {
     return decodeURIComponent(fragment);

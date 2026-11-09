@@ -120,6 +120,19 @@ describe('parseEpub — EPUB 3', () => {
     expect(ch2.html).not.toContain('onclick');
   });
 
+  it('keeps a right-to-left base direction declared on <html> or <body> (regression: rendered left to right)', async () => {
+    const files = epub3();
+    files['OEBPS/Text/ch2.xhtml'] = xhtml('<p>هذا هو الفصل الثاني من الكتاب.</p>', ' xml:lang="ar" dir="rtl"');
+    expect((await parseEpub(await buildEpub(files))).chapters[1]!.html).toContain('<div lang="ar" dir="rtl">');
+    files['OEBPS/Text/ch2.xhtml'] = xhtml('<p>هذا هو الفصل الثاني من الكتاب.</p>').replace('<body>', '<body dir="rtl">');
+    expect((await parseEpub(await buildEpub(files))).chapters[1]!.html).toContain('<div lang="en" dir="rtl">');
+    // Left to right is the reader's own direction: nothing to add.
+    files['OEBPS/Text/ch2.xhtml'] = xhtml('<p>Chapter two.</p>', ' dir="ltr"');
+    const ltr = (await parseEpub(await buildEpub(files))).chapters[1]!.html;
+    expect(ltr).toContain('<div lang="en">');
+    expect(ltr).not.toContain('dir=');
+  });
+
   it('keeps links to ids on <body> and <html> working', async () => {
     // Regression: the sanitizer keeps only the body's children, so "ch2.xhtml#chapter-two" pointed nowhere.
     const files = epub3();
