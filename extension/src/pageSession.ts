@@ -161,6 +161,11 @@ export interface PageSessionDeps {
   openSetup: () => void;
   /** The session ended itself: the reader clicked "off", or the extension went away. */
   onEnded: (reason: 'user' | 'orphaned') => void;
+  /**
+   * Whether a key press may run a shortcut. Default: only the reader's own (`isTrusted`), since the
+   * page's scripts can dispatch key events too. Tests, whose events are synthetic, pass `() => true`.
+   */
+  isTrustedKey?: (e: KeyboardEvent) => boolean;
 }
 
 type SourceKind = 'webcam' | 'mouse';
@@ -1422,6 +1427,7 @@ export class PageSession {
   }
 
   private onKeyDown(e: KeyboardEvent): void {
+    if (!(this.deps.isTrustedKey ? this.deps.isTrustedKey(e) : e.isTrusted)) return;
     const action = matchShortcut(e);
     if (!action || isTypingContext(e)) return;
     if (this.calibration && action !== 'turn-off') return;
