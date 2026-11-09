@@ -863,7 +863,8 @@ function parsePlainText(raw: string): ParsedText {
 
 // ───────────────────────────────── Markdown ─────────────────────────────────
 
-const FENCE_RE = /^( {0,3})(`{3,}|~{3,})[^`]*$/;
+// After a backtick fence the info string may not contain a backtick; after a tilde fence it may.
+const FENCE_RE = /^( {0,3})(`{3,}(?=[^`]*$)|~{3,})/;
 // Trailing blanks and the optional closing #s are stripped by atxText: folding them into this
 // regex, as `(.*?)(?:[ \t]+#+)?[ \t]*$`, backtracks quadratically on a long run of spaces.
 const ATX_RE = /^ {0,3}(#{1,6})(?:[ \t]+(.*))?$/;
