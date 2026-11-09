@@ -16,6 +16,7 @@ import {
   loadCalibration,
   measureOffset,
   modelChromeTop,
+  modelZoomChanged,
   qualityFromError,
   refineGazeModel,
   saveCalibration,
@@ -362,6 +363,24 @@ describe('serialization', () => {
     win.outerHeight = 700; // fullscreen: no toolbar
     const refined = refineGazeModel(trained, collect(GRID.slice(0, 5), 20, 96)).model;
     expect(refined.chromeTop).toBe(0);
+  });
+
+  it('tells a page-zoom change from the pixel ratio (one zoom step slips through the size check)', () => {
+    const win = { screenX: 0, screenY: 0, innerWidth: VIEWPORT.width, innerHeight: VIEWPORT.height, outerHeight: 900, devicePixelRatio: 1, top: null as unknown };
+    win.top = win;
+    vi.stubGlobal('window', win);
+    const trained = trainGazeModel(collect(GRID, 25, 97), { viewport: VIEWPORT }).model;
+    expect(modelZoomChanged(trained)).toBe(false);
+    win.devicePixelRatio = 1.1; // Ctrl + : 110 %
+    expect(modelZoomChanged(trained)).toBe(true);
+    expect(modelZoomChanged(deserializeGazeModel(JSON.parse(JSON.stringify(trained.toJSON())) as unknown))).toBe(true);
+    // A quick refresh at the new zoom makes it the reference.
+    expect(modelZoomChanged(refineGazeModel(trained, collect(GRID.slice(0, 5), 20, 98)).model)).toBe(false);
+    // Unknown: models saved before the field existed, and other model classes.
+    const legacy = { ...trained.toJSON() } as Record<string, unknown>;
+    delete legacy.dprAtCalibration;
+    expect(modelZoomChanged(deserializeGazeModel(legacy))).toBe(false);
+    expect(modelZoomChanged({ predict: () => null, viewport: VIEWPORT, trainedAt: 0, toJSON: () => ({ version: 1 }) })).toBe(false);
   });
 
   it('round-trips through JSON with bit-identical predictions', () => {
