@@ -985,16 +985,53 @@ function renderInlineInto(src: string, slots: Slots): string {
     },
   );
 
-  s = escapeHtml(smartenPunctuation(s));
-  s = s
-    .replace(/\*\*\*(?=\S)([\s\S]*?\S)\*\*\*/g, '<strong><em>$1</em></strong>')
-    .replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|[^\p{L}\p{N}_])__(?=\S)([\s\S]*?\S)__(?![\p{L}\p{N}_])/gu, '$1<strong>$2</strong>')
-    .replace(/\*(?=[^\s*])([\s\S]*?[^\s*])\*/g, '<em>$1</em>')
-    .replace(/(^|[^\p{L}\p{N}_])_(?=[^\s_])([\s\S]*?[^\s_])_(?![\p{L}\p{N}_])/gu, '$1<em>$2</em>')
-    .replace(/~~(?=\S)([\s\S]*?\S)~~/g, '<s>$1</s>')
-    .replace(/\n/g, ' ');
-  return s;
+  return renderEmphasis(escapeHtml(smartenPunctuation(s)));
+}
+
+/** End of the last `delim` in `s` that `closes` accepts as a closing delimiter, or -1. */
+function lastCloserEnd(s: string, delim: string, closes: (at: number) => boolean): number {
+  for (let at = s.lastIndexOf(delim); at > 0; at = s.lastIndexOf(delim, at - 1)) {
+    if (closes(at)) return at + delim.length;
+  }
+  return -1;
+}
+
+const spaceAt = (s: string, i: number): boolean => /\s/.test(s[i] ?? '');
+const wordAt = (s: string, i: number): boolean => i < s.length && /[\p{L}\p{N}_]/u.test(String.fromCodePoint(s.codePointAt(i)!));
+
+/** `s.replace(re, replacement)` applied to `s[0, end)` only; `s` unchanged when `end` is -1. */
+function replaceBefore(s: string, end: number, re: RegExp, replacement: string): string {
+  return end < 0 ? s : s.slice(0, end).replace(re, replacement) + s.slice(end);
+}
+
+/**
+ * Bold, italics and strike-through (escaped HTML in, HTML out). Each is a lazy "opener … closer"
+ * regex. An opener with any closer after it matches at the first one, so only openers past the
+ * last closer fail, and each of those rescanned to the end of the paragraph: quadratic on a
+ * paragraph of unmatched "**". Each regex now sees the text up to its last closer only, which holds
+ * every match: the same output for any input, in linear time.
+ */
+export function renderEmphasis(html: string): string {
+  let s = html;
+  const plain = (delim: string): number => lastCloserEnd(s, delim, (at) => !spaceAt(s, at - 1));
+  s = replaceBefore(s, plain('***'), /\*\*\*(?=\S)([\s\S]*?\S)\*\*\*/g, '<strong><em>$1</em></strong>');
+  s = replaceBefore(s, plain('**'), /\*\*(?=\S)([\s\S]*?\S)\*\*/g, '<strong>$1</strong>');
+  // A closer that passes its (?![\p{L}\p{N}_]) in the whole text also passes it at the cut.
+  s = replaceBefore(
+    s,
+    lastCloserEnd(s, '__', (at) => !spaceAt(s, at - 1) && !wordAt(s, at + 2)),
+    /(^|[^\p{L}\p{N}_])__(?=\S)([\s\S]*?\S)__(?![\p{L}\p{N}_])/gu,
+    '$1<strong>$2</strong>',
+  );
+  s = replaceBefore(s, lastCloserEnd(s, '*', (at) => s[at - 1] !== '*' && !spaceAt(s, at - 1)), /\*(?=[^\s*])([\s\S]*?[^\s*])\*/g, '<em>$1</em>');
+  s = replaceBefore(
+    s,
+    lastCloserEnd(s, '_', (at) => s[at - 1] !== '_' && !spaceAt(s, at - 1) && !wordAt(s, at + 1)),
+    /(^|[^\p{L}\p{N}_])_(?=[^\s_])([\s\S]*?[^\s_])_(?![\p{L}\p{N}_])/gu,
+    '$1<em>$2</em>',
+  );
+  s = replaceBefore(s, plain('~~'), /~~(?=\S)([\s\S]*?\S)~~/g, '<s>$1</s>');
+  return s.replace(/\n/g, ' ');
 }
 
 function renderInline(src: string): string {
