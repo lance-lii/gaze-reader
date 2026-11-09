@@ -20,7 +20,7 @@
  *   CPU            — wall time per frame in the app's code (features → decision); MediaPipe's own
  *                    inference isn't simulated and isn't included.
  */
-import type { FeatureFrame, FeatureSource, GazeModel, GazeSample, LineEstimate, Unsubscribe } from '../../src/types';
+import type { FeatureFrame, FeatureSource, GazeModel, GazeSample, LineEstimate, LineLayout, PageEndDecision, Unsubscribe } from '../../src/types';
 import { FEATURE_NAMES, frameQuality } from '../../src/gaze/features';
 import { refineGazeModel, trainGazeModel } from '../../src/gaze/calibrationModel';
 import { WebcamGazeSource } from '../../src/gaze/webcamGazeSource';
@@ -116,11 +116,33 @@ export interface SessionMetrics {
   errLast15: number;
   cpuFirst15: number;
   cpuLast15: number;
+  /** JS heap in use, MB (Node only, else NaN): lowest reading around minute 15 and over the last 15 minutes (lowest = after a collection). */
+  heapMB15: number;
+  heapMBEnd: number;
 }
 
-/** Ways the rig can be varied (A/B of a candidate change without editing the app). */
+// The project has no Node type definitions; the heap reading goes through a narrow shape.
+const heapUsedMB = (): number => {
+  const p = (globalThis as { process?: { memoryUsage?: () => { heapUsed: number } } }).process;
+  const m = p?.memoryUsage?.();
+  return m ? m.heapUsed / 2 ** 20 : NaN;
+};
+
+/** One gaze sample through the decision layer, for probes that look inside a session. */
+export interface RigStep {
+  sample: GazeSample;
+  estimate: LineEstimate | null;
+  decision: PageEndDecision;
+  truth: Truth;
+  layout: LineLayout;
+  /** Every turn so far (a new one is pushed on the step that made it). */
+  turns: readonly TurnRecord[];
+}
+
+/** Ways the rig can be varied (A/B of a candidate change without editing the app), and looked into. */
 export interface RigOptions {
   detector?: () => PageEndDetector;
+  onStep?: (step: RigStep) => void;
 }
 
 export function runSession(scenario: Scenario, seed: number, opts: { minutes?: number } & RigOptions = {}): SessionMetrics {
@@ -271,12 +293,15 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
     tracker.onSample(s);
     const d = detector.update({ t: s.t, gaze: s, estimate: tracker.estimate, layout: world.layout });
     if (d.trigger) turn(s.t, d.targetLineIndex, d.detail.includes('return sweep') ? `${d.reason} (sweep)` : d.reason, false);
+    opts.onStep?.({ sample: s, estimate: tracker.estimate, decision: d, truth: tr, layout: world.layout, turns });
   });
   void gazeSource.start();
 
   let frames = 0;
+  const heap: { t: number; mb: number }[] = [];
   for (let wf = world.next(); wf && !done; wf = world.next()) {
     frames++;
+    if (Math.floor(wf.t / 60_000) > Math.floor(clock / 60_000)) heap.push({ t: wf.t, mb: heapUsedMB() });
     clock = wf.t;
     truth = wf.truth;
     histT.push(wf.t);
@@ -339,7 +364,10 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
   const window15 = (values: number[], times: number[], first: boolean): number[] =>
     values.filter((_, i) => (first ? times[i]! < 15 * 60_000 : times[i]! >= endT - 15 * 60_000));
   const meanOf = (a: number[]): number => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : NaN);
+  const minOf = (a: number[]): number => (a.length ? Math.min(...a) : NaN);
   return {
+    heapMB15: minOf(heap.filter((h) => h.t >= 10 * 60_000 && h.t <= 20 * 60_000).map((h) => h.mb)),
+    heapMBEnd: minOf(heap.filter((h) => h.t >= endT - 15 * 60_000).map((h) => h.mb)),
     errFirst15: quantile(window15(gazeErr, gazeErrT, true), 0.5),
     errLast15: quantile(window15(gazeErr, gazeErrT, false), 0.5),
     cpuFirst15: meanOf(window15(cpu, cpuT, true)),
@@ -388,6 +416,9 @@ export interface Summary {
   errLast15: number;
   cpuFirst15: number;
   cpuLast15: number;
+  /** JS heap in use, MB, around minute 15 and at the end (mean over runs). */
+  heapMB15: number;
+  heapMBEnd: number;
   /** What was going on at the unintended turns. */
   falseCauses: Record<string, number>;
 }
@@ -447,6 +478,8 @@ export function summarize(runs: readonly SessionMetrics[]): Summary {
     errLast15: avg(runs.map((r) => r.errLast15)),
     cpuFirst15: avg(runs.map((r) => r.cpuFirst15)),
     cpuLast15: avg(runs.map((r) => r.cpuLast15)),
+    heapMB15: avg(runs.map((r) => r.heapMB15)),
+    heapMBEnd: avg(runs.map((r) => r.heapMBEnd)),
     falseCauses: causes,
   };
 }
@@ -472,6 +505,7 @@ export function summaryTable(rows: readonly Summary[]): string {
     'on line %',
     'prompts/h',
     'CPU µs/frame (mean/p99)',
+    'heap MB 15 min / end',
   ];
   const lines = [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`];
   for (const s of rows) {
@@ -489,6 +523,7 @@ export function summaryTable(rows: readonly Summary[]): string {
         f1(s.onLinePct),
         f1(s.promptsPerHour, 2),
         `${f1(s.cpuMeanUs, 0)} / ${f1(s.cpuP99Us, 0)}`,
+        `${f1(s.heapMB15, 0)} / ${f1(s.heapMBEnd, 0)}`,
       ].join(' | ')} |`,
     );
   }
