@@ -22,8 +22,9 @@ import { isTrackedLineEstimate } from './lineTracker';
  *     right half of L, but still on the page, for `Tzone` (fallback while the
  *     tracker is unsure).
  *  3. glance-down — gaze at/below the bottom edge for `Tglance` (on by default; can be
- *     switched off). A tracker confident the reader is above the last two lines vetoes it,
- *     as for rule 2, so a look at the keyboard or a phone mid-page doesn't turn the page.
+ *     switched off), when the look down began right after the gaze was at the end of the
+ *     last line: a look at the keyboard or a phone mid-page doesn't turn the page. A tracker
+ *     confident the reader is above the last two lines vetoes it too, as for rule 2.
  *
  * Guards: cooldown after any scroll (and after firing); ≥ 60 % valid samples in
  * the last second; ≥ 4 fixations on the page or ≥ 2.5 s since the last turn
@@ -66,6 +67,15 @@ import { isTrackedLineEstimate } from './lineTracker';
  *    width (see `endProgress`): "only a few words left" means the same on any line.
  *  - Glance-down re-arms only after the gaze has come back up onto the page, so
  *    looking at the keyboard turns one page, not one every cooldown.
+ *  - Glance-down counts only a look below the page that starts within GLANCE_ORIGIN_MS of
+ *    the gaze being at the end of the last line (on it, θx along) — when there is text to
+ *    follow (an estimate; page mode has none and keeps the plain rule). Without that, half of
+ *    the end-to-end harness's glance-down turns were unintended (bench/endtoend: a phone
+ *    glance mid-page, reading the last lines with the gaze dipping below the page, glare).
+ *    With it, unintended turns fell from 12.9 to 7.2 an hour over 32 simulated hours (held-out
+ *    seeds), for 1 point more missed turns (16.9 → 17.9 %). A wider origin (2 pitches above
+ *    the last line, 2.5 s) kept fewer misses only in the noisiest scenario and let half the
+ *    unintended turns back; the tracker's line as an extra origin changed nothing.
  *  - After firing, rules 1 and 2 wait for the gaze to come back up the page.
  *    Gaze that stays parked at the bottom right (a resting mouse, eyes that
  *    didn't follow the turn) would otherwise "reach the end" of every new page
@@ -211,6 +221,8 @@ const DOUBT_DWELL_FACTOR = 2;
 const ANCHOR_DOUBT = 0.25;
 /** Glance-down re-arms once the gaze has come back this far above the glance threshold. */
 const GLANCE_REARM_LINES = 1;
+/** Glance-down counts when the look below the page begins at most this long after the gaze was at the end of the last line. */
+const GLANCE_ORIGIN_MS = 1500;
 /**
  * Bottom-dwell only counts gaze down to this many pitches below the page (slack for
  * vertical noise while reading the last line); further down is a look off the page.
@@ -298,6 +310,11 @@ export class PageEndDetector {
   private settledDocTop: number | null = null;
   private settledRun = 0;
   private glanceArmed = true;
+  /** Last valid sample at the end of the last line (see GLANCE_ORIGIN_MS). */
+  private endSeenAt = -Infinity;
+  /** The latest valid sample was below the page, and that look began from the end of the last line. */
+  private below = false;
+  private belowFromEnd = false;
   /** The gaze has been up the page since the last trigger (rules 1 and 2 wait for it). */
   private lookedUp = true;
 
@@ -332,6 +349,9 @@ export class PageEndDetector {
     // (or undo) the line entered on the later page sits at or below this page's last line, and
     // would wave rule 1 through without the reader ever getting there.
     this.clearEntry();
+    // Likewise the end of the last line the gaze was last seen at.
+    this.endSeenAt = -Infinity;
+    this.belowFromEnd = false;
   }
 
   reset(): void {
@@ -350,6 +370,9 @@ export class PageEndDetector {
     this.clearEntry();
     this.glanceArmed = true;
     this.lookedUp = true;
+    this.endSeenAt = -Infinity;
+    this.below = false;
+    this.belowFromEnd = false;
   }
 
   update(input: PageEndInput): PageEndDecision {
@@ -474,9 +497,21 @@ export class PageEndDetector {
 
     // Rule 3: deliberate glance below the page; must come back up before it can fire again.
     if (valid && yc < zones.glanceTop - GLANCE_REARM_LINES * pitch) this.glanceArmed = true;
+    // Where did this look below the page begin? A deliberate glance follows the end of the last line.
+    if (valid) {
+      if (yc >= zones.glanceTop) {
+        if (!this.below) this.belowFromEnd = t - this.endSeenAt <= GLANCE_ORIGIN_MS;
+        this.below = true;
+      } else {
+        this.below = false;
+        if (yc >= Lline.top - 0.5 * pitch && progress >= th.minProgress) this.endSeenAt = t;
+      }
+    }
     // A look at the keyboard or a phone mid-page is an excursion for the line tracker (it keeps its
     // line), so a tracker sure the reader is above the last two lines vetoes the gesture, as for rule 2.
-    const c3: Tri = !this.opts.glanceDownToTurn ? false : valid ? this.glanceArmed && !vetoed && yc >= zones.glanceTop : null;
+    // Without text to follow (the extension's page mode: no estimate) any look below the page counts.
+    const fromEnd = est === null || this.belowFromEnd;
+    const c3: Tri = !this.opts.glanceDownToTurn ? false : valid ? this.glanceArmed && !vetoed && fromEnd && yc >= zones.glanceTop : null;
     this.glanceDwell.step(c3, dt);
 
     const lineReady = sweep || this.lineDwell.held >= dwellMs;

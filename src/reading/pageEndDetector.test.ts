@@ -267,12 +267,19 @@ describe('PageEndDetector', () => {
       driftHighY: 4 * pitch,
       driftSdY: sdLines * pitch,
     });
-    expect(new Rig().run(2000, below, tracked(0.9, 0.2))).toBeNull();
-    expect(new Rig().run(2000, below, tracked(0.5, 0.2))?.d.reason).toBe('glance-down');
-    expect(new Rig().run(2000, below, tracked(0.9, 0.8))?.d.reason).toBe('glance-down');
-    expect(new Rig().run(2000, below, tracked(0.9, NaN))?.d.reason).toBe('glance-down'); // unknown SD: unpinned
+    // From the end of the last line as an unpinned drift places it (a deliberate glance starts there).
+    const atEnd = { x: xAt(L, 0.9), y: line(L).centerY + 1.5 * pitch };
+    const glance = (est: LineEstimate) => {
+      const rig = new Rig();
+      rig.run(300, atEnd, est);
+      return rig.run(2000, below, est);
+    };
+    expect(glance(tracked(0.9, 0.2))).toBeNull();
+    expect(glance(tracked(0.5, 0.2))?.d.reason).toBe('glance-down');
+    expect(glance(tracked(0.9, 0.8))?.d.reason).toBe('glance-down');
+    expect(glance(tracked(0.9, NaN))?.d.reason).toBe('glance-down'); // unknown SD: unpinned
     // A hand-made estimate (no driftSdY) is taken at its word.
-    expect(new Rig().run(2000, below, estimate(L - 1, { p: 0.5, drift: 3 * pitch, fix: 12 }))).toBeNull();
+    expect(glance(estimate(L - 1, { p: 0.5, drift: 3 * pitch, fix: 12 }))).toBeNull();
   });
 
   it('turns right away when the reader sweeps back from the end of the last line', () => {
@@ -385,13 +392,32 @@ describe('PageEndDetector', () => {
     // Mid-page: the tracker keeps line 8 with high confidence while the eyes are on the desk.
     const mid = new Rig();
     expect(mid.run(3000, lookDown, estimate(8, { p: 0.9, fix: 30 }))).toBeNull();
-    // The same look from the last two lines is a deliberate glance.
+    // The same look from the end of the last line is a deliberate glance (the tracker on either of the last two).
     for (const at of [L, L - 1]) {
       const rig = new Rig();
+      rig.run(300, { x: xAt(L, 0.9), y: line(L).centerY }, estimate(at, { p: 0.9, fix: 30 }));
       expect(rig.run(3000, lookDown, estimate(at, { p: 0.9, fix: 30 }))?.d.reason).toBe('glance-down');
     }
     // No estimate at all (the extension's page mode) still fires.
     expect(new Rig().run(3000, lookDown, null)?.d.reason).toBe('glance-down');
+  });
+
+  it('counts a look below the page only when it starts at the end of the last line (regression: phone glances turned pages)', () => {
+    const lookDown = { x: 500, y: viewport.bottom + 300 };
+    const unsure = (i: number) => estimate(i, { p: 0.4, fix: 30 }); // too unsure to veto anything
+    const after = (where: Gaze, est: LineEstimate, ms = 300) => {
+      const rig = new Rig();
+      rig.run(ms, where, est);
+      return rig.run(3000, lookDown, est);
+    };
+    expect(after({ x: xAt(8, 0.4), y: line(8).centerY }, unsure(8))).toBeNull(); // the phone, mid-page
+    expect(after({ x: xAt(L, 0.1), y: line(L).centerY }, unsure(L))).toBeNull(); // the start of the last line
+    expect(after({ x: xAt(L, 0.9), y: line(L).centerY }, unsure(L))?.d.reason).toBe('glance-down');
+    // The end of the last line, then two seconds back up the page before looking down: something else.
+    const rig = new Rig();
+    rig.run(300, { x: xAt(L, 0.9), y: line(L).centerY }, unsure(L));
+    rig.run(2000, { x: xAt(L - 4, 0.5), y: line(L - 4).centerY }, unsure(L));
+    expect(rig.run(3000, lookDown, unsure(L))).toBeNull();
   });
 
   it('respects the cooldown after any scroll', () => {

@@ -29,6 +29,13 @@ position sat a line or two off after shifting in the chair, and page turns came 
   or missed turn; single-paragraph pages 83 % instead of 69 %; and on web articles (the extension)
   a 15 % stretch costs no turn and keeps 94–98 % on the line. Not yet fixed: if gaze reads 2–3 lines low from the start, the first page of a
   long paragraph still often turns early. The debug overlay shows the learned stretch ("gain").
+- **A glance at your phone no longer turns the page.** Looking below the page turns it
+  (glance-down), but whenever the reading layer wasn't sure which line you were on, any look down
+  counted: a glance at your phone or the keyboard mid-page, or the gaze dipping below the page
+  while you read the last lines. A look down now counts only when it starts at the end of the last
+  line, where you finish the page. In the new end-to-end simulation (`npm run eval`), unintended
+  page turns fell from 12.9 to 7.2 an hour, for one more missed turn in a hundred. The extension's
+  page mode, which has no lines to follow, still turns on any look down.
 - **Calibration starts over when the window changes.** Resizing or zooming the window, or moving it
   to another screen, in the middle of the dots mixed dots from before and after the change into one
   calibration, which then read your gaze in the wrong place. The dots now start over from the first

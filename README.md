@@ -233,9 +233,10 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
      its end for a moment, or you finish it and your eyes jump back to the left looking for a
      next line that isn't there;
    - your gaze rests at the bottom right of the text (a fallback for when the tracker is unsure);
-   - you deliberately look below the page (glance-down, which you can switch off). It is ignored
-     while the tracker is confident you're still above the last two lines, so a look at the
-     keyboard mid-page doesn't turn it.
+   - you deliberately look below the page from the end of the last line (glance-down, which you
+     can switch off). A look down that starts anywhere else, at the keyboard or a phone mid-page,
+     doesn't turn it, and neither does one while the tracker is confident you're still above the
+     last two lines.
 
    Guards prevent false turns: a cooldown after every scroll, enough valid tracking in the last
    second, some reading on the new page, and never a turn during a blink. After a turn, the
