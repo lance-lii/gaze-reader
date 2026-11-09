@@ -29,6 +29,52 @@ position sat a line or two off after shifting in the chair, and page turns came 
   or missed turn; single-paragraph pages 83 % instead of 69 %; and on web articles (the extension)
   a 15 % stretch costs no turn and keeps 94–98 % on the line. Not yet fixed: if gaze reads 2–3 lines low from the start, the first page of a
   long paragraph still often turns early. The debug overlay shows the learned stretch ("gain").
+- **Calibration starts over when the window changes.** Resizing or zooming the window, or moving it
+  to another screen, in the middle of the dots mixed dots from before and after the change into one
+  calibration, which then read your gaze in the wrong place. The dots now start over from the first
+  one, with a short note saying why.
+
+### Web app
+
+- **One zoom step asks for the quick refresh.** Zooming the page by one step (to 90 % or 110 %)
+  changed the window by less than the size check allowed, so the calibration kept reading your gaze
+  about a tenth off, roughly two lines at the bottom of the page. Any zoom change now offers the
+  5-dot refresh, and opening a book at another zoom starts with it.
+- **Opening a book again finds it in your library.** A library entry was tied to how the app
+  rendered the book, so after an update that rendered a file differently, opening the same file
+  again added a second copy that started from the beginning. Books are now also recognised by their
+  file, page or pasted text, so you land back on your page. A book added with an earlier version is
+  recognised this way after you have opened its file once more; if this version renders that file
+  differently, that once still adds a second copy.
+- **Words no longer run together in some EPUBs.** A space that a book wraps in its own styled run
+  (common in InDesign and Calibre EPUBs, and in Word HTML) was dropped: "The quick" became
+  "Thequick".
+- **XHTML files open.** A standalone .xhtml file with an empty `<title/>` (or a self-closed
+  `<script/>`) in its header failed with "We couldn't find any readable text".
+- **Arabic and Hebrew books keep their direction.** A right-to-left direction set for the whole
+  document was lost, so the text was laid out left to right. Page turning by gaze still expects
+  left-to-right lines.
+- **Markdown fixes.** A hard-wrapped line that starts with a year ("…ended in / 1945. Then…") no
+  longer turns into a numbered list, and a `~~~` code block whose first line holds a backtick no
+  longer swallows the rest of the book.
+- **Odd files can't freeze the tab.** A Project Gutenberg text with a very long run of blank lines,
+  or a Markdown paragraph full of `**` or `_` that never close, took several seconds to open; both
+  now open at once.
+
+### Chrome extension
+
+- **Web pages can no longer press Gaze Reader's shortcuts.** A page's own scripts could send fake
+  Alt+Shift key presses to turn Gaze Reader off, change your settings in every tab, start a
+  calibration or, with the camera blocked, keep bringing the setup tab to the front. The shortcuts
+  now answer only real key presses. On a site that forwards your keys out of an embedded frame as
+  fake key presses, the Alt+Shift shortcuts stop working; the toolbar button and Alt+Shift+G still
+  work there.
+
+### Privacy
+
+- **The camera promises are tested.** Automated tests now check that the camera stays off in the
+  library and stops when you go back to it, and that it stops after a tab has been hidden for a
+  minute and comes back with the tab, as [PRIVACY.md](PRIVACY.md) says.
 
 ## 1.1.0 (unreleased, 2026-09-25)
 

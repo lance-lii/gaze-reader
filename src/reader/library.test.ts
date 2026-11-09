@@ -85,6 +85,18 @@ function behavesLikeALibrary(setup: () => Promise<LibraryModule>): void {
     await lib.saveBook({ ...book('extra'), secret: 'nope' } as Book);
     expect(await lib.getBook('extra')).not.toHaveProperty('secret');
   });
+
+  it('finds the entry a re-imported book belongs to: by id, else by its source', async () => {
+    const lib = await setup();
+    await lib.saveBook(book('earlier-render', { sourceKey: 'k1' }));
+    await lib.saveBook(book('legacy')); // saved before books had a source key
+    expect((await lib.getBook('earlier-render'))?.sourceKey).toBe('k1');
+    expect((await lib.listBooks()).find((e) => e.id === 'earlier-render')?.sourceKey).toBe('k1');
+    expect(await lib.findLibraryBook({ id: 'new-render', sourceKey: 'k1' })).toMatchObject({ id: 'earlier-render' });
+    expect(await lib.findLibraryBook({ id: 'legacy', sourceKey: 'k2' })).toMatchObject({ id: 'legacy' });
+    expect(await lib.findLibraryBook({ id: 'unknown', sourceKey: 'k2' })).toBeNull();
+    expect(await lib.findLibraryBook({ id: 'unknown' })).toBeNull();
+  });
 }
 
 // ─────────────────────────────── in-memory fallback ───────────────────────────────

@@ -1021,13 +1021,25 @@ function currentDevicePixelRatio(): number | null {
 /**
  * The chrome height the model was calibrated with, when it is still comparable with
  * {@link currentChromeTop}: null for old models, other model classes, or after a zoom
- * change (the viewport-size check covers that case).
+ * change ({@link modelZoomChanged} covers that case).
  */
 export function modelChromeTop(model: GazeModel | null | undefined): number | null {
   if (!(model instanceof RidgeGazeModel) || model.chromeTop === null) return null;
   const dpr = currentDevicePixelRatio();
   if (model.dprAtCalibration !== null && dpr !== null && Math.abs(dpr - model.dprAtCalibration) > 1e-3) return null;
   return model.chromeTop;
+}
+
+/**
+ * True when the page zoom (or the screen's scale) is not the one the model was calibrated at: the
+ * device pixel ratio changed. Predictions are in calibration-time CSS px, so one zoom step (90 %,
+ * 110 %) scales them by about a tenth about the viewport's corner, while the viewport size changes
+ * by less than the size check tolerates. False for old models and other model classes.
+ */
+export function modelZoomChanged(model: GazeModel | null | undefined): boolean {
+  if (!(model instanceof RidgeGazeModel) || model.dprAtCalibration === null) return false;
+  const dpr = currentDevicePixelRatio();
+  return dpr !== null && Math.abs(dpr - model.dprAtCalibration) > 1e-3;
 }
 
 // ─────────────────────────────── Internals ───────────────────────────────────

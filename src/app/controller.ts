@@ -44,6 +44,7 @@ import {
   currentChromeTop,
   loadCalibration,
   modelChromeTop,
+  modelZoomChanged,
   saveCalibration,
   savedCalibrationNeedsUpgrade,
 } from '../gaze/calibrationModel';
@@ -54,7 +55,7 @@ import { MouseGazeSource } from '../gaze/mouseGazeSource';
 import { WebcamGazeSource } from '../gaze/webcamGazeSource';
 import { isTrackedLineEstimate } from '../reading/lineTracker';
 import { listSampleBooks, loadBookFromFile, loadBookFromText, loadBookFromUrl, loadSampleBook, type SampleBookInfo } from '../reader/bookLoader';
-import { deleteBook, getBook, getProgress, listBooks, saveBook, saveProgress } from '../reader/library';
+import { deleteBook, findLibraryBook, getBook, getProgress, listBooks, saveBook, saveProgress } from '../reader/library';
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
 import { LineTracker } from '../reading/lineTracker';
@@ -698,6 +699,14 @@ export class AppController {
   }
 
   private async openBook(book: Book, seq: number): Promise<void> {
+    // Opened before, maybe rendered differently by an earlier version (a new id): keep that entry
+    // and its reading position instead of adding a second copy.
+    try {
+      const known = await findLibraryBook(book);
+      if (known && known.id !== book.id) book = { ...book, id: known.id, addedAt: known.addedAt };
+    } catch {
+      /* the library is a convenience: open the book anyway */
+    }
     if (this.session?.book.id === book.id) {
       this.toasts.show({ id: 'already-open', message: `“${book.title}” is already open.` });
       return;
@@ -1941,7 +1950,8 @@ export class AppController {
    * toolbar or bookmarks bar), which shifts every prediction with the window origin unchanged.
    */
   private calibrationFit(model: GazeModel): 'fits' | 'size' | 'origin' {
-    if (!calibrationFitsViewport(model.viewport, this.viewportSize())) return 'size';
+    // One zoom step changes the viewport by less than the size check tolerates; the pixel ratio tells.
+    if (!calibrationFitsViewport(model.viewport, this.viewportSize()) || modelZoomChanged(model)) return 'size';
     if (!calibrationOriginFits(modelChromeTop(model), currentChromeTop(), this.layout?.linePitch)) return 'origin';
     return 'fits';
   }

@@ -72,6 +72,7 @@ function setup(settings: Partial<AppSettings> = {}, ext?: ExtSettings) {
     isContextValid: () => true,
     openSetup: () => undefined,
     onEnded: () => undefined,
+    isTrustedKey: () => true, // the tests' key events are synthetic
   };
   return { storage, deps };
 }
