@@ -8,6 +8,7 @@ import type { AppEvents, AppSettings, Book, EventBus, FeatureFrame, GazeModel, L
 import type { AccuracyCheckResult, CalibrationResult } from '../ui/calibrationOverlay';
 import { AppearanceMonitor } from '../gaze/appearance';
 import { GAZE_MODEL_KIND, GAZE_MODEL_VERSION, deserializeGazeModel } from '../gaze/calibrationModel';
+import { TrackerError } from '../gaze/camera';
 import { CameraFeatureSource } from '../gaze/faceTracker';
 import { LightingWatch, type LightingWatchUpdate } from '../gaze/lighting';
 import { LineTracker } from '../reading/lineTracker';
@@ -124,7 +125,11 @@ async function openPastedText(text = 'The eyes jump along the line. '.repeat(120
 function stubCamera() {
   let running = false;
   const listeners = new Set<(f: FeatureFrame) => void>();
-  vi.spyOn(CameraFeatureSource.prototype, 'start').mockImplementation(async () => {
+  const errorListeners = new Set<(err: TrackerError) => void>();
+  const startErrors: unknown[] = [];
+  const start = vi.spyOn(CameraFeatureSource.prototype, 'start').mockImplementation(async () => {
+    const err = startErrors.shift();
+    if (err) throw err;
     running = true;
   });
   vi.spyOn(CameraFeatureSource.prototype, 'stop').mockImplementation(() => {
@@ -133,7 +138,12 @@ function stubCamera() {
   vi.spyOn(CameraFeatureSource.prototype, 'running', 'get').mockImplementation(() => running);
   vi.spyOn(CameraFeatureSource.prototype, 'video', 'get').mockReturnValue(null);
   vi.spyOn(CameraFeatureSource.prototype, 'lastLandmarks', 'get').mockReturnValue(null);
-  vi.spyOn(CameraFeatureSource.prototype, 'onError').mockImplementation(() => () => undefined);
+  vi.spyOn(CameraFeatureSource.prototype, 'onError').mockImplementation((cb) => {
+    errorListeners.add(cb);
+    return () => {
+      errorListeners.delete(cb);
+    };
+  });
   vi.spyOn(CameraFeatureSource.prototype, 'onFrame').mockImplementation((cb) => {
     listeners.add(cb);
     return () => {
@@ -147,6 +157,17 @@ function stubCamera() {
     subscribers: () => listeners.size,
     /** Whether the camera (light) is on. */
     running: () => running,
+    /** How many times the camera was started. */
+    starts: () => start.mock.calls.length,
+    /** The next start() calls reject with these, in order. */
+    failStarts: (...errs: unknown[]) => {
+      startErrors.push(...errs);
+    },
+    /** The camera stops on its own (its track ended: unplugged, permission revoked, the laptop slept). */
+    end: (err: TrackerError) => {
+      running = false;
+      for (const cb of [...errorListeners]) cb(err);
+    },
   };
 }
 
@@ -684,6 +705,9 @@ describe('AppController', () => {
   };
 
   const toastButton = (label: string) => [...document.querySelectorAll<HTMLButtonElement>('.gr-toast__actions button')].find((b) => b.textContent === label);
+  /** A button on a toast that is showing (not on one leaving after being replaced). */
+  const liveToastButton = (label: string) =>
+    [...document.querySelectorAll<HTMLButtonElement>('.gr-toast:not([data-leaving]) .gr-toast__actions button')].find((b) => b.textContent === label);
 
   it('webcam: the camera runs only while a book is open, never in the library (privacy)', async () => {
     const { camera } = await readWithWebcam(calibratedModel(), { open: false });
@@ -712,6 +736,98 @@ describe('AppController', () => {
     hidden = false;
     document.dispatchEvent(new Event('visibilitychange'));
     await until(() => camera.running() && camera.subscribers() >= 2, 'the camera to come back');
+  });
+
+  it('webcam: a camera that freezes (the laptop slept) is restarted once on its own; freezing again within a minute is reported', async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    const { camera, states } = await readWithWebcam(calibratedModel());
+    camera.emit(webcamFrame());
+    const before = camera.starts();
+    skew += 6000; // six seconds without a frame, the tab in view
+    await until(() => camera.starts() === before + 1 && camera.running(), 'the camera to be restarted');
+    expect(toastText()).not.toMatch(/camera stopped/i);
+    camera.emit(webcamFrame());
+    skew += 6000; // frozen again
+    await until(() => /The camera stopped/.test(toastText()), 'the camera-stopped toast');
+    expect(camera.running()).toBe(false);
+    expect(camera.starts()).toBe(before + 1);
+    expect(states.at(-1)?.state).toBe('error');
+    toastButton('Try again')!.click();
+    await until(() => camera.running() && camera.starts() === before + 2, 'Try again to start the camera');
+  });
+
+  it('webcam: a camera that ends (unplugged, access revoked) is restarted once, and a failed restart says why', async () => {
+    const { camera } = await readWithWebcam(calibratedModel());
+    const before = camera.starts();
+    // Woken from sleep: the track ended, and starting again just works.
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => camera.running() && camera.starts() === before + 1, 'the camera to be restarted');
+    expect(toastText()).toBe('');
+    // Access revoked within the minute: no second restart, and the toast says the camera stopped.
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => /The camera stopped/.test(toastText()), 'the camera-stopped toast');
+    expect(camera.starts()).toBe(before + 1);
+    // Try again with access blocked: the toast says so, and offers the mouse instead of a retry.
+    camera.failStarts(new TrackerError('camera-denied'));
+    toastButton('Try again')!.click();
+    await until(() => /Camera access is blocked/.test(toastText()), 'the blocked-camera toast');
+    expect(camera.running()).toBe(false);
+    expect(liveToastButton('Try again')).toBeUndefined();
+    expect(liveToastButton('Use my mouse')).toBeTruthy();
+  });
+
+  it('webcam: the camera unplugged for good: the automatic restart reports no camera, with nothing left running', async () => {
+    const { camera, states } = await readWithWebcam(calibratedModel());
+    camera.failStarts(new TrackerError('no-camera'));
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => /No camera found/.test(toastText()), 'the no-camera toast');
+    expect(camera.running()).toBe(false);
+    expect(states.at(-1)?.state).toBe('error');
+    expect(toastButton('Try again')).toBeTruthy();
+    expect(toastButton('Use my mouse')).toBeTruthy();
+  });
+
+  it('webcam: a denied camera explains how to allow it and offers the mouse and the demo, without retrying', async () => {
+    saved.model = calibratedModel();
+    const camera = stubCamera();
+    camera.failStarts(new TrackerError('camera-denied'));
+    app.destroy();
+    localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false }));
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    await app.start();
+    const seen = record(app, 'tracking-state');
+    await openPastedText();
+    await until(() => /Camera access is blocked/.test(toastText()), 'the blocked-camera toast');
+    expect(toastText()).toMatch(/Allow the camera for this site/);
+    expect(liveToastButton('Try again')).toBeUndefined();
+    expect(toastButton('Use my mouse')).toBeTruthy();
+    expect(toastButton('Watch a demo')).toBeTruthy();
+    await sleep(300);
+    expect(camera.starts()).toBe(1);
+    expect(camera.running()).toBe(false);
+    expect(seen.at(-1)?.state).toBe('error');
+  });
+
+  it('webcam: offline (the face model fails to load): says so, leaves the camera off, and Try again recovers', async () => {
+    saved.model = calibratedModel();
+    const camera = stubCamera();
+    camera.failStarts(new TrackerError('model-load-failed'));
+    app.destroy();
+    localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false }));
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    await app.start();
+    await openPastedText();
+    await until(() => /Couldn.t load the face model/.test(toastText()), 'the model toast');
+    expect(toastText()).toMatch(/Check your connection/);
+    expect(camera.running()).toBe(false);
+    toastButton('Try again')!.click();
+    await until(() => camera.running() && camera.subscribers() >= 2, 'the webcam to run after Try again');
   });
 
   it('webcam: reports the light every second; a changed light re-learns the reading offset and offers a touch-up at a pause', async () => {
@@ -938,11 +1054,13 @@ describe('AppController', () => {
       };
     });
     const mayOffer = vi.spyOn(GuidanceGate.prototype, 'mayOffer'); // the real gate, watched
-    await readWithWebcam(calibratedModel());
+    const { camera } = await readWithWebcam(calibratedModel());
     const offers = (): number => (/The light changed/.test(toastText()) ? 1 : 0);
 
     // +10 s after opening the book the light is judged changed: too early (the book settles for 20 s).
+    // (The camera sends a frame whenever the clock jumps, as a running camera would: else it froze.)
     offset += 10_000;
+    camera.emit(webcamFrame());
     changed = true;
     transition = 'changed';
     await until(() => mayOffer.mock.results.some((r) => r.value === false), 'the gate to hold the offer back');
@@ -951,6 +1069,7 @@ describe('AppController', () => {
 
     // +21 s: the first pause (there's no reading at all here) brings the offer.
     offset += 11_000;
+    camera.emit(webcamFrame());
     await until(() => offers() === 1, 'the offer');
     expect(toastText()).toMatch(/A quick 5-dot refresh keeps page turns accurate/);
     toastButton('Not now')!.click();
@@ -958,6 +1077,7 @@ describe('AppController', () => {
 
     // Snooze and interval over, same light: that change has had its offer.
     offset += 31 * 60_000;
+    camera.emit(webcamFrame());
     const asked = mayOffer.mock.calls.length;
     await sleep(800);
     expect(offers()).toBe(0);

@@ -90,6 +90,7 @@ import {
   calibrationFitsViewport,
   calibrationOriginFits,
   cameraErrorInfo,
+  cameraStoppedInfo,
   coachFlag,
   computeWpm,
   correctedGazeBus,
@@ -110,6 +111,7 @@ import {
   shouldIgnoreShortcut,
   textEndsOnScreen,
   trackerErrorCode,
+  type CameraErrorInfo,
   type SourcePhase,
   type TrackingStatus,
 } from './logic';
@@ -141,6 +143,10 @@ interface ReadingSession {
 const HEARTBEAT_MS = 250;
 const PROGRESS_EVERY_MS = 5000;
 const HIDDEN_STOP_MS = 60_000;
+/** No camera frame for this long while it runs and the tab is visible: it froze (after the laptop slept, a muted track). */
+const CAMERA_STALL_MS = 5000;
+/** A camera that stops again this soon after being restarted on its own is reported, not restarted. */
+const CAMERA_RESTART_MIN_GAP_MS = 60_000;
 const SCROLL_SETTLE_MS = 120;
 const SAVE_POSITION_MS = 1000;
 const ESTIMATE_EMIT_MS = 100;
@@ -280,6 +286,9 @@ export class AppController {
   private sourceGen = 0;
   private camera: CameraFeatureSource | null = null;
   private offCameraError: Unsubscribe | null = null;
+  /** performance.now() of the last camera frame (with or without a face); the stall watch reads it. */
+  private lastCameraFrameAt = Number.NEGATIVE_INFINITY;
+  private lastCameraRestartAt = Number.NEGATIVE_INFINITY;
   /** undefined = not loaded from storage yet. */
   private model: GazeModel | null | undefined = undefined;
   private savedCalibration = false;
@@ -894,6 +903,7 @@ export class AppController {
     const session = this.session;
     if (!session) return;
     if (!document.hidden) {
+      this.watchCamera(now);
       this.tickLighting(now);
       this.pollGuidance(now);
     }
@@ -1551,9 +1561,9 @@ export class AppController {
     return camera;
   }
 
-  private cameraFailed(err: unknown): void {
+  private cameraFailed(err: unknown, override?: CameraErrorInfo): void {
     const code = trackerErrorCode(err);
-    const info = cameraErrorInfo(code);
+    const info = override ?? cameraErrorInfo(code);
     console.warn(`[app] camera unavailable (${code})`, err);
     this.webcamHold = { reason: 'failed', detail: info.title };
     const actions: ToastAction[] = [];
@@ -1564,10 +1574,34 @@ export class AppController {
     this.bus.emit('buddy-say', { text: info.buddyLine, priority: 'high', mood: 'worried' });
   }
 
-  /** The camera stopped on its own after starting (unplugged, taken by another app). */
+  /** The camera stopped on its own after starting (unplugged, permission revoked, taken by another app, the laptop slept). */
   private onCameraRuntimeError(err: unknown): void {
     if (this.sourceKind !== 'webcam') return;
-    this.cameraFailed(err);
+    this.recoverCamera(err);
+  }
+
+  /** Frames stopped arriving while the camera runs and the tab is visible: it froze (often after the laptop slept). */
+  private watchCamera(now: number): void {
+    if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !this.camera?.running) return;
+    if (now - this.lastCameraFrameAt < CAMERA_STALL_MS) return;
+    this.recoverCamera(new Error('The camera stopped sending pictures.'));
+  }
+
+  /**
+   * The camera stopped mid-session. Restart it once on our own, as "Try again" would: after the
+   * laptop wakes that is usually all it needs, and if it can't start the failure says why (no
+   * camera, access blocked, busy). Stopping again within a minute is reported instead.
+   */
+  private recoverCamera(err: unknown): void {
+    const now = performance.now();
+    if (now - this.lastCameraRestartAt < CAMERA_RESTART_MIN_GAP_MS) {
+      this.cameraFailed(err, cameraStoppedInfo());
+      this.syncSource();
+      return;
+    }
+    this.lastCameraRestartAt = now;
+    console.warn('[app] the camera stopped; restarting it', err);
+    this.sourceKind = null; // syncSource() then brings the webcam up afresh
     this.syncSource();
   }
 
@@ -1981,6 +2015,7 @@ export class AppController {
   // rate-limited offer of the 5-dot touch-up, shown only when the reader pauses.
 
   private readonly onCameraFrame = (frame: FeatureFrame): void => {
+    this.lastCameraFrameAt = performance.now();
     this.recorder.frame(frame);
     if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !this.session || document.hidden) return;
     this.lightingWatch.onFrame(frame);
@@ -2194,7 +2229,10 @@ export class AppController {
     this.phase = phase;
     this.phaseDetail = detail;
     const now = performance.now();
-    if (phase === 'running') this.tracking.reset(now);
+    if (phase === 'running') {
+      this.tracking.reset(now);
+      this.lastCameraFrameAt = now;
+    }
     this.refreshTracking(now);
     this.updateOverlays();
   }
@@ -2470,6 +2508,8 @@ export class AppController {
     }
     this.timers.clear('hidden-stop');
     this.dragDepth = 0;
+    // Frames were throttled while hidden: the stall watch starts afresh.
+    this.lastCameraFrameAt = performance.now();
     if (this.hiddenLong) {
       this.hiddenLong = false;
       this.syncSource();
