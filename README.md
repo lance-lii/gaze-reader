@@ -337,7 +337,9 @@ extension/                  Chrome MV3 extension: service worker, offscreen trac
                             script, popup, camera setup page
 scripts/                    Extension and Artifact builds, MediaPipe WASM copy, icon generator
 bench/                      Slow scoreboards: lighting robustness of the gaze features, reading-layer
-                            offset tolerance, replay of diagnostics recordings (npm run bench)
+                            offset tolerance, replay of diagnostics recordings (npm run bench), and
+                            the end-to-end harness: simulated hours of reading from webcam landmarks
+                            to page turns (npm run eval)
 docs/ARCHITECTURE.md        Module contracts and design notes
 ```
 
@@ -355,6 +357,7 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 | `npm test` | Run the unit and integration tests (Vitest, with jsdom for DOM tests) |
 | `npm run check` | All of the above: typecheck, tests, app build, extension build |
 | `npm run bench` | Slow accuracy scoreboards in `bench/` (several minutes). `GR_REPLAY=file.json npm run bench -- bench/replay` replays a diagnostics recording |
+| `npm run eval` | End-to-end scoreboard (about 5 minutes): a simulated reader with ground-truth gaze, through landmark noise, frame drops, blinks, glare, posture changes, a second face and glances at a phone, scored on unintended and missed page turns, turn latency, gaze error, recalibration prompts and CPU. `GR_EVAL_SEEDS`, `GR_EVAL_MINUTES`, `GR_EVAL_ONLY` and `GR_EVAL_OUT=file.json` vary it; the fast gates are `tests/endToEnd.test.ts` |
 
 ## Known limitations
 
