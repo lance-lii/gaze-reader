@@ -503,6 +503,15 @@ export class CameraFeatureSource implements FeatureSource {
     return this.session?.landmarker.delegate ?? null;
   }
 
+  /** The browser's id for the camera in use (to notice a switch to another one); null when off or not reported. */
+  get deviceId(): string | null {
+    try {
+      return this.session?.camera.track.getSettings?.().deviceId || null;
+    } catch {
+      return null;
+    }
+  }
+
   /** How lighting is measured ('off' when unsupported or after a failure); null before the first session. */
   get lightingBackend(): LightingBackend | null {
     return this.lightingProbe === undefined ? null : (this.lightingProbe?.backend ?? 'off');
