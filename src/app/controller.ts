@@ -289,6 +289,8 @@ export class AppController {
   /** performance.now() of the last camera frame (with or without a face); the stall watch reads it. */
   private lastCameraFrameAt = Number.NEGATIVE_INFINITY;
   private lastCameraRestartAt = Number.NEGATIVE_INFINITY;
+  /** The camera the reading started with, to notice a switch to another one. */
+  private cameraDeviceId: string | null = null;
   /** undefined = not loaded from storage yet. */
   private model: GazeModel | null | undefined = undefined;
   private savedCalibration = false;
@@ -1558,6 +1560,7 @@ export class AppController {
       this.afterCalibration(outcome, 'bring-up');
       return camera;
     }
+    this.noteCameraDevice(camera);
     return camera;
   }
 
@@ -1603,6 +1606,22 @@ export class AppController {
     console.warn('[app] the camera stopped; restarting it', err);
     this.sourceKind = null; // syncSource() then brings the webcam up afresh
     this.syncSource();
+  }
+
+  /** Another camera than the one the reading started with (a switch, or an unplug and a fallback): the calibration was made with the old one. */
+  private noteCameraDevice(camera: CameraFeatureSource): void {
+    const id = camera.deviceId;
+    if (!id) return;
+    const before = this.cameraDeviceId;
+    this.cameraDeviceId = id;
+    if (before === null || before === id) return;
+    this.toasts.show({
+      id: 'refresh-calibration',
+      tone: 'warn',
+      title: 'A different camera',
+      message: 'Gaze Reader is using another camera now, and the calibration was made with the old one. Recalibrate to keep page turns accurate.',
+      actions: [{ label: 'Recalibrate', primary: true, run: () => this.recalibrate() }],
+    });
   }
 
   private introduceSource(kind: GazeSourceKind): void {

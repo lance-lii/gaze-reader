@@ -127,6 +127,7 @@ function stubCamera() {
   const listeners = new Set<(f: FeatureFrame) => void>();
   const errorListeners = new Set<(err: TrackerError) => void>();
   const startErrors: unknown[] = [];
+  const state = { deviceId: null as string | null };
   const start = vi.spyOn(CameraFeatureSource.prototype, 'start').mockImplementation(async () => {
     const err = startErrors.shift();
     if (err) throw err;
@@ -144,6 +145,7 @@ function stubCamera() {
       errorListeners.delete(cb);
     };
   });
+  vi.spyOn(CameraFeatureSource.prototype, 'deviceId', 'get').mockImplementation(() => state.deviceId);
   vi.spyOn(CameraFeatureSource.prototype, 'onFrame').mockImplementation((cb) => {
     listeners.add(cb);
     return () => {
@@ -168,6 +170,8 @@ function stubCamera() {
       running = false;
       for (const cb of [...errorListeners]) cb(err);
     },
+    /** What the camera reports: its device id. */
+    state,
   };
 }
 
@@ -787,6 +791,21 @@ describe('AppController', () => {
     expect(states.at(-1)?.state).toBe('error');
     expect(toastButton('Try again')).toBeTruthy();
     expect(toastButton('Use my mouse')).toBeTruthy();
+  });
+
+  it('webcam: switching to another camera asks for a recalibration', async () => {
+    const { camera } = await readWithWebcam(calibratedModel());
+    camera.state.deviceId = 'built-in';
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => camera.running(), 'the camera to be restarted');
+    expect(toastText()).toBe(''); // the first camera seen this session
+    // The external camera is unplugged an hour later; the restart picks the built-in one.
+    const realNow = performance.now.bind(performance);
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+    camera.state.deviceId = 'external';
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => /A different camera/.test(toastText()), 'the different-camera toast');
+    expect(toastButton('Recalibrate')).toBeTruthy();
   });
 
   it('webcam: a denied camera explains how to allow it and offers the mouse and the demo, without retrying', async () => {
