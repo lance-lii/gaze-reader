@@ -87,6 +87,7 @@ function setup(settings: Partial<AppSettings> = {}) {
       setupOpened++;
     },
     onEnded: (reason) => ended.push(reason),
+    isTrustedKey: () => true, // the tests' key events are synthetic
   };
   const hubSend = (msg: HubToTab) => hubEnds.at(-1)!.postMessage(msg);
   return {
@@ -176,6 +177,24 @@ describe('PageSession', () => {
     session.destroy();
     altShift('KeyP'); // listener gone
     expect(session.state().paused).toBe(false);
+  });
+
+  it('ignores key presses a page script fakes (regression: a page could drive the extension)', async () => {
+    const t = setup({ gazeSource: 'mouse', showGazeDot: false });
+    // As on a real page: no stand-in for the browser's isTrusted, which is false for these events.
+    const session = await PageSession.start({ ...t.deps, isTrustedKey: undefined });
+    altShift('KeyO'); // would toggle the gaze dot, saved for every tab
+    altShift('KeyP'); // would pause
+    altShift('KeyX'); // would turn Gaze Reader off
+    await flush();
+    expect(t.ended).toEqual([]);
+    expect(session.state().paused).toBe(false);
+    expect((t.storage.data.get(KEYS.settings) as { settings: AppSettings }).settings.showGazeDot).toBe(false);
+    // …and the page keeps its key.
+    const e = new KeyboardEvent('keydown', { code: 'KeyP', altKey: true, shiftKey: true, bubbles: true, cancelable: true });
+    document.body.dispatchEvent(e);
+    expect(e.defaultPrevented).toBe(false);
+    session.destroy();
   });
 
   it('syncs settings with chrome.storage.local: popup edits apply live, local edits persist', async () => {
