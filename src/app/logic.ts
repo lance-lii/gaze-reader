@@ -679,6 +679,16 @@ export function cameraStoppedInfo(): CameraErrorInfo {
   };
 }
 
+/** The face model can't run in this browser at all (WebAssembly is off or blocked): no retry helps. */
+export function faceTrackerUnsupportedInfo(): CameraErrorInfo {
+  return {
+    title: 'This browser can’t run the face tracker',
+    message: 'WebAssembly is turned off or blocked here, so the face model can’t run. Read with your mouse or the demo, or try another browser.',
+    buddyLine: 'This browser won’t run my face model. The mouse works nicely too!',
+    retryable: false,
+  };
+}
+
 // ────────────────────────────── Calibration fit ─────────────────────────────
 
 /**

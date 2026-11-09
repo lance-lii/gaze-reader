@@ -96,6 +96,7 @@ import {
   correctedGazeBus,
   driftOwnerKey,
   errorMessage,
+  faceTrackerUnsupportedInfo,
   firstFullyVisibleIndex,
   formatLines,
   formatMinutes,
@@ -1566,7 +1567,8 @@ export class AppController {
 
   private cameraFailed(err: unknown, override?: CameraErrorInfo): void {
     const code = trackerErrorCode(err);
-    const info = override ?? cameraErrorInfo(code);
+    // A model that can't load because the browser has no WebAssembly isn't a network problem.
+    const info = override ?? (code === 'model-load-failed' && typeof WebAssembly !== 'object' ? faceTrackerUnsupportedInfo() : cameraErrorInfo(code));
     console.warn(`[app] camera unavailable (${code})`, err);
     this.webcamHold = { reason: 'failed', detail: info.title };
     const actions: ToastAction[] = [];

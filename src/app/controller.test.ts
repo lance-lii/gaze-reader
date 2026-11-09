@@ -849,6 +849,24 @@ describe('AppController', () => {
     await until(() => camera.running() && camera.subscribers() >= 2, 'the webcam to run after Try again');
   });
 
+  it('webcam: without WebAssembly the face model can\'t run: says so, with no pointless retry', async () => {
+    vi.stubGlobal('WebAssembly', undefined);
+    saved.model = calibratedModel();
+    const camera = stubCamera();
+    camera.failStarts(new TrackerError('model-load-failed', "Couldn't load the face-tracking runtime."));
+    app.destroy();
+    localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false }));
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    await app.start();
+    await openPastedText();
+    await until(() => /can.t run the face tracker/.test(toastText()), 'the unsupported-browser toast');
+    expect(toastText()).not.toMatch(/connection/);
+    expect(liveToastButton('Try again')).toBeUndefined();
+    expect(toastButton('Use my mouse')).toBeTruthy();
+  });
+
   it('webcam: reports the light every second; a changed light re-learns the reading offset and offers a touch-up at a pause', async () => {
     let next: LightingWatchUpdate | null = null;
     const tick = vi.spyOn(LightingWatch.prototype, 'tick').mockImplementation(() => {
