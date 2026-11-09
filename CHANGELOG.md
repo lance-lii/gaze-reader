@@ -43,6 +43,12 @@ position sat a line or two off after shifting in the chair, and page turns came 
 
 ### Web app
 
+- **A camera that stops comes back on its own.** After a laptop wakes from sleep the camera often
+  freezes or stops: a frozen camera left the reader at "looking for you" for good, and a stopped
+  one got a toast blaming another app, even when the camera had been unplugged. Gaze Reader now
+  restarts the camera once by itself when it sends no picture for 5 seconds or its video ends.
+  If it can't start, the message says why (no camera found, access blocked, busy), and a camera
+  that stops again within a minute is reported, with Try again.
 - **One zoom step asks for the quick refresh.** Zooming the page by one step (to 90 % or 110 %)
   changed the window by less than the size check allowed, so the calibration kept reading your gaze
   about a tenth off, roughly two lines at the bottom of the page. Any zoom change now offers the
