@@ -560,6 +560,15 @@ interface Collector {
   samples: CalibrationSample[];
 }
 
+/** Where a pass's dots sit: the viewport's size, its pixel ratio (zoom) and its place on the screen. */
+interface ViewportSignature {
+  width: number;
+  height: number;
+  dpr: number;
+  x: number;
+  y: number;
+}
+
 interface PositioningState {
   enteredAt: number;
   lastFrameAt: number | null;
@@ -663,6 +672,8 @@ export class CalibrationOverlay implements Mountable {
   private lastValidAt = 0;
   private validSince: number | null = null;
   private watchdog: ReturnType<typeof setInterval> | null = null;
+  /** The viewport this pass's dots were placed in (see viewportChanged). */
+  private passViewport: ViewportSignature | null = null;
   private lastFeatureLength: number | null = null;
   /** The live gaze source's blink rule, so calibration keeps exactly the frames tracking will use. */
   private readonly blinkGate = new BlinkGate();
@@ -773,9 +784,13 @@ export class CalibrationOverlay implements Mountable {
     const base = asRidgeGazeModel(current);
     const requested = this.opts.mode ?? 'standard';
     let mode: CalibrationMode = requested === 'quick' && base ? 'quick' : requested === 'check' && current ? 'check' : 'standard';
+    // The window was resized, zoomed or moved mid-pass: its dots start over (no new positioning).
+    let restart = false;
     for (;;) {
       this.runMode = mode;
-      await this.positioning(signal, mode);
+      if (restart) this.showToast('The window changed, so the dots start over.');
+      else await this.positioning(signal, mode);
+      restart = false;
       // The saved model can't read today's features: only a full calibration helps.
       if (mode !== 'standard' && base && this.lastFeatureLength !== null && this.lastFeatureLength !== base.featureLength) {
         mode = 'standard';
@@ -784,7 +799,12 @@ export class CalibrationOverlay implements Mountable {
 
       this.resetLightSamples();
       const plan = mode === 'standard' ? shuffle(STANDARD_TARGETS, this.random) : [...(mode === 'check' ? CHECK_TARGETS : QUICK_TARGETS)];
+      this.passViewport = this.viewportSignature();
       const collected = await this.collectTargets(plan, mode === 'check' ? 'validating' : 'point', signal);
+      if (collected.restart) {
+        restart = true;
+        continue;
+      }
       if (collected.succeeded < (mode === 'standard' ? MIN_TARGETS_STANDARD : MIN_TARGETS_QUICK)) {
         await this.failure(FAIL_TOO_FEW, signal);
         continue;
@@ -826,10 +846,18 @@ export class CalibrationOverlay implements Mountable {
         continue;
       }
       await this.sleep(this.timing.minTrainingMs - (performance.now() - startedAt), signal);
+      if (this.viewportChanged()) {
+        restart = true;
+        continue;
+      }
 
       let report = trained.report;
       if (mode === 'standard') {
         const val = await this.collectTargets(shuffle(VALIDATION_TARGETS, this.random), 'validating', signal);
+        if (val.restart) {
+          restart = true;
+          continue;
+        }
         if (val.succeeded >= MIN_VALIDATION_TARGETS) {
           const checked = evaluateModel(trained.model, val.samples, { maxBlink });
           if (checked.sampleCount > 0) report = checked;
@@ -1019,7 +1047,7 @@ export class CalibrationOverlay implements Mountable {
     fractions: readonly Point[],
     kind: TargetKind,
     signal: AbortSignal,
-  ): Promise<{ samples: CalibrationSample[]; succeeded: number }> {
+  ): Promise<{ samples: CalibrationSample[]; succeeded: number; restart?: true }> {
     this.setPhase(kind === 'point' ? 'targets' : 'validating');
     this.lastValidAt = performance.now();
     this.validSince = null;
@@ -1035,6 +1063,8 @@ export class CalibrationOverlay implements Mountable {
         let appear = index === 0;
         for (;;) {
           await this.untilResumed(signal);
+          // Dots placed in another viewport (size, zoom, place on the screen) don't line up with these.
+          if (this.viewportChanged()) return { samples, succeeded, restart: true };
           this.progress = { kind, index, total };
           if (announce) {
             this.emit({ phase: kind, index, total, ...(attempts > 0 ? { message: 'retry' } : {}) });
@@ -1207,6 +1237,7 @@ export class CalibrationOverlay implements Mountable {
     this.onChoice = null;
     this.onRetry = null;
     this.collector = null;
+    this.passViewport = null;
     this.paused = null;
     this.resumeWaiters = [];
     this.liveModel = null;
@@ -1584,6 +1615,11 @@ export class CalibrationOverlay implements Mountable {
     this.stopWatchdog();
     this.watchdog = this.every(250, () => {
       if (this.paused || (this.phase !== 'targets' && this.phase !== 'validating')) return;
+      // A window move has no event: interrupt the dot, and collectTargets starts the pass over.
+      if (this.viewportChanged()) {
+        this.stepCtl?.abort(INTERRUPT);
+        return;
+      }
       if (performance.now() - this.lastValidAt > this.timing.faceLostMs) this.pause('face');
     });
   }
@@ -1906,6 +1942,30 @@ export class CalibrationOverlay implements Mountable {
   private announce(text: string): void {
     const sr = this.dom?.sr;
     if (sr) sr.textContent = text;
+  }
+
+  private viewportSignature(): ViewportSignature {
+    const { width, height } = this.measureViewport();
+    const win = this.root?.ownerDocument.defaultView ?? (typeof window === 'undefined' ? null : window);
+    const origin = currentScreenOrigin();
+    return { width, height, dpr: win?.devicePixelRatio || 1, x: origin.x, y: origin.y };
+  }
+
+  /**
+   * The viewport was resized, zoomed or moved (to another screen, or across this one) since this
+   * pass's dots began: their targets are viewport px, the model one screen origin and pixel ratio.
+   */
+  private viewportChanged(): boolean {
+    const a = this.passViewport;
+    if (!a) return false;
+    const b = this.viewportSignature();
+    return (
+      Math.abs(a.width - b.width) > 0.5 ||
+      Math.abs(a.height - b.height) > 0.5 ||
+      Math.abs(a.dpr - b.dpr) > 1e-3 ||
+      Math.abs(a.x - b.x) > 0.5 ||
+      Math.abs(a.y - b.y) > 0.5
+    );
   }
 
   private measureViewport(): { width: number; height: number } {
