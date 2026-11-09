@@ -81,22 +81,22 @@ export interface SimulatedReaderState {
   linesRead: number;
 }
 
-interface GazeTruth {
+export interface GazeTruth {
   x: number;
   y: number;
   /** Index (in the layout passed to `advance`) of the line being read; -1 if unknown. */
   lineIndex: number;
 }
 
-interface BrainOptions {
+export interface BrainOptions {
   wpm: () => number;
   /** Offline mode (static layout): first and last line indices to read. */
   startLine?: number;
   endLine?: number;
 }
 
-/** Plans eye movements segment by segment against whatever layout is current. */
-class ReaderBrain {
+/** Plans eye movements segment by segment against whatever layout is current (exported for the end-to-end harness). */
+export class ReaderBrain {
   mode: SimulatedReaderMode = 'idle';
   lineDocTop: number | null = null;
   lastReadDocTop: number | null = null;
