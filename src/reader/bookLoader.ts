@@ -480,7 +480,8 @@ function quantile(values: number[], q: number): number {
 const GUTENBERG_START = /^[^\n]*\*{3}\s*START OF[^\n]*$/im;
 const GUTENBERG_END = /^[^\n]*\*{3}\s*END OF[^\n]*$/im;
 const GUTENBERG_OLD_START = /^\*END\*THE SMALL PRINT[^\n]*$/im;
-const GUTENBERG_END_LINE = /^\s*End of (?:the |this )?Project Gutenberg/im;
+// [ \t]*, not \s*: with the m flag \s* would run across a whole run of blank lines from every line in it.
+const GUTENBERG_END_LINE = /^[ \t]*End of (?:the |this )?Project Gutenberg/im;
 const PRODUCED_BY = /^(?:produced by|e-?text prepared by|transcribed (?:from|by)|this e-?book was produced|updated editions will replace|\[?transcriber)/i;
 
 interface GutenbergInfo {

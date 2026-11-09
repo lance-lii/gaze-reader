@@ -936,6 +936,12 @@ describe('long runs of spaces (regression: quadratic regexes froze the tab)', ()
     fast(() => markdownToHtml('a' + spaces + 'b' + spaces + '\nc'));
   });
 
+  it('loads Gutenberg text with a huge run of blank lines quickly', () => {
+    fast(() => loadBookFromText(`*** START OF THE PROJECT GUTENBERG EBOOK X ***\n${'\n'.repeat(100_000)}Hello world, this is the book.`, { format: 'txt' }));
+    // The end marker still ends the book.
+    expect(stripGutenberg('*** START OF X ***\nThe story.\n\n\n  End of the Project Gutenberg EBook of X\nLicence.').body).not.toMatch(/End of|Licence/);
+  });
+
   it('loads an HTML book whose link has a huge run of spaces quickly', () => {
     fast(() => loadBookFromText(`<html><body><p>Some text with <a href="a${spaces}b">a link</a> in it.</p></body></html>`, { format: 'html' }));
   });
