@@ -143,6 +143,8 @@ function stubCamera() {
       for (const cb of [...listeners]) cb(f);
     },
     subscribers: () => listeners.size,
+    /** Whether the camera (light) is on. */
+    running: () => running,
   };
 }
 
@@ -656,6 +658,35 @@ describe('AppController', () => {
   };
 
   const toastButton = (label: string) => [...document.querySelectorAll<HTMLButtonElement>('.gr-toast__actions button')].find((b) => b.textContent === label);
+
+  it('webcam: the camera runs only while a book is open, never in the library (privacy)', async () => {
+    const { camera } = await readWithWebcam(calibratedModel(), { open: false });
+    await sleep(200);
+    expect(camera.running()).toBe(false);
+    await openPastedText();
+    await until(() => camera.running() && camera.subscribers() >= 2, 'the camera to run for the book');
+    app.bus.emit('command', { name: 'open-library' });
+    await until(() => document.documentElement.dataset.screen === 'library', 'the library');
+    expect(camera.running()).toBe(false);
+    expect(camera.subscribers()).toBe(0);
+  });
+
+  it('webcam: a tab hidden for a minute switches the camera off, and coming back switches it on (privacy)', async () => {
+    // A minute is long for a test: the controller's 60-s "hidden" timer runs at once.
+    const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, ms?: number) =>
+      realSetTimeout(handler, ms === 60_000 ? 20 : ms)) as unknown as typeof setTimeout);
+    const { camera } = await readWithWebcam(calibratedModel());
+    expect(camera.running()).toBe(true);
+    let hidden = true;
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await until(() => !camera.running(), 'the camera to stop');
+    expect(camera.subscribers()).toBe(0);
+    hidden = false;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await until(() => camera.running() && camera.subscribers() >= 2, 'the camera to come back');
+  });
 
   it('webcam: reports the light every second; a changed light re-learns the reading offset and offers a touch-up at a pause', async () => {
     let next: LightingWatchUpdate | null = null;
