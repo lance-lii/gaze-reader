@@ -53,6 +53,10 @@ position sat a line or two off after shifting in the chair, and page turns came 
   with. When the camera changes mid-reading (unplugging an external webcam falls back to the
   built-in one), Gaze Reader now says so and offers to recalibrate, instead of reading your gaze
   through the old camera's calibration.
+- **The right message when the browser can't run the face model.** With WebAssembly turned off or
+  blocked (some managed or locked-down browsers), the message asked you to check your internet
+  connection and offered Try again, which could never work. It now says this browser can't run
+  the face tracker, and offers the mouse and the demo.
 - **One zoom step asks for the quick refresh.** Zooming the page by one step (to 90 % or 110 %)
   changed the window by less than the size check allowed, so the calibration kept reading your gaze
   about a tenth off, roughly two lines at the bottom of the page. Any zoom change now offers the
