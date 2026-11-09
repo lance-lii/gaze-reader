@@ -339,6 +339,12 @@ export interface Book {
   source: 'sample' | 'file' | 'paste' | 'url';
   format: BookFormat;
   addedAt: number;
+  /**
+   * Hash of the source (the file's or page's bytes, or the pasted text). `id` hashes the rendered
+   * book, which changes when a newer version renders it differently; this finds the library entry
+   * of a re-imported source anyway. Absent for samples (stable ids) and books saved before it existed.
+   */
+  sourceKey?: string;
 }
 
 export interface ReadingPosition {
