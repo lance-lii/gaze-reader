@@ -8,7 +8,7 @@ import type { Book, BookChapter, ReadingPosition } from '../types';
  * transparently lives in memory for the session.
  */
 
-export type LibraryBookMeta = Pick<Book, 'id' | 'title' | 'author' | 'wordCount' | 'format' | 'addedAt'>;
+export type LibraryBookMeta = Pick<Book, 'id' | 'title' | 'author' | 'wordCount' | 'format' | 'addedAt' | 'sourceKey'>;
 export type LibraryEntry = LibraryBookMeta & { fraction: number; lastReadAt: number | null };
 
 export type LibraryErrorCode = 'invalid' | 'quota' | 'unavailable';
@@ -262,6 +262,10 @@ async function withBackend<T>(fn: (b: Backend) => Promise<T>): Promise<T> {
 
 const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
+/** `{ sourceKey }` when `v` is a plausible one, else nothing (books saved before keys existed). */
+const sourceKeyField = (v: unknown): { sourceKey?: string } =>
+  typeof v === 'string' && v.length > 0 && v.length <= 100 ? { sourceKey: v } : {};
+
 function asChapters(v: unknown): BookChapter[] | null {
   if (!Array.isArray(v)) return null;
   const out: BookChapter[] = [];
@@ -291,6 +295,7 @@ function asBook(v: unknown): Book | null {
     source: b.source as Book['source'],
     format: b.format as Book['format'],
     addedAt: isFiniteNumber(b.addedAt) ? b.addedAt : Date.now(),
+    ...sourceKeyField(b.sourceKey),
   };
 }
 
@@ -305,6 +310,7 @@ function asMeta(v: unknown): LibraryBookMeta | null {
     wordCount: isFiniteNumber(m.wordCount) ? m.wordCount : 0,
     format: typeof m.format === 'string' && BOOK_FORMATS.has(m.format) ? (m.format as Book['format']) : 'txt',
     addedAt: isFiniteNumber(m.addedAt) ? m.addedAt : 0,
+    ...sourceKeyField(m.sourceKey),
   };
 }
 
@@ -334,8 +340,23 @@ export async function saveBook(book: Book): Promise<void> {
     wordCount: clean.wordCount,
     format: clean.format,
     addedAt: clean.addedAt,
+    ...sourceKeyField(clean.sourceKey),
   };
   await withBackend((b) => b.putBook(clean, meta));
+}
+
+/**
+ * The library entry a just-loaded book belongs to: the one with its id, else one made from the
+ * same source (sourceKey) that an earlier version rendered differently. Null for a new book.
+ * Books saved before source keys existed are found by id only.
+ */
+export async function findLibraryBook(book: Pick<Book, 'id' | 'sourceKey'>): Promise<LibraryBookMeta | null> {
+  const metas: LibraryBookMeta[] = [];
+  for (const raw of await withBackend((b) => b.allMeta())) {
+    const m = asMeta(raw);
+    if (m) metas.push(m);
+  }
+  return metas.find((m) => m.id === book.id) ?? (book.sourceKey ? (metas.find((m) => m.sourceKey === book.sourceKey) ?? null) : null);
 }
 
 export async function getBook(id: string): Promise<Book | null> {

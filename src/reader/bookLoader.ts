@@ -102,6 +102,25 @@ export function hashId(text: string): string {
   return ((BigInt(hi) << 32n) | BigInt(lo)).toString(36);
 }
 
+/**
+ * Book.sourceKey for a source's bytes: their length and a 53-bit hash (cyrb53), in base 36. Fast
+ * enough for a 200 MB PDF (hashId's 64-bit FNV-1a would take seconds there), and wide enough that
+ * two different sources in one library practically never share a key.
+ */
+export function sourceKeyOf(bytes: Uint8Array): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < bytes.length; i++) {
+    h1 = Math.imul(h1 ^ bytes[i], 2654435761);
+    h2 = Math.imul(h2 ^ bytes[i], 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `${bytes.length.toString(36)}-${(4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)}`;
+}
+
 const BLOCK_BOUNDARY = new Set([
   'p', 'div', 'section', 'article', 'li', 'dt', 'dd', 'blockquote', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5',
   'h6', 'tr', 'td', 'th', 'figure', 'figcaption', 'br', 'hr', 'ul', 'ol', 'dl', 'table', 'header', 'footer',
@@ -1517,8 +1536,8 @@ function parseTextContent(text: string, opts: TextParseOptions): ParsedBook {
   );
 }
 
-function stamp(parsed: ParsedBook, source: Book['source']): Book {
-  return { ...parsed, source, addedAt: Date.now() };
+function stamp(parsed: ParsedBook, source: Book['source'], sourceKey?: string): Book {
+  return { ...parsed, source, addedAt: Date.now(), ...(sourceKey ? { sourceKey } : {}) };
 }
 
 async function parseBytes(
@@ -1589,7 +1608,9 @@ export async function loadBookFromFile(file: File): Promise<Book> {
   }
   const bytes = new Uint8Array(buffer);
   const kind = sniffKind(bytes, file.name, file.type);
-  return stamp(await parseBytes(bytes, kind, { fallbackTitle: titleFromFileName(file.name) }), 'file');
+  // Keyed before parsing: pdf.js detaches the buffer it is handed.
+  const sourceKey = sourceKeyOf(bytes);
+  return stamp(await parseBytes(bytes, kind, { fallbackTitle: titleFromFileName(file.name) }), 'file', sourceKey);
 }
 
 /** Builds a book from pasted or programmatic text. `opts.title` wins over any detected title. */
@@ -1600,7 +1621,7 @@ export function loadBookFromText(
   if (!text || !text.trim()) throw new BookLoadError('empty', 'There’s no text to read yet — paste some first.');
   const format = opts.format ?? detectTextFormat(text);
   const parsed = parseTextContent(text, { format, explicitTitle: opts.title, fallbackTitle: 'Pasted text' });
-  return stamp(parsed, opts.source ?? 'paste');
+  return stamp(parsed, opts.source ?? 'paste', sourceKeyOf(new TextEncoder().encode(text)));
 }
 
 function normalizeUserUrl(input: string): URL {
@@ -1779,12 +1800,13 @@ export async function loadBookFromUrl(
   }
   const kind = sniffKind(fetched.bytes, finalUrl.pathname, fetched.contentType);
   const charset = /charset\s*=\s*["']?([\w.:-]+)/i.exec(fetched.contentType)?.[1] ?? null;
+  const sourceKey = sourceKeyOf(fetched.bytes);
   const parsed = await parseBytes(fetched.bytes, kind, {
     fallbackTitle: titleFromUrl(finalUrl),
     charset,
     baseUrl: finalUrl.href,
   });
-  return stamp(parsed, 'url');
+  return stamp(parsed, 'url', sourceKey);
 }
 
 // ──────────────────────────────── Sample books ────────────────────────────────

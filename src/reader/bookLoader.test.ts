@@ -627,6 +627,16 @@ describe('loadBookFromFile', () => {
     }
   });
 
+  it('keys a book on its source, so a copy rendered differently can be recognised', async () => {
+    const text = 'The same words, opened twice. '.repeat(40);
+    const pasted = loadBookFromText(text);
+    const retitled = loadBookFromText(text, { title: 'Another title' }); // another rendering, another id
+    expect(retitled.id).not.toBe(pasted.id);
+    expect(retitled.sourceKey).toBe(pasted.sourceKey);
+    expect(loadBookFromText(`${text}More.`).sourceKey).not.toBe(pasted.sourceKey);
+    expect((await loadBookFromFile(new File([text], 'same.txt'))).sourceKey).toBe(pasted.sourceKey); // the same bytes
+  });
+
   it('sniffs an EPUB by its bytes, whatever the extension', async () => {
     const book = await loadBookFromFile(new File([await tinyEpub()], 'download.bin'));
     expect(book.format).toBe('epub');

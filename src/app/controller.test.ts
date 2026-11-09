@@ -4,7 +4,7 @@
  * jsdom can't do stubbed (layout measurement, the network, canvas, the camera).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AppEvents, AppSettings, EventBus, FeatureFrame, GazeModel, LightingSignature, LineLayout, PageEndDecision, TextLine } from '../types';
+import type { AppEvents, AppSettings, Book, EventBus, FeatureFrame, GazeModel, LightingSignature, LineLayout, PageEndDecision, TextLine } from '../types';
 import type { AccuracyCheckResult, CalibrationResult } from '../ui/calibrationOverlay';
 import { AppearanceMonitor } from '../gaze/appearance';
 import { GAZE_MODEL_KIND, GAZE_MODEL_VERSION, deserializeGazeModel } from '../gaze/calibrationModel';
@@ -15,6 +15,8 @@ import { parseRecording } from './diagnostics';
 import { GuidanceGate, SustainedFlags } from './logic';
 import { FEATURE_NAMES } from '../gaze/features';
 import { MouseGazeSource } from '../gaze/mouseGazeSource';
+import { loadBookFromText } from '../reader/bookLoader';
+import { getBook, listBooks, saveBook, saveProgress } from '../reader/library';
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
 import { PageEndDetector } from '../reading/pageEndDetector';
@@ -208,6 +210,30 @@ describe('AppController', () => {
     moveMouse(420, 320);
     await sleep(120);
     expect(gaze.length).toBe(before);
+  });
+
+  it('re-importing a book that this version renders differently reopens its entry and position (regression: a duplicate)', async () => {
+    const text = 'A story about lamps, glasses and books. '.repeat(120);
+    // What an earlier version saved for the same text: the same source, a different rendering (and id).
+    const earlier = loadBookFromText(text, { source: 'paste' });
+    await saveBook({ ...earlier, id: 'earlier-render', chapters: [{ title: null, html: '<p>An earlier rendering of the story.</p>' }] });
+    await saveProgress({ bookId: 'earlier-render', fraction: 0.4, updatedAt: Date.now() });
+    const entries = (await listBooks()).length;
+    const opened = record(app, 'book-opened');
+    await openPastedText(text);
+    expect(opened.at(-1)).toMatchObject({ id: 'earlier-render', resumed: true });
+    expect((await listBooks()).length).toBe(entries);
+  });
+
+  it('keeps books saved before they had a source key, and adds the key when one is opened again', async () => {
+    const text = 'Notes on reading glasses and the light. '.repeat(120);
+    const legacy: Partial<Book> = loadBookFromText(text, { source: 'paste' });
+    delete legacy.sourceKey; // saved by a version without it
+    await saveBook(legacy as Book);
+    const entries = (await listBooks()).length;
+    await openPastedText(text);
+    expect((await listBooks()).length).toBe(entries);
+    expect((await getBook(legacy.id!))?.sourceKey).toBeTruthy();
   });
 
   describe('at the end of the book', () => {
