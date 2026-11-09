@@ -457,6 +457,14 @@ describe('markdownToHtml', () => {
     expect(markdownToHtml('Steps:\n1. one\n2. two')).toBe('<p>Steps:</p>\n<ol><li>one</li><li>two</li></ol>');
     expect(markdownToHtml('Bullets:\n- a')).toBe('<p>Bullets:</p>\n<ul><li>a</li></ul>');
   });
+
+  it('opens a tilde fence whose info string has backticks (regression: the rest of the book became code)', () => {
+    const html = markdownToHtml('~~~ js `x`\ncode\n~~~\n\nAfter the code, the story goes on.');
+    expect(html).toContain('<pre><code>code</code></pre>');
+    expect(html).toContain('<p>After the code, the story goes on.</p>');
+    // After backticks the info string may not contain one (CommonMark): that is no fence.
+    expect(markdownToHtml('``` a`b\nnot code')).not.toContain('<pre>');
+  });
 });
 
 describe('Markdown → Book', () => {
