@@ -594,6 +594,15 @@ describe('loadBookFromFile', () => {
     expect(chapterText(html, 0)).toBe('Hi there, reader.');
   });
 
+  it('opens XHTML whose head has self-closed tags (regression: <title/> swallowed the whole body)', async () => {
+    const body = '<body><h1>Chapter One</h1><p>It began with a lamp and a book.</p></body></html>';
+    const xml = '<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/xhtml">';
+    for (const head of ['<head><title/></head>', '<head><title>T</title><script type="text/javascript" src="x.js"/></head>']) {
+      const book = await loadBookFromFile(new File([xml + head + body], 'chapter1.xhtml', { type: 'application/xhtml+xml' }));
+      expect(book.chapters.map((c) => fragment(c.html).textContent).join(' ')).toContain('It began with a lamp and a book.');
+    }
+  });
+
   it('sniffs an EPUB by its bytes, whatever the extension', async () => {
     const book = await loadBookFromFile(new File([await tinyEpub()], 'download.bin'));
     expect(book.format).toBe('epub');

@@ -1459,11 +1459,26 @@ interface TextParseOptions {
   bookFormat?: BookFormat;
 }
 
+const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+
+/**
+ * XHTML self-closing tags (<title/>, <script src="x"/>) mean something else to an HTML parser:
+ * "<title/>" opens a title that swallows the whole body. In markup that declares itself XHTML,
+ * expand them first (as epub.ts does for its chapters; it isn't imported here, to stay lazy).
+ */
+function expandXhtmlSelfClosing(text: string): string {
+  const head = text.slice(0, 2000);
+  if (!/^\ufeff?\s*<\?xml/.test(head) && !/<html[^>]*\sxmlns\s*=\s*["']http:\/\/www\.w3\.org\/1999\/xhtml["']/i.test(head)) return text;
+  return text.replace(/<([A-Za-z][\w:.-]*)(\s[^<>]*?)?\/>/g, (whole, tag: string, attrs?: string) =>
+    VOID_TAGS.has(tag.toLowerCase()) ? whole : `<${tag}${attrs ?? ''}></${tag}>`,
+  );
+}
+
 function parseTextContent(text: string, opts: TextParseOptions): ParsedBook {
   let parsed: ParsedText;
   if (opts.format === 'html') {
     if (typeof DOMParser === 'undefined') throw new BookLoadError('parse', 'Reading HTML needs a browser.');
-    const doc = new DOMParser().parseFromString(text, 'text/html');
+    const doc = new DOMParser().parseFromString(expandXhtmlSelfClosing(text), 'text/html');
     const fullDocument = opts.mainContent ?? /<(?:html|body)[\s>]|<!doctype/i.test(text.slice(0, 2000));
     parsed = parseHtmlDocument(doc, { baseUrl: opts.baseUrl, mainContent: fullDocument });
   } else if (opts.format === 'md') {
