@@ -898,6 +898,16 @@ function isListStart(line: string): boolean {
   return !!m && (m[4] ?? '').trim().length > 0;
 }
 
+/**
+ * Whether a line ends the paragraph before it. As startsBlock, except that an ordered list must
+ * start at 1 to interrupt a paragraph (CommonMark): "…ended in\n1945. Then…" is one paragraph.
+ */
+function interruptsParagraph(line: string): boolean {
+  if (!startsBlock(line)) return false;
+  const m = LIST_RE.exec(line);
+  return !m || !/^\d/.test(m[2]) || Number.parseInt(m[2], 10) === 1;
+}
+
 function stripColumns(line: string, n: number): string {
   let i = 0;
   let col = 0;
@@ -1128,7 +1138,7 @@ function renderMdBlocks(lines: string[], tight: boolean, depth = 0): string {
         i++;
         break;
       }
-      if (startsBlock(lines[i])) break;
+      if (interruptsParagraph(lines[i])) break;
       para.push(lines[i].replace(/^[ \t]+/, ''));
       i++;
     }
