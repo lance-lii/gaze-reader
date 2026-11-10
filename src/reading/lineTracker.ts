@@ -47,27 +47,49 @@ import { classifySaccade } from '../signal/fixations';
  *   wild fixation can't wipe out the posterior), times a horizontal
  *   plausibility factor that penalizes x far outside the line (short
  *   paragraph-final lines).
- * - Line transitions by saccade kind (LINE_TRANSITIONS): forward → mostly
- *   stay; regression → stay or back one; return sweep → next line; jump → 60 %
- *   uniform + 40 % where dy points. The remaining mass is spread uniformly; it
- *   is small (1 %) for forward saccades and regressions, so a sudden vertical
- *   step mid-line is not cheaply explained as the reader skipping lines.
+ * - Line transitions by saccade kind: forward → stay; regression → stay (or
+ *   the next line: a sweep off a short line often looks like a regression);
+ *   return sweep → next line; jump → 60 % uniform + 40 % where dy points. While
+ *   the vertical noise is low the odds are close to what reading does
+ *   (READING_TRANSITIONS: a forward saccade stays on its line 97.5 % of the
+ *   time); as σ_y grows from 0.5 to 1 line they blend into the leakier
+ *   LINE_TRANSITIONS, because in noise the labels go wrong (in the end-to-end
+ *   simulator a noisy webcam's "forward" saccades changed lines 4 % of the
+ *   time, its regressions 39 %). With the leaky odds while the labels were
+ *   right, a slow drift that couldn't keep up with a moving head made "the
+ *   reader slipped a line" the cheaper explanation: that slip mid-line was the
+ *   commonest way the tracker went wrong. The remaining mass is spread
+ *   uniformly; it is small (≤ 1 %) for forward saccades and regressions, so a
+ *   sudden vertical step mid-line is not cheaply explained as skipping lines.
  *   Two ambiguous cases are split: a jump *down* while the eyes keep moving
  *   along the line is partly the gaze bias stepping (the drift shifts, the
  *   line stays), and a long leftward saccade out of the right half that lands
  *   too far right for a return sweep (a horizontal gaze offset) is partly one.
+ * - Where lines end tells them apart: a return sweep starts near the end of
+ *   the line it leaves (95 % within 0.23 of the column), so each line it may
+ *   have left is weighed by how close to its end the last fixation was; and a
+ *   move from the end of a short line to the column's left edge counts as a
+ *   sweep 70 % of the time whatever its label. "Line k with offset d" and
+ *   "line k + 1 with d − 1" then part at every paragraph's short last line.
+ *   That evidence needs the gaze's x to be about right: where sweeps land (just
+ *   inside the column's left edge) gives a sideways offset, and past 0.1 of the
+ *   column it fades out (gone at 0.2).
  * - Drift transitions: a slow Gaussian random walk (driftRate × 0.8 = 0.06 lines
  *   per fixation; faster while the gain is still unknown, so the drift can
  *   follow a stretch not learned yet) plus a small chance of a sudden shift
- *   (the head moved). On a
+ *   (the head moved), and while the noise is low a 10 % share of a faster walk
+ *   (0.25 lines per fixation): leaning in or settling back moves the offset by
+ *   more than a line within 20 fixations (5 % of the time in the end-to-end
+ *   simulator), faster than the slow walk can follow. On a
  *   fresh start the drift prior is N(0, 0.5 lines) with 30 % spread uniformly:
  *   calibration is usually right, but light can differ from calibration. Right
  *   after a new calibration (reset({ calibrated: true })) the light is the
  *   calibration's: the prior is the Gaussian alone.
  * - Page turns re-anchor the drift: the line the reader resumes on is known,
- *   so half of the drift belief is reset to uniform and the first fixations on
- *   the new page pin it again. A drift learned on a wrong line can't survive
- *   every turn.
+ *   so most of the drift belief (80 %) is reset to uniform and the first
+ *   fixations on the new page pin it again. A drift learned on a wrong line
+ *   can't survive every turn, nor can one learned at the bottom of the page
+ *   that a stretch not yet learned carries wrongly to the top.
  * - The gain carries over page turns, appearance changes and
  *   reset({ keepDrift }). It learns from how the offset changes as the reader
  *   moves down the page and across turns (the offset at the centre carries over
@@ -121,6 +143,15 @@ import { classifySaccade } from '../signal/fixations';
  * page as well as "3 lines of offset" until its bottom. Under correlated
  * noise the slow walk turns a page one line early now and then (1–2 of 168 in
  * three of the gapped document's harsh rows, which had none).
+ * End to end (bench/reading/lineTracker: webcam landmarks → fixations → this,
+ * nine scenarios, on seeds it wasn't tuned on) 75 % of reading fixations are
+ * on the reader's line and 3.9 % on a wrong one with the tracker sure of it;
+ * before the reading odds, the faster walk and the line ends 71 % and 5.1 %.
+ * On the scoreboard above that took the mean over its rows from 91.4 % to
+ * 92.9 % on the line, early or unsafe turns from 530 to 454 and missed ones
+ * from 285 to 266, but a horizontal offset of +200 px costs more than it did
+ * (92 % on the line and 6 of 168 turns missed, against 95 % and 5), and so do
+ * long gapless paragraphs at noise 1.4 (7 missed, against 2).
  */
 
 export interface LineTrackerOptions {
@@ -197,6 +228,28 @@ export const LINE_TRANSITIONS: Readonly<Record<Exclude<SaccadeKind, 'jump'>, Rea
   regression: Object.freeze({ stay: 0.877, next: 0.031, next2: 0, prev: 0.082 }),
   'return-sweep': Object.freeze({ stay: 0.07, next: 0.75, next2: 0.08, prev: 0.03 }),
 });
+
+/**
+ * The same, while the vertical noise is low and the labels can be trusted: close to what reading
+ * does. Measured in the end-to-end simulator (bench/endtoend) over consecutive reading fixations:
+ * forward saccades stayed on their line 99.3 % of the time, return sweeps went to the next one
+ * 98.2 %, regressions stayed 89 % and went to the next line 10.7 % (sweeps off short lines);
+ * rounded towards the leaky odds for real gaze.
+ */
+export const READING_TRANSITIONS: Readonly<Record<Exclude<SaccadeKind, 'jump'>, Readonly<TransitionRow>>> = Object.freeze({
+  forward: Object.freeze({ stay: 0.975, next: 0.015, next2: 0, prev: 0.005 }),
+  regression: Object.freeze({ stay: 0.86, next: 0.1, next2: 0, prev: 0.03 }),
+  'return-sweep': Object.freeze({ stay: 0.04, next: 0.92, next2: 0.02, prev: 0.005 }),
+});
+/** σ_y (lines) up to which READING_TRANSITIONS hold, and from which LINE_TRANSITIONS do. */
+const LABELS_SURE_SIGMA_LINES = 0.5;
+const LABELS_UNSURE_SIGMA_LINES = 1;
+/** Share of the faster drift walk while the labels are sure… */
+const FAST_WALK_SHARE = 0.1;
+/** …and its step, lines per fixation. */
+const FAST_WALK_LINES = 0.25;
+/** The share fades as the labels become unsure, in halves: round(FAST_WALK_STEPS × (1 − leak)) of 2. */
+const FAST_WALK_STEPS = 1.6;
 
 /** After a jump: 60 % uniform, 40 % where the vertical displacement points (σ = 1 line). */
 const JUMP_UNIFORM = 0.6;
@@ -379,7 +432,7 @@ const PAGE_TURN_UNIFORM = 0.02;
  * is known then, so the first fixations re-pin the drift; keeping all of it
  * would let a drift learned on a wrong line outvote the known line forever.
  */
-const PAGE_TURN_KEEP_DRIFT = 0.5;
+const PAGE_TURN_KEEP_DRIFT = 0.2;
 /** Share kept when the camera reports an appearance change (the gaze bias itself changed). */
 const APPEARANCE_KEEP_DRIFT = 0.1;
 /**
@@ -459,6 +512,7 @@ interface TrackerSnapshot {
   excursions: number;
   lastSaccade: SaccadeKind | null;
   progressX: number;
+  sidewaysPx: number;
 }
 
 interface HistoryEntry {
@@ -473,7 +527,7 @@ export class LineTracker {
   /** Drift grid (lines), symmetric around 0. */
   private readonly grid: Float64Array;
   /** Random-walk kernel over drift bins (odd length, centered) and its σ in WALK_SD_STEPs; see walkKernel. */
-  private walk: { step: number; kernel: Float64Array } | null = null;
+  private walk: { step: number; halves: number; kernel: Float64Array } | null = null;
 
   private layout: LineLayout | null = null;
   /** Indices (into layout.lines) of the readable lines, top to bottom. */
@@ -504,6 +558,8 @@ export class LineTracker {
   private excursions = 0;
   private lastSaccade: SaccadeKind | null = null;
   private progressX = 0;
+  /** Sideways offset of the gaze (px, + = reads right), from where return sweeps land. */
+  private sidewaysPx = 0;
   private est: TrackedLineEstimate | null = null;
   /** Appearance changes waiting for the first fixation that starts at or after them (ascending). */
   private pendingChanges: number[] = [];
@@ -695,7 +751,15 @@ export class LineTracker {
         kind === 'regression' &&
         -dxCol >= LONG_REGRESSION_MIN_DX_COL &&
         this.prevFix.x >= this.column.left + LONG_REGRESSION_START_COL * columnWidth;
-      this.predict(kind, ignoreDy ? 0 : (f.y - this.prevFix.y) / pitch, dxCol, sweepLike);
+      // Return sweeps land just inside the column's left edge: where they land shows how far
+      // sideways the gaze reads, and with a large sideways offset where a fixation sits on its line
+      // says nothing about which line it is.
+      if (dxCol <= -SIDEWAYS_SWEEP_DX_COL && this.prevFix.x >= this.column.left + 0.5 * columnWidth) {
+        const landed = f.x - (this.column.left + SWEEP_LANDS_COL * columnWidth);
+        this.sidewaysPx += SIDEWAYS_RATE * (clamp(landed, -SIDEWAYS_MAX_COL * columnWidth, SIDEWAYS_MAX_COL * columnWidth) - this.sidewaysPx);
+      }
+      const ends = { xFrom: this.prevFix.x, xTo: f.x, columnWidth, trust: this.lineEndTrust(columnWidth) };
+      this.predict(kind, ignoreDy ? 0 : (f.y - this.prevFix.y) / pitch, dxCol, sweepLike, ends);
     }
     this.dyUntrusted = false;
     this.gainTimeStep();
@@ -865,6 +929,7 @@ export class LineTracker {
    * already knows. With `calibrated` (a calibration just ran) the drift prior has no uniform share.
    */
   reset(opts: LineTrackerResetOptions = {}): void {
+    if (!opts.keepDrift) this.sidewaysPx = 0;
     this.driftBelief = opts.keepDrift ? this.keptDrift() : this.driftPrior(opts.calibrated ? 0 : DRIFT_PRIOR_UNIFORM);
     this.joint = this.seed(this.topPrior());
     this.clearPrevFix();
@@ -921,10 +986,26 @@ export class LineTracker {
     if (this.grid.length < 2) return Float64Array.of(1);
     const base = this.opts.driftRate * DRIFT_WALK_PER_RATE;
     const step = Math.round(Math.sqrt(base * base + GAIN_WALK_SHARE * this.gainFilter.pgg) / WALK_SD_STEP);
-    if (this.walk?.step === step) return this.walk.kernel;
-    const kernel = gaussianKernel((step * WALK_SD_STEP) / (this.grid[1]! - this.grid[0]!));
-    this.walk = { step, kernel };
+    // The faster share in two steps (all of it while σ_y < 0.53 lines, half up to 0.84, none beyond),
+    // so the kernel stays a function of the state.
+    const halves = Math.round(FAST_WALK_STEPS * (1 - this.labelLeak()));
+    if (this.walk?.step === step && this.walk.halves === halves) return this.walk.kernel;
+    const bin = this.grid[1]! - this.grid[0]!;
+    const slow = gaussianKernel((step * WALK_SD_STEP) / bin);
+    const share = (FAST_WALK_SHARE * halves) / 2;
+    const kernel = share > 0 ? mixKernels(slow, gaussianKernel(FAST_WALK_LINES / bin), share) : slow;
+    this.walk = { step, halves, kernel };
     return kernel;
+  }
+
+  /** 0 while the vertical noise is low and saccade labels can be trusted, 1 once it is high (see READING_TRANSITIONS). */
+  private labelLeak(): number {
+    return clamp01((this.sigmaLines - LABELS_SURE_SIGMA_LINES) / (LABELS_UNSURE_SIGMA_LINES - LABELS_SURE_SIGMA_LINES));
+  }
+
+  /** How far to trust where fixations sit along their line (1 → 0 as the gaze reads further sideways). */
+  private lineEndTrust(columnWidth: number): number {
+    return clamp01(1 - (Math.abs(this.sidewaysPx) / columnWidth - SIDEWAYS_TRUSTED_COL) / SIDEWAYS_FADE_COL);
   }
 
   /** The gain filter's prediction for one more fixation: its offset walks like the drift, its gain barely. */
@@ -1028,6 +1109,7 @@ export class LineTracker {
       excursions: this.excursions,
       lastSaccade: this.lastSaccade,
       progressX: this.progressX,
+      sidewaysPx: this.sidewaysPx,
     };
   }
 
@@ -1050,6 +1132,7 @@ export class LineTracker {
     this.excursions = s.excursions;
     this.lastSaccade = s.lastSaccade;
     this.progressX = s.progressX;
+    this.sidewaysPx = s.sidewaysPx;
   }
 
   /**
@@ -1166,10 +1249,41 @@ export class LineTracker {
    * step of the gaze bias; a sweep-like long regression partly as a return sweep), then the drift
    * random walk. dxCol is the horizontal displacement as a share of the column width.
    */
-  private predict(kind: SaccadeKind, dyLines: number, dxCol: number, sweepLike = false): void {
+  private predict(kind: SaccadeKind, dyLines: number, dxCol: number, sweepLike = false, ends?: LineEnds): void {
     const m = this.states.length;
     const D = this.grid.length;
     const out = new Float64Array(m * D);
+    const lines = this.layout?.lines;
+    const trust = ends && lines && ends.columnWidth > 0 && Number.isFinite(ends.xFrom) && Number.isFinite(ends.xTo) ? ends.trust : 0;
+    // A return sweep leaves a line near its end: weigh each line it may have left by how close to
+    // that end the last fixation was (the short last line of a paragraph sets lines apart).
+    if (kind === 'return-sweep' && trust > 0) {
+      const w = new Float64Array(m);
+      let any = false;
+      for (let k = 0; k < m; k++) {
+        w[k] = 1 - trust * (1 - sweepStartPlausibility(ends!.xFrom, lines![this.states[k]!]!, ends!.columnWidth));
+        if (w[k]! < 1) any = true;
+      }
+      if (any) {
+        const j = this.joint.slice();
+        for (let k = 0; k < m; k++) for (let b = 0; b < D; b++) j[k * D + b] = j[k * D + b]! * w[k]!;
+        this.joint = j;
+      }
+    }
+    // From the end of a short line the move to the next line's start is short, and often labelled
+    // forward or a regression: from each short line it would leave from its end, a share is a sweep.
+    const sweepShare = new Float64Array(m);
+    let shortSweep = false;
+    if ((kind === 'forward' || kind === 'regression') && trust > 0 && ends!.xTo <= this.column.left + SHORT_SWEEP_LANDS_COL * ends!.columnWidth) {
+      for (let k = 0; k < m; k++) {
+        const line = lines![this.states[k]!]!;
+        if (line.right - line.left >= SHORT_LINE_COL * ends!.columnWidth) continue;
+        if (ends!.xFrom < line.right - SWEEP_START_REACH_COL * ends!.columnWidth) continue;
+        sweepShare[k] = trust * SHORT_SWEEP_SHARE;
+        shortSweep = true;
+      }
+    }
+    const leak = this.labelLeak();
     // A downward mid-line jump: from each line whose jump would land on the text, a share stays on
     // the line with the drift shifted by dy. A jump down past the last line is a look below the
     // page (lingering at the end, the glance-down gesture), not the bias stepping.
@@ -1189,13 +1303,24 @@ export class LineTracker {
       src = rest;
     }
     const col = new Array<number>(m);
+    const colSweep = new Array<number>(m);
     // The jump kernel depends on the lines and dy only, not on the drift bin: build it once.
     const jk = kind === 'jump' ? jumpKernel(m, dyLines) : undefined;
     for (let b = 0; b < D; b++) {
       for (let k = 0; k < m; k++) col[k] = src[k * D + b]!;
-      const next = transitionLines(col, kind, dyLines, jk);
+      if (shortSweep) {
+        for (let k = 0; k < m; k++) {
+          colSweep[k] = sweepShare[k]! * col[k]!;
+          col[k] = col[k]! - colSweep[k]!;
+        }
+      }
+      const next = transitionLines(col, kind, dyLines, leak, jk);
+      if (shortSweep) {
+        const swept = transitionLines(colSweep, 'return-sweep', dyLines, leak);
+        for (let k = 0; k < m; k++) next[k] = next[k]! + swept[k]!;
+      }
       if (sweepLike) {
-        const sweep = transitionLines(col, 'return-sweep', dyLines);
+        const sweep = transitionLines(col, 'return-sweep', dyLines, leak);
         for (let k = 0; k < m; k++) {
           next[k] = (1 - LONG_REGRESSION_SWEEP_SHARE) * next[k]! + LONG_REGRESSION_SWEEP_SHARE * sweep[k]!;
         }
@@ -1460,7 +1585,11 @@ function jumpKernel(m: number, dyLines: number): JumpKernel {
  * Line transition of one probability vector (over readable states, top to bottom). `jk`: the jump
  * kernel for this m and dy, when the caller transitions many vectors with it (built here otherwise).
  */
-function transitionLines(a: readonly number[], kind: SaccadeKind, dyLines: number, jk?: JumpKernel): number[] {
+/**
+ * Line transitions for one drift bin. `leak` blends READING_TRANSITIONS (0, labels trusted) into
+ * LINE_TRANSITIONS (1).
+ */
+function transitionLines(a: readonly number[], kind: SaccadeKind, dyLines: number, leak: number, jk?: JumpKernel): number[] {
   const m = a.length;
   const out = new Array<number>(m).fill(0);
   let mass = 0;
@@ -1481,7 +1610,7 @@ function transitionLines(a: readonly number[], kind: SaccadeKind, dyLines: numbe
   // Absorbing edges: moving on from the last readable line (looking for a next line
   // that isn't there) keeps the reader at the bottom rather than scattering them over
   // the page; likewise moving back from the first line keeps them at the top.
-  const T = LINE_TRANSITIONS[kind];
+  const T = blendRows(READING_TRANSITIONS[kind], LINE_TRANSITIONS[kind], leak);
   const rem = Math.max(0, 1 - (T.stay + T.next + T.next2 + T.prev));
   let uniformMass = 0;
   for (let i = 0; i < m; i++) {
@@ -1505,6 +1634,62 @@ function transitionLines(a: readonly number[], kind: SaccadeKind, dyLines: numbe
  * Gaussian outside it. Mostly matters for short paragraph-final lines: a
  * fixation far to the right of where a line ends can't be on that line.
  */
+function blendRows(a: Readonly<TransitionRow>, b: Readonly<TransitionRow>, t: number): TransitionRow {
+  const u = clamp01(t);
+  return { stay: a.stay + u * (b.stay - a.stay), next: a.next + u * (b.next - a.next), next2: a.next2 + u * (b.next2 - a.next2), prev: a.prev + u * (b.prev - a.prev) };
+}
+
+/** Two centred kernels mixed (1 − share) : share. */
+function mixKernels(a: Float64Array, b: Float64Array, share: number): Float64Array {
+  const ra = a.length >> 1;
+  const rb = b.length >> 1;
+  const r = Math.max(ra, rb);
+  const k = new Float64Array(2 * r + 1);
+  for (let j = -ra; j <= ra; j++) k[j + r] = k[j + r]! + (1 - share) * a[j + ra]!;
+  for (let j = -rb; j <= rb; j++) k[j + r] = k[j + r]! + share * b[j + rb]!;
+  return k;
+}
+
+/** Where the saccade into a fixation started and ended, for evidence from where lines end. */
+interface LineEnds {
+  xFrom: number;
+  xTo: number;
+  columnWidth: number;
+  /** How far to trust it, 0..1 (see lineEndTrust). */
+  trust: number;
+}
+
+/**
+ * Return sweeps start near the end of the line they leave: 95 % within 0.23 of the column before it
+ * (the end-to-end simulator, gaze noise included). Further back, plausibility falls off (σ 0.1 of
+ * the column) to a floor: a reader may abandon a line.
+ */
+const SWEEP_START_REACH_COL = 0.22;
+const SWEEP_START_SD_COL = 0.1;
+const SWEEP_START_FLOOR = 0.05;
+/** A line shorter than this (column widths) ends early, and from its end… */
+const SHORT_LINE_COL = 0.8;
+/** …a move landing this close to the column's left edge… */
+const SHORT_SWEEP_LANDS_COL = 0.3;
+/** …is a return sweep with this probability, whatever it was labelled. */
+const SHORT_SWEEP_SHARE = 0.7;
+/** A leftward move this long (column widths) out of the right half is taken as a return sweep… */
+const SIDEWAYS_SWEEP_DX_COL = 0.4;
+/** …which, without a sideways offset, lands this far into the column (the median in the simulator)… */
+const SWEEP_LANDS_COL = 0.11;
+/** …learned at this rate, at most this far either way (column widths). */
+const SIDEWAYS_RATE = 0.2;
+const SIDEWAYS_MAX_COL = 0.4;
+/** Line ends are trusted fully up to this sideways offset (column widths), not at all past it + the fade. */
+const SIDEWAYS_TRUSTED_COL = 0.1;
+const SIDEWAYS_FADE_COL = 0.1;
+
+function sweepStartPlausibility(xFrom: number, line: TextLine, colW: number): number {
+  const d = line.right - SWEEP_START_REACH_COL * colW - xFrom;
+  if (d <= 0) return 1;
+  return Math.max(SWEEP_START_FLOOR, Math.exp(-0.5 * (d / (SWEEP_START_SD_COL * colW)) ** 2));
+}
+
 function horizontalPlausibility(x: number, line: TextLine, colW: number, pitch: number): number {
   const tol = 0.03 * colW + 8;
   const d = Math.max(line.left - tol - x, x - (line.right + tol), 0);

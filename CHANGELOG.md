@@ -29,6 +29,16 @@ position sat a line or two off after shifting in the chair, and page turns came 
   or missed turn; single-paragraph pages 83 % instead of 69 %; and on web articles (the extension)
   a 15 % stretch costs no turn and keeps 94–98 % on the line. Not yet fixed: if gaze reads 2–3 lines low from the start, the first page of a
   long paragraph still often turns early. The debug overlay shows the learned stretch ("gain").
+- **The reading position holds your line when you shift in your seat.** Leaning in or settling back
+  moves where the webcam thinks you look by a line or more within seconds, and the reading layer
+  put that down to you having moved up or down a line: its most common mistake. While tracking is
+  steady it now trusts the direction of your eye movements (a step to the right stays on the
+  line), lets the offset follow faster, tells lines apart by where they end (a return sweep starts
+  at the end of the line it leaves, so a paragraph's short last line sets lines apart), and
+  re-learns the offset on each page from the line you resume on. In the end-to-end simulation, on
+  seeds it wasn't tuned on (27 hours), fixations on the right line went from 71 % to 75 % and
+  those on a wrong line with the tracker sure of itself from 5.1 % to 3.9 %; unintended page turns
+  fell from 7.0 to 6.1 an hour and missed ones from 20 % to 15 % of pages.
 - **A glance at your phone no longer turns the page.** Looking below the page turns it
   (glance-down), but whenever the reading layer wasn't sure which line you were on, any look down
   counted: a glance at your phone or the keyboard mid-page, or the gaze dipping below the page
