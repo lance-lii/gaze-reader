@@ -212,7 +212,7 @@ export class Topbar implements Mountable {
   }
 
   setStatus(s: TopbarStatus): void {
-    const view = statusPill(s.state, s.kind, s.cameraOn);
+    const view = statusPill(s.state, s.kind, s.cameraOn, s.detail);
     const { pill, pillLabel, demoChip } = this.ui;
     pillLabel.textContent = view.label;
     pill.dataset.tone = view.tone;

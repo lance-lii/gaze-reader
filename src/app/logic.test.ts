@@ -711,3 +711,18 @@ describe('webAssemblyUsable', () => {
     expect(webAssemblyUsable()).toBe(false);
   });
 });
+
+describe('a hold on page turns (a camera switch waiting for the reader)', () => {
+  it('shows as paused with its own reason, whatever the auto-scroll setting, and the pill says it', () => {
+    const m = new TrackingStateMachine();
+    const reason = 'Page turns wait: this isn’t the camera you calibrated with.';
+    m.reset(0);
+    feed(m, 0, 2000, true);
+    expect(m.evaluate(2000, { phase: 'running', kind: 'webcam', autoScroll: true, holdReason: reason })).toEqual({ state: 'paused', detail: reason });
+    expect(m.evaluate(2000, { phase: 'running', kind: 'webcam', autoScroll: false, holdReason: reason })).toEqual({ state: 'paused', detail: reason });
+    expect(statusPill('paused', 'webcam', true, reason).description).toBe(`Camera on (video stays on this device). ${reason}`);
+    // A plain pause still says how to resume.
+    const plain = m.evaluate(2000, { phase: 'running', kind: 'webcam', autoScroll: false });
+    expect(statusPill(plain.state, 'webcam', true, plain.detail).description).toMatch(/Press P to resume/);
+  });
+});
