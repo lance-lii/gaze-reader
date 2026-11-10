@@ -5,6 +5,7 @@ import {
   DEFAULT_LINE_TRACKER_OPTIONS,
   LINE_TRANSITIONS,
   LineTracker,
+  READING_TRANSITIONS,
   isTrackedLineEstimate,
   type TrackedLineEstimate,
 } from './lineTracker';
@@ -243,6 +244,28 @@ describe('LineTracker', () => {
     const between = (short.centerY + layout.lines[3]!.centerY) / 2;
     const est = tracker.onFixation(fix(0, 780, between));
     expect(est.posterior[3]!).toBeGreaterThan(3 * est.posterior[2]!);
+  });
+
+  it('tells a short line from the next by where a return sweep starts', () => {
+    const d = makeDocument({ lines: 12, paragraphLines: [3, 3], paragraphGap: 0, shortLineFraction: [0.35, 0.35], seed: 2 });
+    const layout = d.layoutAt(0);
+    const [short, full, after] = [layout.lines[2]!, layout.lines[3]!, layout.lines[4]!];
+    const tracker = new LineTracker();
+    tracker.reset({ calibrated: true });
+    tracker.setLayout(layout, 'initial');
+    // Reading at a height between the short line and the full one below it (which one is unclear)…
+    const y = (short.centerY + full.centerY) / 2;
+    let t = 0;
+    for (const x of [short.right - 65, short.right - 25, short.right - 5]) {
+      tracker.onFixation(fix(t, x, y));
+      t += 260;
+    }
+    // …then a return sweep from the end of the short line, which is mid-way along the full one.
+    const e = tracker.onFixation(fix(t, after.left + 60, y + layout.linePitch));
+    expect(e.lastSaccade).toBe('return-sweep');
+    expect(e.lineIndex).toBe(3); // it left the short line (1.0: undecided, 0.44 against 0.41)
+    expect(e.posterior[3]!).toBeGreaterThan(4 * e.posterior[4]!);
+    expect(full.right - full.left).toBeGreaterThan(2 * (short.right - short.left));
   });
 
   it('updates progressX from live samples', () => {
@@ -616,7 +639,7 @@ describe('LineTracker under large gaze offsets (lighting)', () => {
     const s0 = sigma();
     expect(s0).toBeLessThan(0.8); // σ has been learning from 0.9...
     expect(s0).toBeGreaterThan(0.42); // ...and is not at its floor
-    // After a page turn the resume line is sure through its prior, but half of the drift belief is
+    // After a page turn the resume line is sure through its prior, but most of the drift belief is
     // uniform: the first fixation's residual against a drift that isn't known yet says nothing
     // about the noise (here it would pull σ down, the fixation being dead on the line).
     const { next, resume } = turn(tracker);
@@ -634,7 +657,41 @@ describe('LineTracker under large gaze offsets (lighting)', () => {
     for (const kind of ['forward', 'regression'] as const) {
       const T = LINE_TRANSITIONS[kind];
       expect(T.stay + T.next + T.next2 + T.prev).toBeCloseTo(0.99, 9);
+      const R = READING_TRANSITIONS[kind];
+      expect(R.stay + R.next + R.next2 + R.prev).toBeGreaterThanOrEqual(0.99);
+      // Labels trusted: a forward saccade stays on its line; a "regression" is now and then the sweep off a short line.
+      if (kind === 'forward') expect(R.stay).toBeGreaterThan(T.stay);
+      else expect(R.next).toBeGreaterThan(T.next);
     }
+  });
+
+  it('follows a gaze offset that moves by a line along the text (leaning in) instead of slipping a line', () => {
+    // The offset grows by a line over 12 fixations mid-page and stays (with the leaky odds the
+    // tracker blamed the line instead: 89 % on the line from the lean on, against 95 %).
+    let ok = 0;
+    let n = 0;
+    for (const seed of [1, 2, 3, 4, 5, 6]) {
+      const d = makeDocument({ lines: 60, seed });
+      const layout = d.layoutAt(0, { viewport });
+      const tracker = new LineTracker();
+      tracker.reset({ calibrated: true });
+      tracker.setLayout(layout, 'initial');
+      const rng = mulberry32(seed);
+      let t = 0;
+      let k = 0;
+      for (let i = 0; i <= lastFullyVisibleIndex(layout); i++) {
+        const l = layout.lines[i]!;
+        const m = Math.max(2, Math.round(((l.right - l.left) / 700) * 8));
+        for (let j = 0; j < m; j++, k++, t += 260) {
+          const lean = k < 50 ? 0 : Math.min(1, (k - 50) / 12);
+          const e = tracker.onFixation(fix(t, l.left + ((j + 0.4) / m) * (l.right - l.left), l.centerY + (lean + 0.25 * gaussian(rng)) * pitch));
+          if (k < 50) continue;
+          n++;
+          if (e.lineIndex === i) ok++;
+        }
+      }
+    }
+    expect(ok / n).toBeGreaterThan(0.93);
   });
 
   it('applies a late appearance report retroactively: rewinds to the change and replays the fixations since', () => {

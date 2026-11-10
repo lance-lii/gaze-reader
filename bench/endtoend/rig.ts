@@ -25,7 +25,7 @@
  *   CPU            — wall time per frame in the app's code (features → decision); MediaPipe's own
  *                    inference isn't simulated and isn't included.
  */
-import type { FeatureFrame, FeatureSource, GazeModel, GazeSample, LineEstimate, LineLayout, PageEndDecision, Sensitivity, Unsubscribe } from '../../src/types';
+import type { FeatureFrame, FeatureSource, Fixation, GazeModel, GazeSample, LineEstimate, LineLayout, PageEndDecision, Sensitivity, Unsubscribe } from '../../src/types';
 import { FEATURE_NAMES, frameQuality } from '../../src/gaze/features';
 import { refineGazeModel, trainGazeModel } from '../../src/gaze/calibrationModel';
 import { WebcamGazeSource } from '../../src/gaze/webcamGazeSource';
@@ -139,6 +139,16 @@ const heapUsedMB = (): number => {
   return m ? m.heapUsed / 2 ** 20 : NaN;
 };
 
+/** One fixation through the line tracker, with the line the reader really fixated, for scoring the tracker itself. */
+export interface RigFixation {
+  fixation: Fixation;
+  estimate: LineEstimate;
+  /** Index into `layout.lines` of the line the reader fixated, or -1 when not reading a visible line. */
+  trueIndex: number;
+  mode: Truth['mode'];
+  layout: LineLayout;
+}
+
 /** One gaze sample through the decision layer, for probes that look inside a session. */
 export interface RigStep {
   sample: GazeSample;
@@ -164,7 +174,9 @@ export interface RigOptions {
   /** Lines of context kept at the top after a turn (default: the app's, DEFAULT_SETTINGS.overlapLines). */
   overlapLines?: number;
   detector?: (sensitivity: Sensitivity) => PageEndDetectorLike;
+  tracker?: () => LineTracker;
   onStep?: (step: RigStep) => void;
+  onFixation?: (fix: RigFixation) => void;
 }
 
 export function runSession(scenario: Scenario, seed: number, opts: { minutes?: number } & RigOptions = {}): SessionMetrics {
@@ -181,7 +193,7 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
   let clock = 0;
   const gazeSource = new WebcamGazeSource({ features: camera, getModel: () => model, now: () => clock });
   const fixations = new FixationDetector();
-  const tracker = new LineTracker();
+  const tracker = opts.tracker ? opts.tracker() : new LineTracker();
   tracker.reset({ calibrated: true });
   tracker.setLayout(world.layout, 'initial');
   const detector: PageEndDetectorLike = opts.detector ? opts.detector(sensitivity) : new PageEndDetector({ sensitivity });
@@ -320,6 +332,10 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
       if (mid.mode === 'reading' && mid.line !== null && est.lineIndex >= 0) {
         fixCount++;
         if (Math.abs(world.layout.lines[est.lineIndex]!.docTop - mid.line) < 1) onLine++;
+      }
+      if (opts.onFixation) {
+        const trueIndex = mid.mode === 'reading' && mid.line !== null ? world.layout.lines.findIndex((l) => Math.abs(l.docTop - mid.line!) < 1) : -1;
+        opts.onFixation({ fixation: completed, estimate: est, trueIndex, mode: mid.mode, layout: world.layout });
       }
       onReadingEstimate(est);
     }

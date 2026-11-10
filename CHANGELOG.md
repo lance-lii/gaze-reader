@@ -35,6 +35,16 @@ position sat a line or two off after shifting in the chair, and page turns came 
   turns that cost you your place fell from 12.3 to 7.1 an hour on Balanced, with no more missed
   turns. This is only the default. Settings are saved as a whole, so if you have changed any
   setting before, yours keep one line until you set "Lines kept for context" to 2.
+- **The reading position holds your line when you shift in your seat.** Leaning in or settling back
+  moves where the webcam thinks you look by a line or more within seconds, and the reading layer
+  put that down to you having moved up or down a line: its most common mistake. While tracking is
+  steady it now trusts the direction of your eye movements (a step to the right stays on the
+  line), lets the offset follow faster, tells lines apart by where they end (a return sweep starts
+  at the end of the line it leaves, so a paragraph's short last line sets lines apart), and
+  re-learns the offset on each page from the line you resume on. In the end-to-end simulation, on
+  seeds it wasn't tuned on (27 hours), fixations on the right line went from 71 % to 75 % and
+  those on a wrong line with the tracker sure of itself from 5.1 % to 3.9 %; unintended page turns
+  fell from 7.0 to 6.1 an hour and missed ones from 20 % to 15 % of pages.
 - **A glance at your phone no longer turns the page.** Looking below the page turns it
   (glance-down), but whenever the reading layer wasn't sure which line you were on, any look down
   counted: a glance at your phone or the keyboard mid-page, or the gaze dipping below the page
@@ -162,6 +172,14 @@ position sat a line or two off after shifting in the chair, and page turns came 
   The noisiest scenarios count three shorter sessions instead of one long one: an early difference
   can send one long session down a much worse path (one dim hour swung from 14 to 37 missed pages
   where three 20-minute sessions stayed at 30).
+
+### Development
+
+- **A scoreboard for the line tracker itself.** `npm run bench -- bench/reading/lineTracker` scores,
+  in every scenario of the end-to-end simulation, how often the tracker is on the line the reader
+  is really reading, how often it is wrong while sure of itself, and how often it puts the reader on
+  the last line while they are two or more lines above it (the kind of error that turns pages
+  early), apart from what the page-end detector then does with it.
 
 ## 1.1.0 (unreleased, 2026-09-25)
 
