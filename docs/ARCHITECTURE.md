@@ -332,15 +332,27 @@ visible line is being read":
   adapted from the residuals of confident fixations only while the drift is pinned, clamped 0.4–3
   lines), times a horizontal plausibility factor (penalize x far outside the line's [left, right] —
   matters for short last lines of paragraphs).
-* *Line transition*, chosen by the saccade kind between consecutive fixations (`LINE_TRANSITIONS`):
-  forward → stay 0.886 / next 0.073 / prev 0.031; regression → stay 0.877 / prev 0.082 / next
-  0.031; **return-sweep → next 0.75 / next+1 0.08 / stay 0.07 / prev 0.03**; jump → 60 % uniform +
-  40 % where dy points. The remainder is spread uniformly (1 % for forward and regression, so a
-  vertical step mid-line isn't cheaply explained as skipping lines). A jump *down* while the eyes
-  keep moving along the line is 30 % treated as the bias stepping; a look away and straight back is
-  rolled back as an excursion.
+* *Line transition*, chosen by the saccade kind between consecutive fixations. While σ_y ≤ 0.5
+  lines the labels are trusted (`READING_TRANSITIONS`, close to what reading does in the end-to-end
+  simulator): forward → stay 0.975 / next 0.015 / prev 0.005; regression → stay 0.86 / next 0.1
+  (the sweep off a short line) / prev 0.03; return-sweep → next 0.92 / next+1 0.02 / stay 0.04 /
+  prev 0.005. From σ_y 0.5 to 1 line they blend into the leakier `LINE_TRANSITIONS` (forward → stay
+  0.886 / next 0.073 / prev 0.031; regression → stay 0.877 / prev 0.082 / next 0.031;
+  **return-sweep → next 0.75 / next+1 0.08 / stay 0.07 / prev 0.03**), because noise mislabels
+  saccades. Jump → 60 % uniform + 40 % where dy points. The remainder is spread uniformly (≤ 1 % for
+  forward and regression, so a vertical step mid-line isn't cheaply explained as skipping lines).
+  A jump *down* while the eyes keep moving along the line is 30 % treated as the bias stepping; a
+  look away and straight back is rolled back as an excursion.
+* *Line ends*: a return sweep starts near the end of the line it leaves (95 % within 0.23 of the
+  column), so each line it may have left is weighed by how close to its end the last fixation was
+  (Gaussian fall-off beyond 0.22 of the column, σ 0.1, floor 0.05); a move from the end of a line
+  shorter than 0.8 of the column that lands in the left 0.3 of it is a sweep 70 % of the time
+  whatever its label. Both need the gaze's x: where sweeps land gives a sideways offset (EMA 0.2 of
+  landing − 0.11 of the column), and the evidence fades out from 0.1 to 0.2 of the column of it.
 * *Drift transition*: a slow random walk (driftRate × 0.8 lines per fixation: 0.06 at the default
-  driftRate 0.075; 1.0 and 1.1 used 0.15) plus a small chance of a sudden shift. While the gain is
+  driftRate 0.075; 1.0 and 1.1 used 0.15) plus a small chance of a sudden shift, and while σ_y ≤ 0.5
+  lines a 10 % share of a faster walk (0.25 lines per fixation, fading out by σ_y 1 line): leaning in
+  or settling back moves the offset faster than the slow walk can follow. While the gain is
   still unknown the walk is faster (its variance gets 0.3 × the gain's: 0.08 lines per fixation at
   a fresh start, back to ≈ 0.06 once a page or two have pinned the gain), so the drift can follow a
   stretch the gain hasn't learned yet. Fresh start: N(0, 0.5 lines) with 30 % spread uniformly
@@ -364,7 +376,8 @@ visible line is being read":
   "line k, no drift" (spurious drifts, early and missed turns in steady light).
 * *Layout changes*: on scroll/resize, carry the posterior across by matching `docTop`; on
   `page-turn`, `afterPageTurn(resume)` puts the prior on the resume line and **re-anchors the drift**
-  (half of the belief reset to uniform), so a drift learned on a wrong line can't survive turns.
+  (80 % of the belief reset to uniform), so a drift learned on a wrong line, or one a stretch not
+  yet learned carries wrongly from the bottom of the page to the top, can't survive turns.
 * *Appearance changes*: `appearanceChangedAt(t)` (the camera saw the light or the eyelids change):
   at the first fixation starting at or after `t` the tracker keeps the line, resets the drift to
   90 % uniform and classifies that saccade on dx only (its dy belongs to the sensor).
@@ -411,7 +424,12 @@ none.
 2. **bottom-dwell** (fallback when the HMM is unsure): `(gaze.y − driftY) ≥ L.top − 0.25·pitch`
    and `gaze.x` in the right half of the column for ≥ `Tzone` ms.
 3. **glance-down** (if enabled): gaze at/below `viewport.bottom − 0.2·pitch` (off-screen below
-   counts) for ≥ `Tglance` ms — an intentional "turn the page" gesture.
+   counts) for ≥ `Tglance` ms — an intentional "turn the page" gesture. On text it needs a line
+   estimate, and counts only a look down that began ≤ 1500 ms after the gaze was at the end of `L`:
+   2 valid samples in a row across rule 2's zone (x from the middle of `L` to `zoneRight`,
+   drift-corrected y from `L.top − 0.5·pitch` down to `zoneBottom`, so a last line read a little low
+   still counts; an end seen during a look below the page makes it one from the end). In page mode
+   (`PageEndInput.pageMode`) any look down counts.
 
 | preset | θp | θx | dwell | Tzone | Tglance | cooldown |
 |---|---|---|---|---|---|---|
@@ -419,7 +437,9 @@ none.
 | balanced | 0.55 | 0.70 | 350 | 1200 | 600 | 1800 |
 | eager | 0.45 | 0.55 | 200 | 800 | 450 | 1400 |
 
-Guards: cooldown after any scroll; ≥ 60 % valid samples over the last 1000 ms; ≥ 4 fixations
+Guards: cooldown after any scroll; ≥ 60 % valid samples over the last 1000 ms, and ≥ 8 of them
+(`MIN_TRACKING_HZ` = 7 a second: fixations end at gaps over 150 ms, so slower tracking finds none;
+the web app's slow-camera message uses the same rate); ≥ 4 fixations
 on the page or ≥ 2500 ms since the last turn (glance-down exempt); never fire during a scroll
 animation (the controller doesn't call `update` then). `targetLineIndex` = the tracker's line if
 it is ≥ L−1, else L.

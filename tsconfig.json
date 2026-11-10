@@ -28,6 +28,7 @@
     "vite.config.ts",
     "vitest.config.ts",
     "bench",
-    "vitest.bench.config.ts"
+    "vitest.bench.config.ts",
+    "vitest.eval.config.ts"
   ]
 }

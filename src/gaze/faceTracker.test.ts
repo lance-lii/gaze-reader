@@ -596,6 +596,23 @@ describe('CameraFeatureSource', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it('names the camera in use while running, and nothing when off or not reported', async () => {
+    const h = harness();
+    expect(h.src.deviceId).toBeNull();
+    await h.src.start();
+    expect(h.src.deviceId).toBeNull(); // a track that doesn't report settings
+    Object.assign(h.cam.track, { getSettings: () => ({ deviceId: 'cam-1' }) });
+    expect(h.src.deviceId).toBe('cam-1');
+    Object.assign(h.cam.track, {
+      getSettings: () => {
+        throw new Error('gone');
+      },
+    });
+    expect(h.src.deviceId).toBeNull();
+    h.src.stop();
+    expect(h.src.deviceId).toBeNull();
+  });
+
   it('reports an unbiased fps when frame times jitter', async () => {
     let enqueue!: (f: VideoFrame) => void;
     class FakeProcessor {

@@ -18,8 +18,8 @@ describe('core foundation', () => {
     const store = createSettingsStore(bus, { persist: false });
     let changed: string[] = [];
     bus.on('settings-changed', (e) => { changed = e.changed; });
-    bus.emit('settings-patch', { overlapLines: 2, fontSizePx: 9999 });
-    expect(store.get().overlapLines).toBe(2);
+    bus.emit('settings-patch', { overlapLines: 3, fontSizePx: 9999 });
+    expect(store.get().overlapLines).toBe(3);
     expect(store.get().fontSizePx).toBe(DEFAULT_SETTINGS.fontSizePx);
     expect(changed).toEqual(['overlapLines']);
   });

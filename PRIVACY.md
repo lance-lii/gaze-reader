@@ -47,7 +47,9 @@ requests they make.
   conditions while you calibrated: a few lighting ratios (such as the whites of your eyes
   against the background, or one side of your face against the other) and how open your eyes
   were, so the app can tell later when the light has changed. The summary uses ratios only,
-  not how light or dark your skin is. It contains no images.
+  not how light or dark your skin is. It contains no images. With it the app keeps which camera
+  you calibrated with, as the browser's own id for it (a random code that differs from site to
+  site and changes when you clear the site's data), so it can tell when you read through another one.
 
 **Extension** (in `chrome.storage.local`, on your computer):
 
