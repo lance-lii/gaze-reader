@@ -5,7 +5,8 @@
  *   World frame → extractEyeFeatures/frameQuality (as faceTracker.processFrame does)
  *     → AppearanceMonitor (eyelids) → AppearanceChangeFilter → LineTracker.appearanceChangedAt
  *     → WebcamGazeSource (blink gate, plausibility, One Euro) → FixationDetector → LineTracker
- *     → PageEndDetector → page turn (anchor line to the top, resume line, 650-ms scroll during which
+ *     → PageEndDetector → page turn (the anchor line and the app's default context above it to the
+ *       top, resume line, 650-ms scroll during which
  *       the pipeline is blocked, and the cooldown from the end of the scroll, as ScrollController and
  *       afterJump do)
  *   A reopened book starts the reading layer over (startSession's resetPipeline('auto')); the reader
@@ -42,9 +43,12 @@ import {
   resumeLineIndex,
 } from '../../src/app/logic';
 import { frameFeatures, VIEW } from '../lighting/faceSim';
+import { DEFAULT_SETTINGS } from '../../src/core/settings';
 import { HARNESS_VERSION, PITCH, World, type Scenario, type Truth } from './world';
 
-const SCROLL_MS = 650; // AppSettings.scrollDurationMs default
+const SCROLL_MS = DEFAULT_SETTINGS.scrollDurationMs;
+/** Lines of context kept at the top after a turn, as ScrollController.computeTarget places them (0–3). */
+const overlapOf = (n: number): number => Math.round(Math.min(3, Math.max(0, n)));
 const MISS_AFTER_MS = 8000;
 const HEARTBEAT_MS = 250;
 const OFFER_TTL_MS = 120_000;
@@ -157,12 +161,15 @@ export interface PageEndDetectorLike {
 export interface RigOptions {
   /** The preset the reader chose (default 'balanced'). */
   sensitivity?: Sensitivity;
+  /** Lines of context kept at the top after a turn (default: the app's, DEFAULT_SETTINGS.overlapLines). */
+  overlapLines?: number;
   detector?: (sensitivity: Sensitivity) => PageEndDetectorLike;
   onStep?: (step: RigStep) => void;
 }
 
 export function runSession(scenario: Scenario, seed: number, opts: { minutes?: number } & RigOptions = {}): SessionMetrics {
   const sensitivity = opts.sensitivity ?? 'balanced';
+  const overlap = overlapOf(opts.overlapLines ?? DEFAULT_SETTINGS.overlapLines);
   const world = new World({ seed, scenario, ...(opts.minutes !== undefined ? { minutes: opts.minutes } : {}) });
   const viewport = { width: VIEW.width, height: VIEW.height };
 
@@ -230,13 +237,15 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
     const target = targetIndex >= 0 && targetIndex < lines.length ? targetIndex : lastFullyVisibleIndex(lines);
     const anchor = lines[target];
     if (!anchor) return;
+    // What goes to the top: the anchor (the last line read) and overlap − 1 lines above it.
+    const top = lines[target - overlap + 1] ?? anchor;
     const tr = truth!;
     const lingering = world.reader.mode === 'lingering';
     const readerDocTop = world.reader.lineDocTop;
     const L = lastFullyVisibleIndex(lines);
     const readerIdx = readerDocTop === null ? -1 : lines.findIndex((l) => Math.abs(l.docTop - readerDocTop) < 1);
     const readerVsL = readerIdx < 0 ? -lines.length : readerIdx - L;
-    const unsafe = !manual && readerDocTop !== null && readerDocTop < anchor.docTop - 0.5 * PITCH;
+    const unsafe = !manual && readerDocTop !== null && readerDocTop < top.docTop - 0.5 * PITCH;
     const start = pageStartDocTop;
     const needed = start === null || !lines[L] ? NaN : lines.filter((l) => l.docTop > start + 1 && l.docTop <= lines[L]!.docTop + 1).length;
     const kind = manual ? 'missed' : unsafe || readerVsL < -1 ? 'false' : 'intended';
@@ -260,7 +269,7 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
     });
     pageSweeps = 0;
     pageStartDocTop = null;
-    const next = Math.min(maxScroll, anchor.docTop - 0.35 * PITCH);
+    const next = Math.min(maxScroll, top.docTop - 0.35 * PITCH);
     if (next <= layout.scrollTop + 1) {
       done = true;
       return;

@@ -98,7 +98,8 @@ interface Harness {
 function setup(overrides: Partial<AppSettings> = {}, scrollerOpts?: Parameters<typeof makeScroller>[0]): Harness {
   const scroller = makeScroller(scrollerOpts);
   const bus = createEventBus();
-  const settings: AppSettings = { ...DEFAULT_SETTINGS, ...overrides };
+  // The turn mechanics below are worked out with one line of context; the default has its own test.
+  const settings: AppSettings = { ...DEFAULT_SETTINGS, overlapLines: 1, ...overrides };
   const events: Harness['events'] = [];
   for (const type of ['page-turn', 'page-turn-undone'] as const) {
     bus.on(type, (payload: AppEvents[typeof type]) => events.push({ type, payload }));
@@ -175,6 +176,16 @@ describe('ScrollController.computeTarget', () => {
 });
 
 describe('ScrollController.turnPage', () => {
+  it('keeps two lines of context by default: the line above the last one read goes to the top', async () => {
+    expect(DEFAULT_SETTINGS.overlapLines).toBe(2);
+    const { scroller, controller, events } = setup({ scrollDurationMs: 0, overlapLines: DEFAULT_SETTINGS.overlapLines });
+    scroller.setScroll(2000);
+    const layout = makeLayout(2000);
+    await controller.turnPage(layout, 13, { auto: true, reason: 'line-tracker' });
+    expect(events[0]).toMatchObject({ type: 'page-turn', payload: { from: 2000, to: layout.lines[12].docTop - 14 } });
+    expect(scroller.scrollTop).toBe(layout.lines[12].docTop - 14);
+  });
+
   it('emits page-turn and animates with an ease-in-out curve to the exact target', async () => {
     const { scroller, controller, events } = setup({ scrollDurationMs: 400 });
     scroller.setScroll(2000);
@@ -403,9 +414,9 @@ describe('ScrollController on the window', () => {
     });
     window.scrollTo = scrollTo as unknown as typeof window.scrollTo;
     const bus = createEventBus();
-    const controller = new ScrollController({ scroller: window, bus, getSettings: () => ({ ...DEFAULT_SETTINGS, scrollDurationMs: 0 }) });
+    const controller = new ScrollController({ scroller: window, bus, getSettings: () => ({ ...DEFAULT_SETTINGS, overlapLines: 1, scrollDurationMs: 0 }) });
     await controller.turnPage(null, -1, { auto: false, reason: 'key' });
-    expect(y).toBeCloseTo(700 - 2 * 22 * 1.9);
+    expect(y).toBeCloseTo(700 - 2 * 22 * 1.9); // one screen less the line kept and the one above it
     expect(scrollTo).toHaveBeenLastCalledWith(expect.objectContaining({ behavior: 'instant' }));
     expect(controller.atEnd()).toBe(false);
     await controller.scrollTo(99_999);

@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { SLOW_MS, gateReport, gateSession, gateTitle, type Gate } from './endToEndGates';
 
-const GATE: Gate = { scenario: 'noisy webcam', minutes: 10, seeds: [1, 2, 3], maxFalse: 7, maxMissed: 39 };
+const GATE: Gate = { scenario: 'noisy webcam', minutes: 10, seeds: [1, 2, 3], maxFalse: 9, maxMissed: 36 };
 
 describe('end-to-end gate: noisy webcam (simulated reader, fixed seed)', () => {
   it(gateTitle(GATE), { timeout: SLOW_MS }, () => {

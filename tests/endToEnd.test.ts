@@ -7,10 +7,10 @@ import { describe, expect, it } from 'vitest';
 import { SLOW_MS, gateReport, gateSession, gateTitle, type Gate } from './endToEndGates';
 
 const GATES: Gate[] = [
-  { scenario: 'clean', minutes: 20, maxFalse: 2, maxMissed: 2 },
-  { scenario: 'everyday', minutes: 20, maxFalse: 6, maxMissed: 6 },
-  { scenario: 'everyday', minutes: 20, sensitivity: 'relaxed', maxFalse: 2, maxMissed: 7 },
-  { scenario: 'distracted', minutes: 15, maxFalse: 2, maxMissed: 5 },
+  { scenario: 'clean', minutes: 20, maxFalse: 3, maxMissed: 2 },
+  { scenario: 'everyday', minutes: 20, maxFalse: 6, maxMissed: 5 },
+  { scenario: 'everyday', minutes: 20, sensitivity: 'relaxed', maxFalse: 2, maxMissed: 11 },
+  { scenario: 'distracted', minutes: 15, maxFalse: 3, maxMissed: 3 },
 ];
 
 describe('end-to-end gates: everyday conditions (simulated reader, fixed seed)', () => {
