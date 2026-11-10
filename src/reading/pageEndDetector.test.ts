@@ -487,6 +487,24 @@ describe('PageEndDetector', () => {
     expect(rig.run(3000, phone, atL)?.d.reason).toBe('glance-down');
   });
 
+  it('takes a look down from the end of a last line that reads a little low (regression: dim light, a posture change: a finished page never turned)', () => {
+    // Here the glance threshold is only 0.6 pitch below the last line's centre. With a 30 px downward
+    // error the tracker hasn't learned, every sample on the last line is past it: one long look
+    // "below the page" that began before the reader reached the end, so the deliberate look down
+    // after finishing was never "from the end".
+    const zones = pageEndZones(layout)!;
+    expect(zones.glanceTop - line(L).centerY).toBeLessThan(30);
+    const low = 30;
+    const unsure = estimate(L, { p: 0.4, fix: 30 }); // as in noisy light: rule 1 can't act
+    const rig = new Rig();
+    rig.run(1500, { x: xAt(L - 3, 0.5), y: line(L - 3).centerY + low }, unsure);
+    const start = rig.t;
+    // Reads the last line in 1.2 s (only ~0.6 s in bottom-dwell's half), then looks well below it.
+    const onLine = rig.run(1200, (t) => ({ x: xAt(L, 0.05 + 0.9 * Math.min(1, (t - start) / 1200)), y: line(L).centerY + low }), unsure);
+    const hit = onLine ?? rig.run(900, { x: xAt(L, 0.6), y: line(L).centerY + 3 * pitch + low }, unsure);
+    expect(hit?.d.reason, 'the finished page turned').toBe('glance-down');
+  });
+
   it('forgets the end of the last line on a scroll, so a look down right after a turn doesn\'t turn the next page too', () => {
     const lookDown = { x: 500, y: viewport.bottom + 300 };
     const unsure = estimate(L, { p: 0.4, fix: 30 });

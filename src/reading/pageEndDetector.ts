@@ -71,7 +71,8 @@ import { DEFAULT_FIXATION_OPTIONS } from '../signal/fixations';
  *  - Glance-down re-arms only after the gaze has come back up onto the page, so
  *    looking at the keyboard turns one page, not one every cooldown.
  *  - Glance-down counts only a look below the page that starts within GLANCE_ORIGIN_MS of
- *    the gaze being at the end of the last line (across rule 2's zone, END_SAMPLES in a row), and only
+ *    the gaze being at the end of the last line (across rule 2's zone and down to its bottom, below
+ *    the glance threshold, END_SAMPLES in a row), and only
  *    once there is a line estimate; page mode (`pageMode`, no lines to follow) keeps the plain
  *    rule. The zone, not θx along the line: Dewey's corner and the screen edge to the right of the
  *    text armed half of the unintended glance turns left in the harness, and Relaxed's θx = 0.85
@@ -547,14 +548,21 @@ export class PageEndDetector {
     if (valid && yc < zones.glanceTop - GLANCE_REARM_LINES * pitch) this.glanceArmed = true;
     // Where did this look below the page begin? A deliberate glance follows the end of the last line.
     if (valid) {
+      // Down to rule 2's own bottom, past the glance threshold: gaze that reads a little low (dim
+      // light, a posture change) puts the end of the last line there.
+      const atEnd = yc >= Lline.top - END_ABOVE_LINES * pitch && yc < zones.zoneBottom && x >= zones.zoneLeft && x <= zones.zoneRight;
+      this.endRun = atEnd ? this.endRun + 1 : 0;
+      if (this.endRun >= END_SAMPLES) {
+        this.endSeenAt = t;
+        // Reading low, the last line itself is already "below the page": that look began before the
+        // reader got to its end, and was judged then. Its end seen, it is a look down from the end.
+        if (this.below) this.belowFromEnd = true;
+      }
       if (yc >= zones.glanceTop) {
         if (!this.below) this.belowFromEnd = t - this.endSeenAt <= GLANCE_ORIGIN_MS;
         this.below = true;
       } else {
         this.below = false;
-        const atEnd = yc >= Lline.top - END_ABOVE_LINES * pitch && x >= zones.zoneLeft && x <= zones.zoneRight;
-        this.endRun = atEnd ? this.endRun + 1 : 0;
-        if (this.endRun >= END_SAMPLES) this.endSeenAt = t;
       }
     }
     // A look at the keyboard or a phone mid-page is an excursion for the line tracker (it keeps its
