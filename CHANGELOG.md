@@ -41,6 +41,10 @@ position sat a line or two off after shifting in the chair, and page turns came 
   end-to-end simulation a glance at a phone then turned the page about 5 times an hour. Page turns
   now wait until tracking is fast enough again, and the web app says why after 5 seconds. At 10
   frames a second and above nothing changes.
+- **A page no longer turns the moment you come back.** Gaze resting at the end of the page counts up
+  towards a turn. If tracking stopped meanwhile (you opened Settings, switched tabs, or the camera
+  froze and restarted), the count carried on from where it was, so a page could turn a frame or two
+  after you came back. A gap of more than 0.4 s now starts the count over, as a long blink already did.
 - **Calibration starts over when the window changes.** Resizing or zooming the window, or moving it
   to another screen, in the middle of the dots mixed dots from before and after the change into one
   calibration, which then read your gaze in the wrong place. The dots now start over from the first

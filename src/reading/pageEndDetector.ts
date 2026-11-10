@@ -193,7 +193,11 @@ export function pageEndZones(layout: LineLayout | null): PageEndZones | null {
 const DWELL_DECAY = 3;
 /** Tracking dropouts shorter than this freeze a dwell; longer ones reset it. */
 const DROPOUT_GRACE_MS = 400;
-/** Larger gaps between updates (the controller paused us) count as this much time. */
+/**
+ * A gap between updates (frames lost, the controller pausing us) counts as at most this much
+ * time; one longer than DROPOUT_GRACE_MS (the tab hidden, a dialog open, the camera frozen and
+ * restarted) is a dropout like any other: the dwells and the look below the page start over.
+ */
 const MAX_STEP_MS = 100;
 /** How long "confidently at the end of the last line" stays armed for the return-sweep shortcut. */
 const SWEEP_ARM_MS = 1500;
@@ -386,8 +390,13 @@ export class PageEndDetector {
     const t = input.t;
     if (!Number.isFinite(t)) return idle(-1, 'no clock (t is not finite)');
     if (this.startedAt === null) this.startedAt = t;
-    const dt = this.lastT === null ? 0 : Math.min(MAX_STEP_MS, Math.max(0, t - this.lastT));
+    const gap = this.lastT === null ? 0 : t - this.lastT;
+    const dt = gap > DROPOUT_GRACE_MS ? 0 : Math.min(MAX_STEP_MS, Math.max(0, gap));
     this.lastT = Math.max(t, this.lastT ?? t);
+    // Nothing was seen for a while: what the dwells held (and where a look below the page began)
+    // belongs to before the gap. Without this a dwell built before Settings was opened finished
+    // within a frame or two of closing it.
+    if (gap > DROPOUT_GRACE_MS) this.forgetHeld();
 
     const g = input.gaze;
     const valid = !!g && g.valid && Number.isFinite(g.x) && Number.isFinite(g.y);
@@ -639,6 +648,16 @@ export class PageEndDetector {
       return back >= 0.5 * w && x <= z.columnLeft + SWEEP_LAND_COL * z.columnWidth && dy >= SHORT_SWEEP_MIN_DY_LINES * z.pitch;
     }
     return back >= SWEEP_MIN_DX_COL * z.columnWidth && x <= z.columnLeft + SWEEP_LAND_COL * z.columnWidth;
+  }
+
+  /** After a long gap: the dwells, an armed sweep and a look below the page in progress start over. */
+  private forgetHeld(): void {
+    this.lineDwell.reset();
+    this.zoneDwell.reset();
+    this.glanceDwell.reset();
+    this.disarmSweep();
+    this.below = false;
+    this.belowFromEnd = false;
   }
 
   private disarmSweep(): void {

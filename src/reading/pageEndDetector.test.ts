@@ -507,6 +507,22 @@ describe('PageEndDetector', () => {
     expect(rig.run(1000, on, estimate(L, { fix: 12 }))!.at - blinkEnd).toBeLessThanOrEqual(4 * STEP);
   });
 
+  it('starts the dwells over after a long gap with no updates (regression: a dwell built before Settings fired right after it)', () => {
+    // Bottom-dwell at 1.0 s of 1.2 s, then 20 s without a sample reaching the detector (a dialog
+    // open, the tab hidden, the camera frozen and restarted), then the same spot again.
+    const unsure = estimate(L - 6, { p: 0.4, fix: 30 }); // unsure, and far from the end: only rule 2 acts
+    const zone = { x: pageEndZones(layout)!.zoneLeft + 40, y: line(L).centerY };
+    const rig = new Rig();
+    expect(rig.run(1000, zone, unsure)).toBeNull();
+    rig.t += 20_000;
+    const back = rig.t;
+    expect(rig.run(400, zone, unsure), 'fired off the dwell from before the gap').toBeNull();
+    // The dwell builds again from nothing: the full Tzone, not the 200 ms left over.
+    const hit = rig.run(2000, zone, unsure);
+    expect(hit?.d.reason).toBe('bottom-dwell');
+    expect(hit!.at - back).toBeGreaterThanOrEqual(PAGE_END_PRESETS.balanced.zoneMs);
+  });
+
   it('needs some reading on the page before the tracker-based rules may fire', () => {
     const rig = new Rig();
     const est = estimate(L, { fix: 2, sac: 'return-sweep' });
