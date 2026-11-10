@@ -10,7 +10,7 @@ import {
   pageEndZones,
 } from './pageEndDetector';
 import type { TrackedLineEstimate } from './lineTracker';
-import { mulberry32 } from './simulatedReader';
+import { gaussian, mulberry32 } from './simulatedReader';
 import { makeDocument } from './testLayouts';
 
 const doc = makeDocument({ lines: 40, paragraphLines: [99, 99], seed: 1 });
@@ -451,6 +451,40 @@ describe('PageEndDetector', () => {
     rig.run(300, { x: xAt(L, 0.9), y: line(L).centerY }, unsure(L));
     rig.run(2000, { x: xAt(L - 4, 0.5), y: line(L - 4).centerY }, unsure(L));
     expect(rig.run(3000, lookDown, unsure(L))).toBeNull();
+  });
+
+  it('takes only the end of the last line itself for where a look down starts (regression: Dewey\'s corner, a frame on the way to the phone)', () => {
+    const phone = { x: 560, y: viewport.bottom + 600 };
+    const unsure = estimate(8, { p: 0.4, fix: 30 }); // reading line 8 of 20, the tracker too unsure to veto
+    const zones = pageEndZones(layout)!;
+    const reading = { x: xAt(8, 0.5), y: line(8).centerY };
+    // Dewey's bubble in the bottom-right corner, right of the column, then the phone.
+    let rig = new Rig();
+    rig.run(1500, reading, unsure);
+    rig.run(800, { x: zones.zoneRight + 60, y: line(L).centerY - 10 }, unsure);
+    expect(rig.run(3000, phone, unsure), 'Dewey, then the phone').toBeNull();
+    // One look at that corner, read a little low, straddling the glance threshold.
+    const r = mulberry32(9);
+    rig = new Rig();
+    rig.run(1500, reading, unsure);
+    expect(rig.run(2000, () => ({ x: zones.zoneRight + 60 + 15 * gaussian(r), y: zones.glanceTop + 20 + 20 * gaussian(r) }), unsure), 'a noisy look at the corner').toBeNull();
+    // A look down from the right of line 8 with one frame on the way at the last line's height.
+    rig = new Rig();
+    rig.run(1500, { x: xAt(8, 0.85), y: line(8).centerY }, unsure);
+    rig.run(STEP, { x: xAt(8, 0.85), y: line(L).centerY }, unsure);
+    expect(rig.run(3000, phone, unsure), 'one frame through the end of the page on the way down').toBeNull();
+    // The phone, back up to line 8 (one frame past the end on the way), the phone again.
+    rig = new Rig();
+    rig.run(1500, { x: xAt(8, 0.8), y: line(8).centerY }, unsure);
+    expect(rig.run(2500, phone, unsure)).toBeNull();
+    rig.run(STEP, { x: xAt(L, 0.85), y: line(L).centerY }, unsure);
+    rig.run(700, { x: xAt(8, 0.8), y: line(8).centerY }, unsure);
+    expect(rig.run(3000, phone, unsure), 'the phone again').toBeNull();
+    // From the end of the last line itself it is the gesture, as before.
+    const atL = estimate(L, { p: 0.4, fix: 30 });
+    rig = new Rig();
+    rig.run(300, { x: xAt(L, 0.9), y: line(L).centerY }, atL);
+    expect(rig.run(3000, phone, atL)?.d.reason).toBe('glance-down');
   });
 
   it('forgets the end of the last line on a scroll, so a look down right after a turn doesn\'t turn the next page too', () => {
