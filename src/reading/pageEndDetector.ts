@@ -79,10 +79,14 @@ import { DEFAULT_FIXATION_OPTIONS } from '../signal/fixations';
  *    left so little of the line that fidgety readers' own looks down from its end missed. Without that, half of
  *    the end-to-end harness's glance-down turns were unintended (bench/endtoend: a phone
  *    glance mid-page, reading the last lines with the gaze dipping below the page, glare).
- *    With it, unintended turns fell from 12.9 to 7.2 an hour over 32 simulated hours (held-out
- *    seeds), for 1 point more missed turns (16.9 → 17.9 %). A wider origin (2 pitches above
- *    the last line, 2.5 s) kept fewer misses only in the noisiest scenario and let half the
- *    unintended turns back; the tracker's line as an extra origin changed nothing.
+ *    With it and the guards and bounds here, against the deployed detector (`npm run eval`,
+ *    seeds 1–3, 33 h a preset): unintended turns 17.0 → 6.9 an hour on Balanced and 13.2 → 4.2 on
+ *    Relaxed, missed pages 17.5 → 20.4 % and 24.6 → 27.2 % (within their 95 % intervals; most of
+ *    the rise in dim light, glasses and noisy webcams, and where the reader pauses or re-reads
+ *    before looking down, which no origin rule can tell from a phone glance). A wider origin
+ *    (2 pitches above the last line, 2.5 s), and a look down any time within 8 s of the end while
+ *    the gaze stays in the last six lines, each kept fewer misses only in noise and let unintended
+ *    turns back; the tracker's line as an extra origin changed nothing.
  *  - After firing, rules 1 and 2 wait for the gaze to come back up the page.
  *    Gaze that stays parked at the bottom right (a resting mouse, eyes that
  *    didn't follow the turn) would otherwise "reach the end" of every new page

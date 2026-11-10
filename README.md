@@ -235,12 +235,16 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
    - your gaze rests at the bottom right of the text (a fallback for when the tracker is unsure);
    - you deliberately look below the page from the end of the last line (glance-down, which you
      can switch off). A look down that starts anywhere else, at the keyboard or a phone mid-page,
-     doesn't turn it, and neither does one while the tracker is confident you're still above the
-     last two lines.
+     Dewey in the corner or the edge of the screen, doesn't turn it; neither does one while the
+     tracker is confident you're still above the last two lines, or before it has placed you on
+     the page at all (a book just opened). If you finish a page and think or re-read for a moment
+     before looking down, look back at the end of the last line first: in the end-to-end simulation
+     that pause is where most of the missed turns are.
 
-   Guards prevent false turns: a cooldown after every scroll, enough valid tracking in the last
-   second (and tracking fast enough to follow the lines: at least 7 frames a second), some
-   reading on the new page, and never a turn during a blink. After a turn, the
+   Guards prevent false turns: a cooldown after every scroll and after a book opens or a
+   calibration ends, enough valid tracking in the last second (and tracking fast enough to follow
+   the lines: at least 7 frames a second), some reading on the new page, and never a turn during a
+   blink. After a turn, the
    detector waits for your eyes to come back up the page, so a resting gaze or mouse can't page
    through the book on its own.
 6. **Scrolling** puts the next unread line near the top (keeping 1 line of context by default)

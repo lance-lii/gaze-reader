@@ -36,9 +36,16 @@ position sat a line or two off after shifting in the chair, and page turns came 
   line, where you finish the page: its right half, held for a moment, and not a glance at Dewey
   in the corner beside it, the edge of the screen, or one frame on the way to your phone. When the
   gaze reads a little low at the bottom of the page (dim light, after shifting in your seat), the
-  end of the last line can sit just below the page edge; it still counts as where you finished. In the new end-to-end simulation (`npm run eval`), unintended
-  page turns fell from 12.9 to 7.2 an hour, for one more missed turn in a hundred. The extension's
-  page mode, which has no lines to follow, still turns on any look down.
+  end of the last line can sit just below the page edge; it still counts as where you finished.
+  The extension's page mode, which has no lines to follow, still turns on any look down.
+
+  With this and the other page-turn changes below, in the end-to-end simulation (`npm run eval`,
+  33 simulated hours per preset) unintended page turns fell from 17.0 to 6.9 an hour on Balanced and
+  from 13.2 to 4.2 on Relaxed. Missed turns rose from 17.5 to 20.4 % of pages on Balanced and from
+  24.6 to 27.2 % on Relaxed: about one more missed page for every three or four unintended turns
+  prevented, mostly in dim light, with glasses and with noisy webcams. Both rises are within the
+  simulation's 95 % intervals (± 9 to 13 points over all scenarios). A missed turn waits for you to
+  look down again or press a key; an unintended one loses your place.
 - **No page turns before you have read anything.** When a book opened or a calibration ended, the
   reading layer had nothing to go on until your first look at the text, and until then any look
   below the page counted as the turn gesture: glancing at your phone or the keyboard as the camera
