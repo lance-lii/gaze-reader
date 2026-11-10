@@ -5,14 +5,18 @@
  *   World frame → extractEyeFeatures/frameQuality (as faceTracker.processFrame does)
  *     → AppearanceMonitor (eyelids) → AppearanceChangeFilter → LineTracker.appearanceChangedAt
  *     → WebcamGazeSource (blink gate, plausibility, One Euro) → FixationDetector → LineTracker
- *     → PageEndDetector → page turn (anchor line to the top, resume line, cooldown, 650-ms scroll
- *       during which the pipeline is blocked, as ScrollController/afterJump do)
+ *     → PageEndDetector → page turn (anchor line to the top, resume line, 650-ms scroll during which
+ *       the pipeline is blocked, and the cooldown from the end of the scroll, as ScrollController and
+ *       afterJump do)
+ *   A reopened book starts the reading layer over (startSession's resetPipeline('auto')); the reader
+ *   may first glance at the phone or keyboard (World.arrive), also after a calibration refresh.
  *   DriftWatch + GuidanceGate → a 5-dot refresh offer at a pause; the simulated reader accepts it
  *   (refineGazeModel on 5 dots at today's posture; the reading layer re-learns its offset).
  *   A reader who has finished the page and waited 8 s without a turn turns it by hand: a miss.
  *
  * Scoring (truth from the World):
- *   intended turn  — the reader had finished the page's last line (lingering).
+ *   intended turn  — the reader had finished the page's last line (lingering), or was on it (or the
+ *                    line above, kept on screen): "early" then, scored apart.
  *   premature turn — anything else: an unintended turn. "Unsafe" when the line being read
  *                    scrolls out of view (the reader loses their place).
  *   latency        — finished the last line → turn (time spent looking away excluded).
@@ -20,14 +24,14 @@
  *   CPU            — wall time per frame in the app's code (features → decision); MediaPipe's own
  *                    inference isn't simulated and isn't included.
  */
-import type { FeatureFrame, FeatureSource, GazeModel, GazeSample, LineEstimate, LineLayout, PageEndDecision, Unsubscribe } from '../../src/types';
+import type { FeatureFrame, FeatureSource, GazeModel, GazeSample, LineEstimate, LineLayout, PageEndDecision, Sensitivity, Unsubscribe } from '../../src/types';
 import { FEATURE_NAMES, frameQuality } from '../../src/gaze/features';
 import { refineGazeModel, trainGazeModel } from '../../src/gaze/calibrationModel';
 import { WebcamGazeSource } from '../../src/gaze/webcamGazeSource';
 import { AppearanceMonitor } from '../../src/gaze/appearance';
 import { FixationDetector } from '../../src/signal/fixations';
 import { LineTracker, isTrackedLineEstimate } from '../../src/reading/lineTracker';
-import { PageEndDetector } from '../../src/reading/pageEndDetector';
+import { PageEndDetector, type PageEndInput } from '../../src/reading/pageEndDetector';
 import {
   AppearanceChangeFilter,
   DriftWatch,
@@ -38,7 +42,7 @@ import {
   resumeLineIndex,
 } from '../../src/app/logic';
 import { frameFeatures, VIEW } from '../lighting/faceSim';
-import { PITCH, World, type Scenario, type Truth } from './world';
+import { HARNESS_VERSION, PITCH, World, type Scenario, type Truth } from './world';
 
 const SCROLL_MS = 650; // AppSettings.scrollDurationMs default
 const MISS_AFTER_MS = 8000;
@@ -79,6 +83,8 @@ export interface TurnRecord {
   kind: 'intended' | 'false' | 'missed';
   /** The line being read scrolled out of view. */
   unsafe: boolean;
+  /** An intended turn made before the reader had finished the last line (on it, or the line above it). */
+  early: boolean;
   /** Reader's line − the last fully visible line (0 = on it). */
   readerVsL: number;
   /** Finished the last line → turn, ms (0 when it turned while the reader was still on it). */
@@ -97,6 +103,7 @@ export interface TurnRecord {
 export interface SessionMetrics {
   scenario: string;
   seed: number;
+  sensitivity: Sensitivity;
   minutes: number;
   frames: number;
   turns: TurnRecord[];
@@ -139,13 +146,23 @@ export interface RigStep {
   turns: readonly TurnRecord[];
 }
 
+/** What the rig needs of a page-end detector: the working tree's, or the deployed one (deployedPageEndDetector.ts). */
+export interface PageEndDetectorLike {
+  update(input: PageEndInput): PageEndDecision;
+  notifyScrolled(t: number): void;
+  reset(): void;
+}
+
 /** Ways the rig can be varied (A/B of a candidate change without editing the app), and looked into. */
 export interface RigOptions {
-  detector?: () => PageEndDetector;
+  /** The preset the reader chose (default 'balanced'). */
+  sensitivity?: Sensitivity;
+  detector?: (sensitivity: Sensitivity) => PageEndDetectorLike;
   onStep?: (step: RigStep) => void;
 }
 
 export function runSession(scenario: Scenario, seed: number, opts: { minutes?: number } & RigOptions = {}): SessionMetrics {
+  const sensitivity = opts.sensitivity ?? 'balanced';
   const world = new World({ seed, scenario, ...(opts.minutes !== undefined ? { minutes: opts.minutes } : {}) });
   const viewport = { width: VIEW.width, height: VIEW.height };
 
@@ -160,7 +177,7 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
   const tracker = new LineTracker();
   tracker.reset({ calibrated: true });
   tracker.setLayout(world.layout, 'initial');
-  const detector = opts.detector ? opts.detector() : new PageEndDetector();
+  const detector: PageEndDetectorLike = opts.detector ? opts.detector(sensitivity) : new PageEndDetector({ sensitivity });
   const appearance = new AppearanceMonitor(null);
   appearance.setBaseline(model.environment?.appearance ?? null, null);
   const changes = new AppearanceChangeFilter();
@@ -219,11 +236,13 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
     const unsafe = !manual && readerDocTop !== null && readerDocTop < anchor.docTop - 0.5 * PITCH;
     const start = pageStartDocTop;
     const needed = start === null || !lines[L] ? NaN : lines.filter((l) => l.docTop > start + 1 && l.docTop <= lines[L]!.docTop + 1).length;
+    const kind = manual ? 'missed' : unsafe || readerVsL < -1 ? 'false' : 'intended';
     turns.push({
       t,
       reason,
-      kind: manual ? 'missed' : unsafe || readerVsL < -1 ? 'false' : 'intended',
+      kind,
       unsafe,
+      early: kind === 'intended' && !lingering,
       readerVsL,
       latencyMs: lingering && world.reader.lingerStartedAt !== null ? t - world.reader.lingerStartedAt : 0,
       active: [...tr.active],
@@ -246,7 +265,9 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
     world.scrollTo(next);
     tracker.setLayout(world.layout, 'page-turn');
     tracker.afterPageTurn(resumeLineIndex(world.layout.lines, anchor.docTop, world.layout.linePitch));
-    detector.notifyScrolled(t);
+    // The app starts the cooldown when the scroll animation ends (afterJump → notifyScrolled); nothing
+    // reaches the detector in between, so telling it now with that time is the same.
+    detector.notifyScrolled(t + SCROLL_MS);
     fixations.reset();
     blockedUntil = t + SCROLL_MS;
     guidance.notePageTurn(t);
@@ -304,6 +325,20 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
     if (Math.floor(wf.t / 60_000) > Math.floor(clock / 60_000)) heap.push({ t: wf.t, mb: heapUsedMB() });
     clock = wf.t;
     truth = wf.truth;
+    if (wf.event === 'reopen') {
+      // The book was closed and opened again: the camera source starts afresh and startSession runs
+      // resetPipeline('auto') (same source and calibration: the drift is kept) and measure('initial').
+      gazeSource.stop();
+      void gazeSource.start();
+      fixations.reset();
+      tracker.reset({ keepDrift: true });
+      tracker.setLayout(world.layout, 'initial');
+      detector.reset();
+      driftWatch.reset();
+      wasBlocked = false;
+      pageSweeps = 0;
+      pageStartDocTop = null;
+    }
     histT.push(wf.t);
     histLine.push(wf.truth.lineDocTop);
     histMode.push(wf.truth.mode);
@@ -343,6 +378,7 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
           model = refineGazeModel(model, world.refreshSamples(), { viewport, maxBlink: CAL_MAX_BLINK }).model;
           appearance.setBaseline(model.environment?.appearance ?? null, null);
           world.hold(REFRESH_MS);
+          world.arrive(world.t);
           fixations.reset();
           detector.reset();
           tracker.appearanceChangedAt(world.t);
@@ -374,6 +410,7 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
     cpuLast15: meanOf(window15(cpu, cpuT, false)),
     scenario: scenario.name,
     seed,
+    sensitivity,
     minutes: world.t / 60_000,
     frames,
     turns,
@@ -388,18 +425,131 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
   };
 }
 
+// ───────────────────────────────── Records ─────────────────────────────────
+
+/** A mergeable histogram (fixed bin width): quantiles of millions of values without keeping them. */
+export interface Hist {
+  step: number;
+  n: number;
+  counts: Record<string, number>;
+}
+
+export const newHist = (step: number): Hist => ({ step, n: 0, counts: {} });
+
+export function histAdd(h: Hist, v: number): void {
+  if (!Number.isFinite(v)) return;
+  const b = String(Math.floor(v / h.step));
+  h.counts[b] = (h.counts[b] ?? 0) + 1;
+  h.n++;
+}
+
+export function histMerge(into: Hist, from: Hist): Hist {
+  for (const [b, c] of Object.entries(from.counts)) into.counts[b] = (into.counts[b] ?? 0) + c;
+  into.n += from.n;
+  return into;
+}
+
+/** The q-quantile (as `quantile` picks it: the value at floor(q·(n − 1))), to the bin's middle. */
+export function histQuantile(h: Hist, q: number): number {
+  if (h.n === 0) return NaN;
+  let k = Math.min(h.n - 1, Math.max(0, Math.floor(q * (h.n - 1))));
+  const bins = Object.keys(h.counts).map(Number).sort((a, b) => a - b);
+  for (const b of bins) {
+    const c = h.counts[String(b)]!;
+    if (k < c) return (b + 0.5) * h.step;
+    k -= c;
+  }
+  return (bins[bins.length - 1]! + 0.5) * h.step;
+}
+
+const histOf = (a: ArrayLike<number>, step: number): Hist => {
+  const h = newHist(step);
+  for (let i = 0; i < a.length; i++) histAdd(h, a[i]!);
+  return h;
+};
+
+/** One session, compact enough to write out and merge (the eval runs sessions in parallel shards). */
+export interface SessionRecord {
+  version: string;
+  /** Scenario name, or a row label ("everyday, 2 h in one go"). */
+  scenario: string;
+  seed: number;
+  sensitivity: Sensitivity;
+  /** Which detector ran: 'current' (the working tree), 'deployed', or a baseline's label. */
+  detector: string;
+  minutes: number;
+  frames: number;
+  turns: TurnRecord[];
+  calibrationErrPx: number;
+  fixations: number;
+  onLine: number;
+  prompts: number;
+  otherFaceValid: number;
+  errFirst15: number;
+  errLast15: number;
+  cpuFirst15: number;
+  cpuLast15: number;
+  heapMB15: number;
+  heapMBEnd: number;
+  gazeErrPx: Hist;
+  vErrLines: Hist;
+  cpuUs: Hist;
+}
+
+export function toRecord(m: SessionMetrics, opts: { label?: string; detector?: string } = {}): SessionRecord {
+  return {
+    version: HARNESS_VERSION,
+    scenario: opts.label ?? m.scenario,
+    seed: m.seed,
+    sensitivity: m.sensitivity,
+    detector: opts.detector ?? 'current',
+    minutes: m.minutes,
+    frames: m.frames,
+    turns: m.turns,
+    calibrationErrPx: m.calibrationErrPx,
+    fixations: m.fixations,
+    onLine: m.onLine,
+    prompts: m.prompts,
+    otherFaceValid: m.otherFaceValid,
+    errFirst15: m.errFirst15,
+    errLast15: m.errLast15,
+    cpuFirst15: m.cpuFirst15,
+    cpuLast15: m.cpuLast15,
+    heapMB15: m.heapMB15,
+    heapMBEnd: m.heapMBEnd,
+    gazeErrPx: histOf(m.gazeErrPx, 1),
+    vErrLines: histOf(m.vErrLines, 0.01),
+    cpuUs: histOf(m.cpuUs, 1),
+  };
+}
+
 // ───────────────────────────────── Summaries ─────────────────────────────────
+
+/** Per-seed tallies, for confidence intervals. */
+export interface SeedTally {
+  seed: number;
+  hours: number;
+  falses: number;
+  pages: number;
+  missed: number;
+}
 
 export interface Summary {
   scenario: string;
+  sensitivity: Sensitivity | 'mixed';
+  detector: string;
   hours: number;
   pages: number;
   autoTurns: number;
-  /** Unintended turns per hour, and those that lost the reader's place. */
+  /** Unintended turns per hour (± 95 % half-width), and those that lost the reader's place. */
   falsePerHour: number;
+  falseCI: number;
   unsafePerHour: number;
-  /** Missed turns, % of pages. */
+  /** Missed turns, % of pages (± 95 % half-width, points). */
   missedPct: number;
+  missedCI: number;
+  /** Intended turns made before the reader had finished the last line, % of intended turns. */
+  earlyPct: number;
   latencyP50: number;
   latencyP90: number;
   errP50: number;
@@ -421,6 +571,7 @@ export interface Summary {
   heapMBEnd: number;
   /** What was going on at the unintended turns. */
   falseCauses: Record<string, number>;
+  seeds: SeedTally[];
 }
 
 export function quantile(a: ArrayLike<number>, q: number): number {
@@ -429,58 +580,100 @@ export function quantile(a: ArrayLike<number>, q: number): number {
   return s[Math.min(s.length - 1, Math.max(0, Math.floor(q * (s.length - 1))))]!;
 }
 
-function concat(parts: readonly Float64Array[]): Float64Array {
-  const out = new Float64Array(parts.reduce((a, p) => a + p.length, 0));
-  let o = 0;
-  for (const p of parts) {
-    out.set(p, o);
-    o += p.length;
-  }
-  return out;
+const isRecord = (r: SessionMetrics | SessionRecord): r is SessionRecord => 'version' in r;
+
+/** Sample variance (k − 1), 0 for fewer than two values. */
+function variance(v: readonly number[]): number {
+  if (v.length < 2) return 0;
+  const m = v.reduce((a, b) => a + b, 0) / v.length;
+  return v.reduce((a, b) => a + (b - m) ** 2, 0) / (v.length - 1);
 }
 
-export function summarize(runs: readonly SessionMetrics[]): Summary {
-  const hours = runs.reduce((a, r) => a + r.minutes, 0) / 60;
-  const turns = runs.flatMap((r) => r.turns);
+/**
+ * Standard errors of a rate (events per hour) and a proportion (missed pages), over seeds. The
+ * larger of the counting error (Poisson, binomial) and the spread between seeds: decisions in one
+ * session are not independent (one change sends the reader down another path), so neither alone is honest.
+ */
+export function rateSE(seeds: readonly SeedTally[], pick: (s: SeedTally) => number): number {
+  const hours = seeds.reduce((a, s) => a + s.hours, 0);
+  if (!(hours > 0)) return NaN;
+  const events = seeds.reduce((a, s) => a + pick(s), 0);
+  const poisson = Math.max(events, 1) / hours ** 2;
+  const between = variance(seeds.filter((s) => s.hours > 0).map((s) => pick(s) / s.hours)) / seeds.length;
+  return Math.sqrt(Math.max(poisson, between));
+}
+
+export function missedSE(seeds: readonly SeedTally[]): number {
+  const pages = seeds.reduce((a, s) => a + s.pages, 0);
+  if (!(pages > 0)) return NaN;
+  const missed = seeds.reduce((a, s) => a + s.missed, 0);
+  const q = (missed + 0.5) / (pages + 1);
+  const binomial = (q * (1 - q)) / pages;
+  const between = variance(seeds.filter((s) => s.pages > 0).map((s) => s.missed / s.pages)) / seeds.length;
+  return Math.sqrt(Math.max(binomial, between));
+}
+
+export function summarize(runs: readonly (SessionMetrics | SessionRecord)[]): Summary {
+  const recs = runs.map((r) => (isRecord(r) ? r : toRecord(r)));
+  const hours = recs.reduce((a, r) => a + r.minutes, 0) / 60;
+  const turns = recs.flatMap((r) => r.turns);
   const premature = turns.filter((t) => t.kind === 'false');
   const intended = turns.filter((t) => t.kind === 'intended');
   const missed = turns.filter((t) => t.kind === 'missed');
   const pages = intended.length + missed.length;
-  const err = concat(runs.map((r) => r.gazeErrPx));
-  const verr = concat(runs.map((r) => r.vErrLines));
-  const cpu = concat(runs.map((r) => r.cpuUs));
+  const err = recs.reduce((h, r) => histMerge(h, r.gazeErrPx), newHist(1));
+  const verr = recs.reduce((h, r) => histMerge(h, r.vErrLines), newHist(0.01));
+  const cpu = recs.reduce((h, r) => histMerge(h, r.cpuUs), newHist(1));
+  const cpuMean = Object.entries(cpu.counts).reduce((a, [b, c]) => a + (Number(b) + 0.5) * c, 0) / Math.max(1, cpu.n);
   const causes: Record<string, number> = {};
   for (const t of premature) {
     const key = t.otherFace ? 'second-face' : t.active.filter((a) => a !== 'blink').join('+') || 'reading';
     causes[`${key} (${t.reason})`] = (causes[`${key} (${t.reason})`] ?? 0) + 1;
   }
-  const fixations = runs.reduce((a, r) => a + r.fixations, 0);
+  const fixations = recs.reduce((a, r) => a + r.fixations, 0);
+  const bySeed = new Map<number, SeedTally>();
+  for (const r of recs) {
+    const s = bySeed.get(r.seed) ?? { seed: r.seed, hours: 0, falses: 0, pages: 0, missed: 0 };
+    s.hours += r.minutes / 60;
+    s.falses += r.turns.filter((t) => t.kind === 'false').length;
+    s.missed += r.turns.filter((t) => t.kind === 'missed').length;
+    s.pages += r.turns.filter((t) => t.kind !== 'false').length;
+    bySeed.set(r.seed, s);
+  }
+  const seeds = [...bySeed.values()].sort((a, b) => a.seed - b.seed);
+  const sens = new Set(recs.map((r) => r.sensitivity));
   return {
-    scenario: runs[0]?.scenario ?? '',
+    scenario: recs[0]?.scenario ?? '',
+    sensitivity: sens.size === 1 ? [...sens][0]! : 'mixed',
+    detector: recs[0]?.detector ?? '',
     hours,
     pages,
     autoTurns: intended.length + premature.length,
     falsePerHour: premature.length / hours,
+    falseCI: 1.96 * rateSE(seeds, (s) => s.falses),
     unsafePerHour: premature.filter((t) => t.unsafe).length / hours,
     missedPct: pages ? (100 * missed.length) / pages : NaN,
+    missedCI: 100 * 1.96 * missedSE(seeds),
+    earlyPct: intended.length ? (100 * intended.filter((t) => t.early).length) / intended.length : NaN,
     latencyP50: quantile(intended.map((t) => t.latencyMs), 0.5),
     latencyP90: quantile(intended.map((t) => t.latencyMs), 0.9),
-    errP50: quantile(err, 0.5),
-    errP90: quantile(err, 0.9),
-    errP99: quantile(err, 0.99),
-    vErrP50: quantile(verr, 0.5),
-    onLinePct: fixations ? (100 * runs.reduce((a, r) => a + r.onLine, 0)) / fixations : NaN,
-    promptsPerHour: runs.reduce((a, r) => a + r.prompts, 0) / hours,
-    calibrationErrPx: runs.reduce((a, r) => a + r.calibrationErrPx, 0) / runs.length,
-    cpuMeanUs: cpu.reduce((a, v) => a + v, 0) / Math.max(1, cpu.length),
-    cpuP99Us: quantile(cpu, 0.99),
-    errFirst15: avg(runs.map((r) => r.errFirst15)),
-    errLast15: avg(runs.map((r) => r.errLast15)),
-    cpuFirst15: avg(runs.map((r) => r.cpuFirst15)),
-    cpuLast15: avg(runs.map((r) => r.cpuLast15)),
-    heapMB15: avg(runs.map((r) => r.heapMB15)),
-    heapMBEnd: avg(runs.map((r) => r.heapMBEnd)),
+    errP50: histQuantile(err, 0.5),
+    errP90: histQuantile(err, 0.9),
+    errP99: histQuantile(err, 0.99),
+    vErrP50: histQuantile(verr, 0.5),
+    onLinePct: fixations ? (100 * recs.reduce((a, r) => a + r.onLine, 0)) / fixations : NaN,
+    promptsPerHour: recs.reduce((a, r) => a + r.prompts, 0) / hours,
+    calibrationErrPx: recs.reduce((a, r) => a + r.calibrationErrPx, 0) / recs.length,
+    cpuMeanUs: cpuMean,
+    cpuP99Us: histQuantile(cpu, 0.99),
+    errFirst15: avg(recs.map((r) => r.errFirst15)),
+    errLast15: avg(recs.map((r) => r.errLast15)),
+    cpuFirst15: avg(recs.map((r) => r.cpuFirst15)),
+    cpuLast15: avg(recs.map((r) => r.cpuLast15)),
+    heapMB15: avg(recs.map((r) => r.heapMB15)),
+    heapMBEnd: avg(recs.map((r) => r.heapMBEnd)),
     falseCauses: causes,
+    seeds,
   };
 }
 
@@ -490,15 +683,17 @@ function avg(a: readonly number[]): number {
 }
 
 const f1 = (v: number, d = 1): string => (Number.isFinite(v) ? v.toFixed(d) : '–');
+const pm = (v: number, ci: number, d = 1): string => (Number.isFinite(ci) ? `${f1(v, d)} ± ${f1(ci, d)}` : f1(v, d));
 
 export function summaryTable(rows: readonly Summary[]): string {
   const head = [
     'scenario',
     'hours',
     'pages',
-    'false/h',
+    'false/h (± 95 %)',
     'unsafe/h',
-    'missed %',
+    'missed % (± 95 %)',
+    'early %',
     'latency p50/p90 ms',
     'gaze err p50/p90/p99 px',
     'err first/last 15 min',
@@ -514,9 +709,10 @@ export function summaryTable(rows: readonly Summary[]): string {
         s.scenario,
         f1(s.hours),
         String(s.pages),
-        f1(s.falsePerHour, 2),
+        pm(s.falsePerHour, s.falseCI, 2),
         f1(s.unsafePerHour, 2),
-        f1(s.missedPct),
+        pm(s.missedPct, s.missedCI),
+        f1(s.earlyPct, 0),
         `${f1(s.latencyP50, 0)} / ${f1(s.latencyP90, 0)}`,
         `${f1(s.errP50, 0)} / ${f1(s.errP90, 0)} / ${f1(s.errP99, 0)}`,
         `${f1(s.errFirst15, 0)} / ${f1(s.errLast15, 0)}`,
@@ -524,6 +720,64 @@ export function summaryTable(rows: readonly Summary[]): string {
         f1(s.promptsPerHour, 2),
         `${f1(s.cpuMeanUs, 0)} / ${f1(s.cpuP99Us, 0)}`,
         `${f1(s.heapMB15, 0)} / ${f1(s.heapMBEnd, 0)}`,
+      ].join(' | ')} |`,
+    );
+  }
+  return lines.join('\n');
+}
+
+/** Before → after for one row: differences with 95 % intervals, and what the change trades. */
+export interface Delta {
+  scenario: string;
+  hours: number;
+  falseBefore: number;
+  falseAfter: number;
+  /** after − before, unintended turns per hour, and its 95 % half-width. */
+  dFalse: number;
+  dFalseCI: number;
+  missedBefore: number;
+  missedAfter: number;
+  /** after − before, points of pages missed, and its 95 % half-width. */
+  dMissed: number;
+  dMissedCI: number;
+  /** Extra missed pages per hour for each unintended turn per hour prevented (NaN unless it prevents some). */
+  missedPerPrevented: number;
+}
+
+export function delta(before: Summary, after: Summary): Delta {
+  const missedPerHour = (s: Summary): number => s.seeds.reduce((a, x) => a + x.missed, 0) / s.hours;
+  const se = (a: number, b: number): number => Math.sqrt(a * a + b * b);
+  const dFalse = after.falsePerHour - before.falsePerHour;
+  return {
+    scenario: after.scenario,
+    hours: after.hours,
+    falseBefore: before.falsePerHour,
+    falseAfter: after.falsePerHour,
+    dFalse,
+    dFalseCI: 1.96 * se(rateSE(before.seeds, (s) => s.falses), rateSE(after.seeds, (s) => s.falses)),
+    missedBefore: before.missedPct,
+    missedAfter: after.missedPct,
+    dMissed: after.missedPct - before.missedPct,
+    dMissedCI: 100 * 1.96 * se(missedSE(before.seeds), missedSE(after.seeds)),
+    missedPerPrevented: dFalse < 0 ? (missedPerHour(after) - missedPerHour(before)) / -dFalse : NaN,
+  };
+}
+
+const signed = (v: number, d = 1): string => (Number.isFinite(v) ? `${v > 0 ? '+' : ''}${v.toFixed(d)}` : '–');
+
+export function deltaTable(rows: readonly Delta[]): string {
+  const head = ['scenario', 'hours', 'false/h before → after', 'Δ false/h (95 % CI)', 'missed % before → after', 'Δ missed points (95 % CI)', 'missed pages per unintended turn prevented'];
+  const lines = [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`];
+  for (const d of rows) {
+    lines.push(
+      `| ${[
+        d.scenario,
+        f1(d.hours),
+        `${f1(d.falseBefore, 2)} → ${f1(d.falseAfter, 2)}`,
+        `${signed(d.dFalse, 2)} (${signed(d.dFalse - d.dFalseCI, 2)} … ${signed(d.dFalse + d.dFalseCI, 2)})`,
+        `${f1(d.missedBefore)} → ${f1(d.missedAfter)}`,
+        `${signed(d.dMissed)} (${signed(d.dMissed - d.dMissedCI)} … ${signed(d.dMissed + d.dMissedCI)})`,
+        Number.isFinite(d.missedPerPrevented) ? d.missedPerPrevented.toFixed(2) : '–',
       ].join(' | ')} |`,
     );
   }

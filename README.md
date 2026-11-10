@@ -359,7 +359,7 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 | `npm test` | Run the unit and integration tests (Vitest, with jsdom for DOM tests) |
 | `npm run check` | All of the above: typecheck, tests, app build, extension build |
 | `npm run bench` | Slow accuracy scoreboards in `bench/` (several minutes). `GR_REPLAY=file.json npm run bench -- bench/replay` replays a diagnostics recording |
-| `npm run eval` | End-to-end scoreboard (about 5 minutes): a simulated reader with ground-truth gaze, through landmark noise, frame drops, blinks, glare, posture changes, a second face and glances at a phone, scored on unintended and missed page turns, turn latency, gaze error, recalibration prompts and CPU. `GR_EVAL_SEEDS`, `GR_EVAL_MINUTES`, `GR_EVAL_ONLY` and `GR_EVAL_OUT=file.json` vary it; the fast gates are `tests/endToEnd.test.ts` |
+| `npm run eval` | End-to-end scoreboard (a few minutes, in parallel shards): a simulated reader with ground-truth gaze, through landmark noise, frame drops, blinks, glare, posture changes, a second face, glances at a phone or the keyboard (also right as a book opens), and pauses or re-reading after finishing a page, scored on unintended and missed page turns (with 95 % intervals), turn latency, gaze error, recalibration prompts and CPU, for the Balanced and Relaxed presets. `GR_EVAL_BASELINE=deployed` also runs the deployed page-end detector on the same seeds and prints each scenario's difference with its interval, and the missed pages per unintended turn prevented. `GR_EVAL_SEEDS`, `GR_EVAL_SEED_BASE`, `GR_EVAL_MINUTES`, `GR_EVAL_SENS`, `GR_EVAL_ONLY` and `GR_EVAL_OUT=file.json` vary it (see `bench/endtoend/eval.ts`); the per-scenario gates are `tests/endToEnd*.test.ts` |
 
 ## Known limitations
 
