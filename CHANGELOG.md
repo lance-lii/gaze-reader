@@ -62,9 +62,10 @@ position sat a line or two off after shifting in the chair, and page turns came 
 - **A camera that stops comes back on its own.** After a laptop wakes from sleep the camera often
   freezes or stops: a frozen camera left the reader at "looking for you" for good, and a stopped
   one got a toast blaming another app, even when the camera had been unplugged. Gaze Reader now
-  restarts the camera once by itself when it sends no picture for 5 seconds or its video ends.
-  If it can't start, the message says why (no camera found, access blocked, busy), and a camera
-  that stops again within a minute is reported, with Try again.
+  restarts the camera by itself when it sends no picture for 5 seconds or its video ends. If it
+  can't start, the message says why (no camera found, access blocked, busy). A camera that stops
+  again within a minute, or for the third time in 10 minutes, is reported with Try again instead of
+  being restarted over and over.
 - **A calibration survives the camera restarting.** If the camera stopped while you were on the
   calibration dots, it restarted by itself but went back to reading on the old calibration without
   a word. The dots now start over once the camera is back, with a note saying why.

@@ -146,8 +146,11 @@ const PROGRESS_EVERY_MS = 5000;
 const HIDDEN_STOP_MS = 60_000;
 /** No camera frame for this long while it runs and the tab is visible: it froze (after the laptop slept, a muted track). */
 const CAMERA_STALL_MS = 5000;
-/** A camera that stops again this soon after being restarted on its own is reported, not restarted. */
+/** A camera that stops again this soon after being restarted on its own is reported, not restarted… */
 const CAMERA_RESTART_MIN_GAP_MS = 60_000;
+/** …and so is one that was already restarted this many times in this long (it keeps stopping). */
+const CAMERA_RESTARTS_PER_WINDOW = 2;
+const CAMERA_RESTART_WINDOW_MS = 10 * 60_000;
 /**
  * After this long below MIN_TRACKING_HZ frames a second (the rate the page-end detector needs to
  * follow the lines, and below which it holds every turn) the reader is told why pages don't turn…
@@ -298,7 +301,8 @@ export class AppController {
   private offCameraError: Unsubscribe | null = null;
   /** performance.now() of the last camera frame (with or without a face); the stall watch reads it. */
   private lastCameraFrameAt = Number.NEGATIVE_INFINITY;
-  private lastCameraRestartAt = Number.NEGATIVE_INFINITY;
+  /** When the camera was restarted on its own, in the last CAMERA_RESTART_WINDOW_MS. */
+  private cameraRestarts: number[] = [];
   private slowCameraSince: number | null = null;
   private slowCameraShownAt = Number.NEGATIVE_INFINITY;
   /** The camera has been fast enough since the slow-camera message was last shown (or it never was). */
@@ -1645,21 +1649,25 @@ export class AppController {
   }
 
   /**
-   * The camera stopped mid-session. Restart it once on our own, as "Try again" would: after the
-   * laptop wakes that is usually all it needs, and if it can't start the failure says why (no
-   * camera, access blocked, busy). Stopping again within a minute is reported instead.
+   * The camera stopped mid-session. Restart it on our own, as "Try again" would: after the laptop
+   * wakes that is usually all it needs, and if it can't start the failure says why (no camera,
+   * access blocked, busy). Stopping again within a minute, or a third time in 10 minutes, is
+   * reported instead.
    */
   private recoverCamera(err: unknown): void {
     const now = performance.now();
     // A calibration the reader was in the middle of (or had asked for) is cancelled with the camera:
     // the next start (on its own, or Try again) opens it again instead of reading on the old one.
     if (this.calibration) this.resumeCalibration = this.calibrationMode ?? 'standard';
-    if (now - this.lastCameraRestartAt < CAMERA_RESTART_MIN_GAP_MS) {
-      this.cameraFailed(err, cameraStoppedInfo());
+    this.cameraRestarts = this.cameraRestarts.filter((at) => now - at < CAMERA_RESTART_WINDOW_MS);
+    const last = this.cameraRestarts[this.cameraRestarts.length - 1] ?? Number.NEGATIVE_INFINITY;
+    if (now - last < CAMERA_RESTART_MIN_GAP_MS || this.cameraRestarts.length >= CAMERA_RESTARTS_PER_WINDOW) {
+      // It keeps stopping: restarting it again and again would only flicker; say so instead.
+      this.cameraFailed(err, cameraStoppedInfo(this.cameraRestarts.length + 1));
       this.syncSource();
       return;
     }
-    this.lastCameraRestartAt = now;
+    this.cameraRestarts.push(now);
     console.warn('[app] the camera stopped; restarting it', err);
     this.sourceKind = null; // syncSource() then brings the webcam up afresh
     this.syncSource();

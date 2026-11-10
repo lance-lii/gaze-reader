@@ -898,6 +898,31 @@ describe('AppController', () => {
     expect(toastText()).toMatch(/calibration starts over/);
   });
 
+  it('webcam: a camera that keeps stopping a little over a minute apart is reported on the third stop (regression: restarted silently forever)', async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    const { camera } = await readWithWebcam(calibratedModel());
+    const before = camera.starts();
+    for (let i = 1; i <= 2; i++) {
+      skew += 61_000;
+      camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+      await until(() => camera.running() && camera.starts() === before + i, `restart ${i}`);
+      expect(toastText()).not.toMatch(/camera stopped/i);
+    }
+    skew += 61_000;
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => /It has stopped 3 times in 10 minutes/.test(toastText()), 'the camera-stopped toast');
+    expect(camera.starts()).toBe(before + 2);
+    expect(toastButton('Try again')).toBeTruthy();
+    // Ten quiet minutes later a stop is restarted on its own again.
+    toastButton('Try again')!.click();
+    await until(() => camera.running() && camera.starts() === before + 3, 'Try again');
+    skew += 11 * 60_000;
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => camera.running() && camera.starts() === before + 4, 'the restart after a quiet spell');
+  });
+
   it('webcam: a denied camera explains how to allow it and offers the mouse and the demo, without retrying', async () => {
     saved.model = calibratedModel();
     const camera = stubCamera();
