@@ -34,7 +34,9 @@ position sat a line or two off after shifting in the chair, and page turns came 
   counted: a glance at your phone or the keyboard mid-page, or the gaze dipping below the page
   while you read the last lines. A look down now counts only when it starts at the end of the last
   line, where you finish the page: its right half, held for a moment, and not a glance at Dewey
-  in the corner beside it, the edge of the screen, or one frame on the way to your phone. In the new end-to-end simulation (`npm run eval`), unintended
+  in the corner beside it, the edge of the screen, or one frame on the way to your phone. When the
+  gaze reads a little low at the bottom of the page (dim light, after shifting in your seat), the
+  end of the last line can sit just below the page edge; it still counts as where you finished. In the new end-to-end simulation (`npm run eval`), unintended
   page turns fell from 12.9 to 7.2 an hour, for one more missed turn in a hundred. The extension's
   page mode, which has no lines to follow, still turns on any look down.
 - **No page turns before you have read anything.** When a book opened or a calibration ended, the
