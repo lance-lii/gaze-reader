@@ -20,6 +20,7 @@ import { loadBookFromText } from '../reader/bookLoader';
 import { getBook, listBooks, saveBook, saveProgress } from '../reader/library';
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
+import { Toaster } from '../ui/toast';
 import { PageEndDetector } from '../reading/pageEndDetector';
 import { AppController } from './controller';
 
@@ -882,6 +883,37 @@ describe('AppController', () => {
     await until(() => /The camera is running slowly/.test(toastText()), 'the slow-camera toast');
     expect(toastText()).toMatch(/About 3 pictures a second/);
     expect(camera.running()).toBe(true);
+  });
+
+  it('webcam: the slow-camera message covers every rate too slow to follow the lines, and comes back after the camera recovered (regression: silent at 5–7 a second, then shown once a visit)', { timeout: 20_000 }, async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    const show = vi.spyOn(Toaster.prototype, 'show');
+    const shown = (): number => show.mock.calls.filter(([o]) => o.id === 'slow-camera').length;
+    const { camera } = await readWithWebcam(calibratedModel());
+    const run = async (fps: number, ms: number): Promise<void> => {
+      camera.state.fps = fps;
+      for (let left = ms; left > 0; left -= 2000) {
+        skew += 2000;
+        camera.emit(webcamFrame()); // frames keep coming, only slowly
+        await sleep(300);
+      }
+    };
+    // 6 a second: fixations can't form (the page-end detector holds every turn), so the reader is told.
+    await run(6, 8000);
+    await until(() => shown() === 1, 'the slow-camera message at 6 fps');
+    expect(toastText()).toMatch(/About 6 pictures a second/);
+    // Still slow, or slow again soon: not repeated.
+    await run(6, 8000);
+    await run(30, 4000);
+    await run(6, 8000);
+    expect(shown()).toBe(1);
+    // Fast for a while, then slow again 10 minutes on: said again.
+    await run(30, 4000);
+    skew += 10 * 60_000;
+    await run(4, 8000);
+    await until(() => shown() === 2, 'the slow-camera message again');
   });
 
   it('webcam: reports the light every second; a changed light re-learns the reading offset and offers a touch-up at a pause', async () => {

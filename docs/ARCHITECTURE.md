@@ -421,8 +421,9 @@ none.
 | balanced | 0.55 | 0.70 | 350 | 1200 | 600 | 1800 |
 | eager | 0.45 | 0.55 | 200 | 800 | 450 | 1400 |
 
-Guards: cooldown after any scroll; ≥ 60 % valid samples over the last 1000 ms, and ≥ 6 of them
-(about 5 a second: slower tracking finds no fixations); ≥ 4 fixations
+Guards: cooldown after any scroll; ≥ 60 % valid samples over the last 1000 ms, and ≥ 8 of them
+(`MIN_TRACKING_HZ` = 7 a second: fixations end at gaps over 150 ms, so slower tracking finds none;
+the web app's slow-camera message uses the same rate); ≥ 4 fixations
 on the page or ≥ 2500 ms since the last turn (glance-down exempt); never fire during a scroll
 animation (the controller doesn't call `update` then). `targetLineIndex` = the tracker's line if
 it is ≥ L−1, else L.

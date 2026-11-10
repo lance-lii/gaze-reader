@@ -8,6 +8,7 @@ import type {
   TextLine,
 } from '../types';
 import { isTrackedLineEstimate } from './lineTracker';
+import { DEFAULT_FIXATION_OPTIONS } from '../signal/fixations';
 
 /**
  * Decides when the reader has reached the end of the visible page. Pure logic:
@@ -123,18 +124,26 @@ export const PAGE_END_PRESETS: Readonly<Record<Sensitivity, Readonly<PageEndThre
   eager: Object.freeze({ minPosterior: 0.45, minProgress: 0.55, dwellMs: 200, zoneMs: 800, glanceMs: 450, cooldownMs: 1400 }),
 });
 
+/**
+ * The slowest tracking the line rules can follow, valid samples a second: FixationDetector ends a
+ * fixation at any gap over maxGapMs (150 ms), so below ≈ 6.7 a second no fixation completes and there
+ * is no line estimate to go on. Rounded up. The web app's slow-camera message uses the same rate.
+ */
+export const MIN_TRACKING_HZ = Math.ceil(1000 / DEFAULT_FIXATION_OPTIONS.maxGapMs);
+
 export const PAGE_END_GUARDS = Object.freeze({
   /** Rolling window for the validity guard, ms. */
   validityWindowMs: 1000,
   /** Minimum fraction of valid gaze samples in that window. */
   minValidFraction: 0.6,
   /**
-   * ...and at least this many valid samples in it (both ends count: 6 is 5 a second). Slower
-   * tracking (an overloaded or throttled camera) finds no fixations to follow the lines with, and
-   * in the end-to-end harness at 2–4 frames a second glance-down then turned pages at a phone
-   * glance (5 an hour).
+   * ...and at least this many valid samples in it (both ends count: MIN_TRACKING_HZ + 1 is
+   * MIN_TRACKING_HZ a second). Slower tracking (an overloaded or throttled camera, CPU-only face
+   * tracking) finds no fixations to follow the lines with: in the end-to-end harness at 2–4 frames
+   * a second glance-down then turned pages at a phone glance (5 an hour), and at 5–6.7 a second
+   * the guard used to pass with no fixation ever completing.
    */
-  minValidSamples: 6,
+  minValidSamples: MIN_TRACKING_HZ + 1,
   /** Enough reading on this page: this many fixations... */
   minFixationsOnPage: 4,
   /** ...or this long since the last turn (glance-down is exempt from both). */
