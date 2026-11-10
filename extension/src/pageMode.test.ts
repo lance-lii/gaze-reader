@@ -111,10 +111,10 @@ describe('buildPseudoLayout', () => {
 
     const detector = new PageEndDetector({ sensitivity: 'balanced', glanceDownToTurn: true });
     let t = 0;
-    for (; t < 3000; t += 33) detector.update({ t, gaze: sample(t, 640, 300), estimate: null, layout });
+    for (; t < 3000; t += 33) detector.update({ t, gaze: sample(t, 640, 300), estimate: null, layout, pageMode: true });
     let fired = null;
     for (; t < 5000 && !fired; t += 33) {
-      const d = detector.update({ t, gaze: sample(t, 640, 830), estimate: null, layout }); // looking below the page
+      const d = detector.update({ t, gaze: sample(t, 640, 830), estimate: null, layout, pageMode: true }); // looking below the page
       if (d.trigger) fired = d;
     }
     expect(fired).toMatchObject({ trigger: true, reason: 'glance-down' });
@@ -125,10 +125,10 @@ describe('buildPseudoLayout', () => {
     const last = layout.lines.at(-1)!;
     const detector = new PageEndDetector({ sensitivity: 'balanced', glanceDownToTurn: false });
     let t = 0;
-    for (; t < 1000; t += 33) detector.update({ t, gaze: sample(t, 640, 300), estimate: null, layout });
+    for (; t < 1000; t += 33) detector.update({ t, gaze: sample(t, 640, 300), estimate: null, layout, pageMode: true });
     let fired = null;
     for (; t < 8000 && !fired; t += 33) {
-      const d = detector.update({ t, gaze: sample(t, last.right - 60, last.centerY), estimate: null, layout });
+      const d = detector.update({ t, gaze: sample(t, last.right - 60, last.centerY), estimate: null, layout, pageMode: true });
       if (d.trigger) fired = d;
     }
     expect(fired).toMatchObject({ trigger: true, reason: 'bottom-dwell' });

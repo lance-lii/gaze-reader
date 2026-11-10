@@ -916,6 +916,20 @@ describe('AppController', () => {
     await until(() => shown() === 2, 'the slow-camera message again');
   });
 
+  it('starts the page-end cooldown when a book opens and after a calibration (regression: a first look at the phone turned page 1)', async () => {
+    const cooldown = vi.spyOn(PageEndDetector.prototype, 'notifyScrolled');
+    await readWithWebcam(calibratedModel());
+    expect(cooldown).toHaveBeenCalled(); // the book opened: the reading layer started over
+    const n = cooldown.mock.calls.length;
+    overlays.run = async (bus) => {
+      bus.emit('calibration', { phase: 'start' });
+      bus.emit('calibration', { phase: 'done', report: REPORT });
+      return { model: { ...calibratedModel({ trainedAt: 3000 }), toJSON: () => ({ version: 1, kind: 'gr-ridge-poly2-iris5', wx: [2], wy: [3] }) }, report: REPORT };
+    };
+    app.bus.emit('command', { name: 'recalibrate' });
+    await until(() => cooldown.mock.calls.length > n, 'the cooldown after the calibration');
+  });
+
   it('webcam: reports the light every second; a changed light re-learns the reading offset and offers a touch-up at a pause', async () => {
     let next: LightingWatchUpdate | null = null;
     const tick = vi.spyOn(LightingWatch.prototype, 'tick').mockImplementation(() => {

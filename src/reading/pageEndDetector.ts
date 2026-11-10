@@ -25,7 +25,9 @@ import { DEFAULT_FIXATION_OPTIONS } from '../signal/fixations';
  *  3. glance-down — gaze at/below the bottom edge for `Tglance` (on by default; can be
  *     switched off), when the look down began right after the gaze was at the end of the
  *     last line: a look at the keyboard or a phone mid-page doesn't turn the page. A tracker
- *     confident the reader is above the last two lines vetoes it too, as for rule 2.
+ *     confident the reader is above the last two lines vetoes it too, as for rule 2, and with
+ *     no line estimate yet (a book just opened, a calibration just ended) it waits for one.
+ *     In the extension's page mode (`pageMode`: no text to follow) any look below counts.
  *
  * Guards: cooldown after any scroll (and after firing); ≥ 60 % valid samples in
  * the last second; ≥ 4 fixations on the page or ≥ 2.5 s since the last turn
@@ -69,8 +71,8 @@ import { DEFAULT_FIXATION_OPTIONS } from '../signal/fixations';
  *  - Glance-down re-arms only after the gaze has come back up onto the page, so
  *    looking at the keyboard turns one page, not one every cooldown.
  *  - Glance-down counts only a look below the page that starts within GLANCE_ORIGIN_MS of
- *    the gaze being at the end of the last line (on it, θx along) — when there is text to
- *    follow (an estimate; page mode has none and keeps the plain rule). Without that, half of
+ *    the gaze being at the end of the last line (on it, θx along), and only once there is a line
+ *    estimate; page mode (`pageMode`, no lines to follow) keeps the plain rule. Without that, half of
  *    the end-to-end harness's glance-down turns were unintended (bench/endtoend: a phone
  *    glance mid-page, reading the last lines with the gaze dipping below the page, glare).
  *    With it, unintended turns fell from 12.9 to 7.2 an hour over 32 simulated hours (held-out
@@ -91,6 +93,12 @@ export interface PageEndInput {
   gaze: GazeSample | null;
   estimate: LineEstimate | null;
   layout: LineLayout | null;
+  /**
+   * The extension's page mode: pseudo-lines that are never read line by line, so there is no
+   * estimate, and glance-down counts any look below the page. Otherwise (text) a missing estimate
+   * means the reading layer has nothing to go on yet, not that there are no lines.
+   */
+  pageMode?: boolean;
 }
 
 export interface PageEndOptions {
@@ -534,8 +542,10 @@ export class PageEndDetector {
     }
     // A look at the keyboard or a phone mid-page is an excursion for the line tracker (it keeps its
     // line), so a tracker sure the reader is above the last two lines vetoes the gesture, as for rule 2.
-    // Without text to follow (the extension's page mode: no estimate) any look below the page counts.
-    const fromEnd = est === null || this.belowFromEnd;
+    // Without text to follow (the extension's page mode) any look below the page counts. On text, no
+    // estimate means no fixation yet since the reading layer started over (a book just opened, a
+    // calibration just ended): a first look at the phone then is no turn of a page nobody has read.
+    const fromEnd = input.pageMode === true || (est !== null && this.belowFromEnd);
     const c3: Tri = !this.opts.glanceDownToTurn ? false : valid ? this.glanceArmed && !vetoed && fromEnd && yc >= zones.glanceTop : null;
     this.glanceDwell.step(c3, dt);
 

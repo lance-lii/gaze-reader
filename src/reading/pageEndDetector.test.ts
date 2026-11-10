@@ -56,6 +56,8 @@ interface Gaze {
 class Rig {
   t = 1000;
   last: PageEndDecision | null = null;
+  /** The extension's page mode (no lines to follow): glance-down counts any look below the page. */
+  pageMode = false;
   constructor(readonly det: PageEndDetector = new PageEndDetector()) {}
 
   run(ms: number, gaze: Gaze | ((t: number) => Gaze) | null, est: LineEstimate | null, lay: LineLayout | null = layout) {
@@ -66,7 +68,7 @@ class Rig {
       const sample: GazeSample | null = g
         ? { t: this.t, x: g.x, y: g.y, rawX: g.x, rawY: g.y, valid: g.valid ?? true, confidence: 1, source: 'mouse' }
         : null;
-      const d = this.det.update({ t: this.t, gaze: sample, estimate: est, layout: lay });
+      const d = this.det.update({ t: this.t, gaze: sample, estimate: est, layout: lay, pageMode: this.pageMode });
       this.last = d;
       if (d.trigger) return { d, at: this.t };
     }
@@ -374,6 +376,7 @@ describe('PageEndDetector', () => {
 
   it('turns on a deliberate glance below the page, once per glance, and only if enabled', () => {
     const rig = new Rig();
+    rig.pageMode = true; // the plain rule: any look below the page
     const below = { x: 500, y: viewport.bottom + 60 };
     const start = rig.t;
     const hit = rig.run(2000, below, null);
@@ -387,6 +390,7 @@ describe('PageEndDetector', () => {
     expect(rig.run(2000, below, null)?.d.reason).toBe('glance-down');
 
     const off = new Rig(new PageEndDetector({ glanceDownToTurn: false }));
+    off.pageMode = true;
     expect(off.run(3000, below, null)).toBeNull();
   });
 
@@ -401,8 +405,34 @@ describe('PageEndDetector', () => {
       rig.run(300, { x: xAt(L, 0.9), y: line(L).centerY }, estimate(at, { p: 0.9, fix: 30 }));
       expect(rig.run(3000, lookDown, estimate(at, { p: 0.9, fix: 30 }))?.d.reason).toBe('glance-down');
     }
-    // No estimate at all (the extension's page mode) still fires.
-    expect(new Rig().run(3000, lookDown, null)?.d.reason).toBe('glance-down');
+    // The extension's page mode (no lines to follow, no estimate) still fires.
+    const page = new Rig();
+    page.pageMode = true;
+    expect(page.run(3000, lookDown, null)?.d.reason).toBe('glance-down');
+  });
+
+  it('waits for a line estimate before glance-down counts on text (regression: a look at the phone as a book opened turned page 1)', () => {
+    // The book has just opened, or a calibration just ended: the reading layer starts over, and until
+    // its first fixation there is no estimate. The camera comes up while the reader looks from the page
+    // to the phone (a frame on the page, one on the way down): that turned page 1, unread.
+    const phone = { x: 560, y: viewport.bottom + 600 };
+    for (const sensitivity of ['balanced', 'eager'] as const) {
+      for (const hz of [10, 15, 30]) {
+        const det = new PageEndDetector({ sensitivity });
+        let t = 0;
+        const step = (g: { x: number; y: number }) => det.update({ t: (t += 1000 / hz), gaze: { t, x: g.x, y: g.y, rawX: g.x, rawY: g.y, valid: true, confidence: 1, source: 'webcam' }, estimate: null, layout });
+        step({ x: 600, y: 500 });
+        step({ x: 590, y: 1100 });
+        let fired = false;
+        while (t < 3000) fired = step(phone).trigger || fired;
+        expect(fired, `${sensitivity}, ${hz} Hz`).toBe(false);
+      }
+    }
+    // In page mode the same look is the gesture.
+    const page = new Rig();
+    page.pageMode = true;
+    page.run(33, { x: 600, y: 500 }, null);
+    expect(page.run(3000, phone, null)?.d.reason).toBe('glance-down');
   });
 
   it('counts a look below the page only when it starts at the end of the last line (regression: phone glances turned pages)', () => {
@@ -435,7 +465,7 @@ describe('PageEndDetector', () => {
 
   it('never turns on tracking too slow for fixations to form (regression: phone glances turned pages at 2–4 fps, and the guard let 5–6.7 fps through)', () => {
     const lookDown = { x: 500, y: viewport.bottom + 300 };
-    const at = (hz: number, first: { x: number; y: number }) => {
+    const at = (hz: number, first: { x: number; y: number }, est: LineEstimate | null = null) => {
       const det = new PageEndDetector();
       let t = 1000;
       let last: PageEndDecision | null = null;
@@ -443,7 +473,7 @@ describe('PageEndDetector', () => {
         t += 1000 / hz;
         // No fixations at these rates, so no line estimate: the look below the page is all there is.
         const g = i < 10 * hz ? first : lookDown;
-        last = det.update({ t, gaze: { t, x: g.x, y: g.y, rawX: g.x, rawY: g.y, valid: true, confidence: 1, source: 'webcam' }, estimate: null, layout });
+        last = det.update({ t, gaze: { t, x: g.x, y: g.y, rawX: g.x, rawY: g.y, valid: true, confidence: 1, source: 'webcam' }, estimate: est, layout });
         if (last.trigger) return last;
       }
       return last;
@@ -458,7 +488,7 @@ describe('PageEndDetector', () => {
         expect(d.detail, `${hz} Hz`).toMatch(/^tracking too slow/);
       }
     }
-    for (const hz of [7.5, 10]) expect(at(hz, fromEnd)?.trigger, `at ${hz} Hz the same gaze turns the page`).toBe(true);
+    for (const hz of [7.5, 10]) expect(at(hz, fromEnd, estimate(L, { p: 0.4, fix: 30 }))?.trigger, `at ${hz} Hz the same gaze turns the page`).toBe(true);
   });
 
   it('respects the cooldown after any scroll', () => {
