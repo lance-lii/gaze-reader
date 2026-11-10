@@ -982,6 +982,31 @@ describe('AppController', () => {
     expect(toastButton('Use my mouse')).toBeTruthy();
   });
 
+  it('webcam: WebAssembly there but blocked (a CSP without wasm-unsafe-eval, a policy): says the browser can\'t run it, not the network (regression)', async () => {
+    const real = WebAssembly;
+    vi.stubGlobal('WebAssembly', {
+      ...real,
+      Module: class {
+        constructor() {
+          throw new real.CompileError('Refused to compile or instantiate WebAssembly module');
+        }
+      },
+    });
+    saved.model = calibratedModel();
+    const camera = stubCamera();
+    camera.failStarts(new TrackerError('model-load-failed', "Couldn't load the face-tracking runtime."));
+    app.destroy();
+    localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false }));
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    await app.start();
+    await openPastedText();
+    await until(() => /can.t run the face tracker/.test(toastText()), 'the unsupported-browser toast');
+    expect(toastText()).not.toMatch(/connection/);
+    expect(liveToastButton('Try again')).toBeUndefined();
+  });
+
   it('webcam: a camera too slow to follow the lines says why pages don\'t turn, once', async () => {
     const realNow = performance.now.bind(performance);
     let skew = 0;
