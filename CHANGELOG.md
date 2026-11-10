@@ -66,9 +66,10 @@ position sat a line or two off after shifting in the chair, and page turns came 
   If it can't start, the message says why (no camera found, access blocked, busy), and a camera
   that stops again within a minute is reported, with Try again.
 - **Switching cameras asks for a recalibration.** A calibration only fits the camera it was made
-  with. When the camera changes mid-reading (unplugging an external webcam falls back to the
-  built-in one), Gaze Reader now says so and offers to recalibrate, instead of reading your gaze
-  through the old camera's calibration.
+  with. Gaze Reader now remembers which camera that was and checks it whenever the camera starts,
+  however the reading began. When it changes (unplugging an external webcam or undocking a laptop
+  falls back to the built-in one), it says so and offers to recalibrate, and keeps offering until
+  you do or the old camera is back. Meanwhile it re-learns where your gaze sits.
 - **The right message when the browser can't run the face model.** With WebAssembly turned off or
   blocked (some managed or locked-down browsers), the message asked you to check your internet
   connection and offered Try again, which could never work. It now says this browser can't run

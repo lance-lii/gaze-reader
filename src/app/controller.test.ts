@@ -684,10 +684,11 @@ describe('AppController', () => {
   });
 
   /** Rebuilds the app on the webcam with `model` saved, opens a book and waits for tracking to run. */
-  async function readWithWebcam(model: GazeModel | null, opts: { open?: boolean; settings?: Partial<AppSettings> } = {}) {
+  async function readWithWebcam(model: GazeModel | null, opts: { open?: boolean; settings?: Partial<AppSettings>; deviceId?: string } = {}) {
     app.destroy();
     saved.model = model;
     const camera = stubCamera();
+    if (opts.deviceId) camera.state.deviceId = opts.deviceId;
     localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false, ...opts.settings }));
     root = document.createElement('div');
     document.body.appendChild(root);
@@ -808,6 +809,75 @@ describe('AppController', () => {
     camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
     await until(() => /A different camera/.test(toastText()), 'the different-camera toast');
     expect(toastButton('Recalibrate')).toBeTruthy();
+  });
+
+  const unplug = (camera: ReturnType<typeof stubCamera>, to: string) => {
+    camera.state.deviceId = to;
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+  };
+
+  it('webcam: notices a camera switch after a reading that began with a calibration (regression: only when the saved one fitted)', async () => {
+    overlays.run = async (bus) => {
+      bus.emit('calibration', { phase: 'start' });
+      bus.emit('calibration', { phase: 'done', report: REPORT });
+      return { model: calibratedModel({ trainedAt: 5000 }), report: REPORT };
+    };
+    // First use: no saved calibration, so the dots come first, with the external webcam.
+    const { camera } = await readWithWebcam(null, { deviceId: 'external-usb' });
+    await until(() => camera.subscribers() >= 2 && camera.running(), 'tracking after the calibration');
+    expect(overlays.modes).toEqual(['standard']);
+    const relearn = vi.spyOn(LineTracker.prototype, 'appearanceChangedAt');
+    // An hour on, the external webcam is unplugged and the restart picks the built-in one.
+    const realNow = performance.now.bind(performance);
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+    unplug(camera, 'built-in');
+    await until(() => /A different camera/.test(toastText()), 'the different-camera offer');
+    expect(liveToastButton('Recalibrate')).toBeTruthy();
+    expect(relearn).toHaveBeenCalled(); // the reading layer re-learns its offset meanwhile
+  });
+
+  it('webcam: notices a camera switch hidden behind the 5-dot refresh a smaller window asks for (undocking)', async () => {
+    const { camera } = await readWithWebcam(calibratedModel(), { deviceId: 'external-usb' });
+    const w0 = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+    const h0 = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    try {
+      // The lid closes and the laptop leaves its dock: on wake the window is on the smaller screen.
+      Object.defineProperty(window, 'innerWidth', { value: Math.round(window.innerWidth * 0.7), configurable: true });
+      Object.defineProperty(window, 'innerHeight', { value: Math.round(window.innerHeight * 0.75), configurable: true });
+      overlays.run = async (bus) => {
+        bus.emit('calibration', { phase: 'start' });
+        bus.emit('calibration', { phase: 'done', report: REPORT });
+        return { model: calibratedModel({ adjustOy: 12 }), report: REPORT }; // the same calibration, touched up
+      };
+      const realNow = performance.now.bind(performance);
+      vi.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+      unplug(camera, 'built-in');
+      await until(() => overlays.modes.length === 1, 'the 5-dot refresh');
+      expect(overlays.modes).toEqual(['quick']);
+      await until(() => /A different camera/.test(toastText()), 'the different-camera offer');
+    } finally {
+      if (w0) Object.defineProperty(window, 'innerWidth', w0);
+      if (h0) Object.defineProperty(window, 'innerHeight', h0);
+    }
+  });
+
+  it('webcam: keeps offering the recalibration until the camera matches the calibration again, and only then', async () => {
+    const { camera } = await readWithWebcam(calibratedModel(), { deviceId: 'external-usb' }); // made with this one
+    unplug(camera, 'built-in');
+    await until(() => /A different camera/.test(toastText()), 'the different-camera offer');
+    // The reader reads on; switching to the mouse and back (any restart) brings the offer back.
+    app.bus.emit('settings-patch', { gazeSource: 'mouse' });
+    await until(() => !camera.running(), 'the camera to stop');
+    document.querySelectorAll('.gr-toast').forEach((t) => t.remove());
+    app.bus.emit('settings-patch', { gazeSource: 'webcam' });
+    await until(() => /A different camera/.test(toastText()), 'the offer again');
+    // The external webcam is plugged back in: the calibration's own camera, nothing to offer.
+    const realNow = performance.now.bind(performance);
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+    unplug(camera, 'external-usb');
+    await until(() => camera.running() && !/A different camera/.test(toastText()), 'the offer to go');
+    await sleep(100);
+    expect(toastText()).not.toMatch(/A different camera/);
   });
 
   it('webcam: a denied camera explains how to allow it and offers the mouse and the demo, without retrying', async () => {

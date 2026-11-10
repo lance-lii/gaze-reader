@@ -11,7 +11,7 @@
 import { CSS_PREFIX } from '../core/constants';
 import { createEventBus } from '../core/events';
 import { createSettingsStore, type SettingsStore } from '../core/settings';
-import { readJSON, writeJSON } from '../core/storage';
+import { readJSON, removeKey, writeJSON } from '../core/storage';
 import { FULL_APP_URL, IS_ARTIFACT } from '../core/target';
 import type {
   AppEvents,
@@ -174,6 +174,8 @@ const LIGHTING_HOLD_MS = 5000;
 const APPEARANCE_DEBUG_MS = 250;
 /** Remembers that the "tracker upgraded, please recalibrate once" explanation was given. */
 const UPGRADE_EXPLAINED_KEY = 'calibrationUpgradeExplained.v1';
+/** The browser's id for the camera the saved calibration was made with: `{ deviceId }`. */
+const CALIBRATION_CAMERA_KEY = 'calibrationCamera.v1';
 
 /** What a calibration run did to the model. */
 type CalibrationOutcome = 'standard' | 'refresh' | 'unchanged';
@@ -297,8 +299,6 @@ export class AppController {
   /** performance.now() of the last camera frame (with or without a face); the stall watch reads it. */
   private lastCameraFrameAt = Number.NEGATIVE_INFINITY;
   private lastCameraRestartAt = Number.NEGATIVE_INFINITY;
-  /** The camera the reading started with, to notice a switch to another one. */
-  private cameraDeviceId: string | null = null;
   private slowCameraSince: number | null = null;
   private slowCameraShownAt = Number.NEGATIVE_INFINITY;
   /** The camera has been fast enough since the slow-camera message was last shown (or it never was). */
@@ -1561,6 +1561,7 @@ export class AppController {
       const outcome = await this.calibrate('standard', gen);
       if (!outcome) return null;
       this.afterCalibration(outcome, 'bring-up');
+      this.checkCamera(camera);
       return camera;
     }
     const fit = this.calibrationFit(model);
@@ -1573,9 +1574,10 @@ export class AppController {
       const outcome = await this.calibrate('quick', gen);
       if (!outcome) return null;
       this.afterCalibration(outcome, 'bring-up');
+      this.checkCamera(camera); // a 5-dot touch-up doesn't make the calibration another camera's
       return camera;
     }
-    this.noteCameraDevice(camera);
+    this.checkCamera(camera);
     return camera;
   }
 
@@ -1648,20 +1650,45 @@ export class AppController {
     this.syncSource();
   }
 
-  /** Another camera than the one the reading started with (a switch, or an unplug and a fallback): the calibration was made with the old one. */
-  private noteCameraDevice(camera: CameraFeatureSource): void {
+  /**
+   * A calibration only fits the camera it was made with: compares the one now running with the one
+   * stored with the calibration. Runs after every bring-up, whichever way it went, and offers the
+   * recalibration again each time until they match. Meanwhile the reading layer re-learns its offset,
+   * since the gaze from another camera sits somewhere else.
+   */
+  private checkCamera(camera: CameraFeatureSource): void {
     const id = camera.deviceId;
-    if (!id) return;
-    const before = this.cameraDeviceId;
-    this.cameraDeviceId = id;
-    if (before === null || before === id) return;
+    if (!id || !this.model) return;
+    const saved = readJSON<{ deviceId?: unknown } | null>(CALIBRATION_CAMERA_KEY, null);
+    const calibratedWith = saved && typeof saved.deviceId === 'string' ? saved.deviceId : null;
+    if (calibratedWith === null) {
+      // A calibration from before cameras were recorded: take it to be this camera's.
+      writeJSON(CALIBRATION_CAMERA_KEY, { deviceId: id });
+      return;
+    }
+    if (calibratedWith === id) {
+      this.toasts.dismiss('camera-switch');
+      return;
+    }
+    const now = performance.now();
+    this.lineTracker.appearanceChangedAt(now);
+    this.recordInput({ k: 'appearance', t: now, at: now });
     this.toasts.show({
-      id: 'refresh-calibration',
+      id: 'camera-switch',
       tone: 'warn',
       title: 'A different camera',
-      message: 'Gaze Reader is using another camera now, and the calibration was made with the old one. Recalibrate to keep page turns accurate.',
+      message: 'Gaze Reader is using another camera than the one you calibrated with, so it may read your gaze in the wrong place. Recalibrate to keep page turns accurate.',
       actions: [{ label: 'Recalibrate', primary: true, run: () => this.recalibrate() }],
+      durationMs: 20_000,
     });
+  }
+
+  /** A new calibration (not a refresh of one) was just made with the running camera: it is now the reference. */
+  private rememberCalibrationCamera(): void {
+    const id = this.camera?.deviceId ?? null;
+    if (id) writeJSON(CALIBRATION_CAMERA_KEY, { deviceId: id });
+    else removeKey(CALIBRATION_CAMERA_KEY);
+    this.toasts.dismiss('camera-switch');
   }
 
   private introduceSource(kind: GazeSourceKind): void {
@@ -1799,6 +1826,8 @@ export class AppController {
     if (result) {
       const outcome: CalibrationOutcome = base && sameRidgeCore(result.model.toJSON(), base.toJSON()) ? 'refresh' : 'standard';
       this.adoptModel(result.model, result.report);
+      // A refresh touches up the same calibration: its camera stays the reference.
+      if (outcome === 'standard') this.rememberCalibrationCamera();
       if (mode === 'check' && outcome === 'refresh') this.reportAccuracyCheck(check);
       return outcome;
     }
@@ -2007,6 +2036,7 @@ export class AppController {
 
   private forgetCalibration(): void {
     clearCalibration();
+    removeKey(CALIBRATION_CAMERA_KEY);
     this.model = null;
     this.savedCalibration = false;
     this.applyEnvironment(null);
