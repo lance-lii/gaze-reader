@@ -132,6 +132,9 @@ position sat a line or two off after shifting in the chair, and page turns came 
   Relaxed presets in parallel shards, with three seeds for the two-hour row, and gives 95 % intervals.
   `GR_EVAL_BASELINE=deployed` adds the deployed page-end detector on the same seeds and shows, per scenario,
   each difference with its interval and the missed pages per unintended turn prevented.
+- **The simulation follows the app's new cooldown after a book opens or a calibration ends**, and
+  the eval's "missed pages per unintended turn prevented" is left blank when a change prevents
+  fewer than 0.1 an hour (it divided by almost nothing before).
 - **Per-scenario gates.** `tests/endToEnd*.test.ts` give each scenario its own limits: clean,
   everyday (also on Relaxed), distracted, fidgety (also on Relaxed), glasses, a noisy webcam and dim
   light. A regression in one kind of light or behaviour can no longer hide in a total over all of them.
