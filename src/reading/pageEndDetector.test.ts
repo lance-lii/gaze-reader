@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { GazeSample, LineEstimate, LineLayout, PageEndDecision, SaccadeKind, Sensitivity } from '../types';
 import {
+  MIN_TRACKING_HZ,
   PAGE_END_GUARDS,
   PAGE_END_PRESETS,
   PageEndDetector,
@@ -90,7 +91,9 @@ describe('page-end presets and geometry', () => {
       balanced: { minPosterior: 0.55, minProgress: 0.7, dwellMs: 350, zoneMs: 1200, glanceMs: 600, cooldownMs: 1800 },
       eager: { minPosterior: 0.45, minProgress: 0.55, dwellMs: 200, zoneMs: 800, glanceMs: 450, cooldownMs: 1400 },
     });
-    expect(PAGE_END_GUARDS).toEqual({ validityWindowMs: 1000, minValidFraction: 0.6, minValidSamples: 6, minFixationsOnPage: 4, minMsSinceTurn: 2500 });
+    expect(PAGE_END_GUARDS).toEqual({ validityWindowMs: 1000, minValidFraction: 0.6, minValidSamples: 8, minFixationsOnPage: 4, minMsSinceTurn: 2500 });
+    // Fixations end at gaps over 150 ms (DEFAULT_FIXATION_OPTIONS.maxGapMs): no lines to follow below ≈ 6.7 a second.
+    expect(MIN_TRACKING_HZ).toBe(7);
   });
 
   it('derives the zones from the last fully visible line', () => {
@@ -430,27 +433,32 @@ describe('PageEndDetector', () => {
     expect(rig.run(4000, lookDown, unsure)).toBeNull(); // …and straight down at the keyboard
   });
 
-  it('never turns on tracking slower than 5 samples a second (regression: phone glances turned pages at 2–4 fps)', () => {
+  it('never turns on tracking too slow for fixations to form (regression: phone glances turned pages at 2–4 fps, and the guard let 5–6.7 fps through)', () => {
     const lookDown = { x: 500, y: viewport.bottom + 300 };
-    const at = (hz: number) => {
+    const at = (hz: number, first: { x: number; y: number }) => {
       const det = new PageEndDetector();
       let t = 1000;
+      let last: PageEndDecision | null = null;
       for (let i = 0; i < 20 * hz; i++) {
         t += 1000 / hz;
-        // No fixations at this rate, so no line estimate: the look below the page is all there is.
-        const g = i < 10 * hz ? { x: xAt(L, 0.9), y: line(L).centerY } : lookDown;
-        const d = det.update({ t, gaze: { t, x: g.x, y: g.y, rawX: g.x, rawY: g.y, valid: true, confidence: 1, source: 'webcam' }, estimate: null, layout });
-        if (d.trigger) return d;
-        if (i === 20 * hz - 1) return d;
+        // No fixations at these rates, so no line estimate: the look below the page is all there is.
+        const g = i < 10 * hz ? first : lookDown;
+        last = det.update({ t, gaze: { t, x: g.x, y: g.y, rawX: g.x, rawY: g.y, valid: true, confidence: 1, source: 'webcam' }, estimate: null, layout });
+        if (last.trigger) return last;
       }
-      return null;
+      return last;
     };
-    for (const hz of [2, 4]) {
-      const d = at(hz)!;
-      expect(d.trigger, `${hz} Hz`).toBe(false);
-      expect(d.detail, `${hz} Hz`).toMatch(/^tracking too slow/);
+    const fromEnd = { x: xAt(L, 0.9), y: line(L).centerY };
+    // 5.5–6.5 a second: the old 5-a-second guard passed, but every gap is over 150 ms, so no fixation
+    // ever completed (the same as at 2–4): a look at the phone from mid-page then turned page after page.
+    for (const hz of [2, 4, 5.5, 6, 6.5]) {
+      for (const first of [fromEnd, { x: xAt(8, 0.5), y: line(8).centerY }]) {
+        const d = at(hz, first)!;
+        expect(d.trigger, `${hz} Hz`).toBe(false);
+        expect(d.detail, `${hz} Hz`).toMatch(/^tracking too slow/);
+      }
     }
-    expect(at(10)?.trigger, 'at 10 Hz the same gaze turns the page').toBe(true);
+    for (const hz of [7.5, 10]) expect(at(hz, fromEnd)?.trigger, `at ${hz} Hz the same gaze turns the page`).toBe(true);
   });
 
   it('respects the cooldown after any scroll', () => {

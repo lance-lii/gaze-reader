@@ -59,7 +59,7 @@ import { deleteBook, findLibraryBook, getBook, getProgress, listBooks, saveBook,
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
 import { LineTracker } from '../reading/lineTracker';
-import { PageEndDetector } from '../reading/pageEndDetector';
+import { MIN_TRACKING_HZ, PageEndDetector } from '../reading/pageEndDetector';
 import { SimulatedReaderSource } from '../reading/simulatedReader';
 import { FixationDetector } from '../signal/fixations';
 import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationMode } from '../ui/calibrationOverlay';
@@ -148,10 +148,13 @@ const HIDDEN_STOP_MS = 60_000;
 const CAMERA_STALL_MS = 5000;
 /** A camera that stops again this soon after being restarted on its own is reported, not restarted. */
 const CAMERA_RESTART_MIN_GAP_MS = 60_000;
-/** Below this many frames a second gaze can't follow the lines (the page-end detector waits for 5 valid samples a second)… */
-const SLOW_CAMERA_FPS = 5;
-/** …and after this long at that rate the reader is told why pages don't turn. */
+/**
+ * After this long below MIN_TRACKING_HZ frames a second (the rate the page-end detector needs to
+ * follow the lines, and below which it holds every turn) the reader is told why pages don't turn…
+ */
 const SLOW_CAMERA_MS = 5000;
+/** …and told again when it happens again after the camera was fast enough, at most this often. */
+const SLOW_CAMERA_REPEAT_MS = 10 * 60_000;
 const SCROLL_SETTLE_MS = 120;
 const SAVE_POSITION_MS = 1000;
 const ESTIMATE_EMIT_MS = 100;
@@ -297,7 +300,9 @@ export class AppController {
   /** The camera the reading started with, to notice a switch to another one. */
   private cameraDeviceId: string | null = null;
   private slowCameraSince: number | null = null;
-  private slowCameraShown = false;
+  private slowCameraShownAt = Number.NEGATIVE_INFINITY;
+  /** The camera has been fast enough since the slow-camera message was last shown (or it never was). */
+  private slowCameraRecovered = true;
   /** undefined = not loaded from storage yet. */
   private model: GazeModel | null | undefined = undefined;
   private savedCalibration = false;
@@ -1604,13 +1609,15 @@ export class AppController {
     }
     // Frames still come, but too few to follow the lines (an overloaded or throttled machine).
     const fps = camera.fps;
-    if (!(fps > 0 && fps < SLOW_CAMERA_FPS)) {
+    if (!(fps > 0 && fps < MIN_TRACKING_HZ)) {
       this.slowCameraSince = null;
+      if (fps >= MIN_TRACKING_HZ) this.slowCameraRecovered = true;
       return;
     }
     this.slowCameraSince ??= now;
-    if (this.slowCameraShown || now - this.slowCameraSince < SLOW_CAMERA_MS) return;
-    this.slowCameraShown = true;
+    if (now - this.slowCameraSince < SLOW_CAMERA_MS || !this.slowCameraRecovered || now - this.slowCameraShownAt < SLOW_CAMERA_REPEAT_MS) return;
+    this.slowCameraShownAt = now;
+    this.slowCameraRecovered = false;
     this.toasts.show({
       id: 'slow-camera',
       tone: 'warn',

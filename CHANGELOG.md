@@ -36,11 +36,12 @@ position sat a line or two off after shifting in the chair, and page turns came 
   line, where you finish the page. In the new end-to-end simulation (`npm run eval`), unintended
   page turns fell from 12.9 to 7.2 an hour, for one more missed turn in a hundred. The extension's
   page mode, which has no lines to follow, still turns on any look down.
-- **No page turns on tracking too slow to follow you.** Below about 5 frames a second (an
-  overloaded or throttled machine) there are no fixations to follow the lines with, and in the
-  end-to-end simulation a glance at a phone then turned the page about 5 times an hour. Page turns
-  now wait until tracking is fast enough again, and the web app says why after 5 seconds. At 10
-  frames a second and above nothing changes.
+- **No page turns on tracking too slow to follow you.** Below about 7 frames a second (an
+  overloaded or throttled machine, or face tracking on the CPU) no fixation can form, so there are
+  no lines to follow, and in the end-to-end simulation a glance at a phone then turned the page
+  about 5 times an hour. Page turns now wait until tracking is fast enough again. After 5 seconds the
+  web app says why, and says it again if the camera slows down again later (at most every 10
+  minutes). At 10 frames a second and above nothing changes.
 - **A page no longer turns the moment you come back.** Gaze resting at the end of the page counts up
   towards a turn. If tracking stopped meanwhile (you opened Settings, switched tabs, or the camera
   froze and restarted), the count carried on from where it was, so a page could turn a frame or two

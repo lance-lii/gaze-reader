@@ -124,7 +124,7 @@ describe('page-end detector: guarantees under random input', () => {
         const where = `seed ${seed}, t ${s.t.toFixed(0)}`;
         expect(ok, `fired on an invalid sample (${where})`).toBe(true);
         expect(s.t - Math.max(lastScroll, lastFire), `fired within the cooldown (${where})`).toBeGreaterThanOrEqual(cooldown - 1e-6);
-        expect(recent.filter((r) => r.ok).length, `fired on too few valid samples (${where})`).toBeGreaterThanOrEqual(PAGE_END_GUARDS.minValidSamples - 1);
+        expect(recent.filter((r) => r.ok).length, `fired on too few valid samples (${where})`).toBeGreaterThanOrEqual(PAGE_END_GUARDS.minValidSamples);
         lastFire = s.t;
       });
     }
