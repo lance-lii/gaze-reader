@@ -172,6 +172,30 @@ describe('TrackingStateMachine', () => {
     expect(m.evaluate(t, running({ kind: 'mouse', autoScroll: false })).state).toBe('paused');
   });
 
+  it('reports a line tracker that has been unsure for a while, below the camera states and pauses', () => {
+    const m = new TrackingStateMachine();
+    m.reset(0);
+    let t = feed(m, 0, 3000, true, 0.9);
+    expect(m.evaluate(t, running({ lineUnsure: true }))).toEqual({ state: 'unsure', detail: 'Unsure of the line' });
+    expect(m.evaluate(t, running({ lineUnsure: false })).state).toBe('tracking');
+    // Paused (by the reader or a hold), auto-scroll isn't waiting on the line at all.
+    expect(m.evaluate(t, running({ lineUnsure: true, autoScroll: false })).state).toBe('paused');
+    expect(m.evaluate(t, running({ lineUnsure: true, holdReason: 'Camera changed' })).state).toBe('paused');
+    // The camera's own trouble is the cause to fix first.
+    t = feed(m, t, t + 4000, true, 0.12);
+    expect(m.evaluate(t, running({ lineUnsure: true })).state).toBe('poor');
+    t = feed(m, t, t + 1500, false);
+    expect(m.evaluate(t, running({ lineUnsure: true })).state).toBe('no-face');
+  });
+
+  it('never reports unsure for mouse and demo sources', () => {
+    const m = new TrackingStateMachine();
+    m.reset(0);
+    const t = feed(m, 0, 3000, true, 0.9);
+    expect(m.evaluate(t, running({ kind: 'mouse', lineUnsure: true })).state).toBe('tracking');
+    expect(m.evaluate(t, running({ kind: 'simulated', lineUnsure: true })).state).toBe('tracking');
+  });
+
   it('ignores non-finite timestamps and confidences', () => {
     const m = new TrackingStateMachine();
     m.reset(0);
@@ -193,6 +217,7 @@ describe('statusPill', () => {
     expect(statusPill('tracking', 'webcam', true).label).toBe('Tracking');
     expect(statusPill('no-face', 'webcam', true).label).toBe('Looking for you');
     expect(statusPill('poor', 'webcam', true).label).toBe('Low confidence');
+    expect(statusPill('unsure', 'webcam', true).label).toBe('Unsure of your line');
     expect(statusPill('paused', 'webcam', true).label).toBe('Paused');
     expect(statusPill('off', null, false).label).toBe('Camera off');
     expect(statusPill('tracking', 'simulated', false).label).toBe('Demo');
@@ -201,7 +226,7 @@ describe('statusPill', () => {
   });
 
   it('mentions the camera whenever it is on', () => {
-    for (const s of ['tracking', 'no-face', 'poor', 'paused', 'starting', 'calibrating'] as const) {
+    for (const s of ['tracking', 'no-face', 'poor', 'unsure', 'paused', 'starting', 'calibrating'] as const) {
       expect(statusPill(s, 'webcam', true).description).toMatch(/Camera on/);
     }
     expect(statusPill('paused', 'mouse', false).description).not.toMatch(/Camera on/);
@@ -210,8 +235,18 @@ describe('statusPill', () => {
   it('uses tones that match severity', () => {
     expect(statusPill('tracking', 'webcam', true).tone).toBe('ok');
     expect(statusPill('no-face', 'webcam', true).tone).toBe('warn');
+    expect(statusPill('unsure', 'webcam', true).tone).toBe('warn');
     expect(statusPill('error', 'webcam', false).tone).toBe('bad');
     expect(statusPill('paused', 'webcam', true).tone).toBe('idle');
+  });
+
+  it('tells an unsure reader how to turn the page meanwhile', () => {
+    const v = statusPill('unsure', 'webcam', true);
+    expect(v.description).toMatch(/may not turn by themselves/);
+    expect(v.description).toMatch(/Space/);
+    // A mouse or the demo reader has no line to be unsure of.
+    expect(statusPill('unsure', 'mouse', false).label).toBe('Mouse');
+    expect(statusPill('unsure', 'simulated', false).label).toBe('Demo');
   });
 
   it('only says "camera" while starting the webcam (regression)', () => {
@@ -226,7 +261,7 @@ describe('statusPill', () => {
 
 describe('pillAlwaysVisible', () => {
   it('keeps the pill up whenever the camera is on (privacy)', () => {
-    for (const s of ['tracking', 'no-face', 'poor', 'starting', 'calibrating', 'paused'] as const) {
+    for (const s of ['tracking', 'no-face', 'poor', 'unsure', 'starting', 'calibrating', 'paused'] as const) {
       expect(pillAlwaysVisible(s, 'webcam', true)).toBe(true);
     }
   });

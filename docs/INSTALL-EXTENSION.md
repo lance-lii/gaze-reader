@@ -100,8 +100,9 @@ leaves the calibration as it is.
 - Want the next page right away? Look just below the bottom edge of the window for a moment.
 - Dewey, the small reading buddy in the corner, reads along with you. Click him for a menu, or drag
   him to another corner. The popup can hide him.
-- The status pill next to Dewey shows whether Gaze Reader can see your eyes. It also has
-  pause, recalibrate and close buttons.
+- The status pill next to Dewey shows whether Gaze Reader can see your eyes, and says **Unsure of
+  your line** when it can't tell which line you're reading: pages may not turn by themselves then,
+  so press Alt+Shift+↓. It also has pause, recalibrate and close buttons.
 - The popup lets you choose eyes or mouse, how eager page turns are (**Relaxed / Balanced /
   Eager**), how pages turn (**Auto / Scrolling / Next-page key**, see
   [page mode](#canvas-and-image-readers-page-mode)), whether Dewey is shown, and whether the gaze
