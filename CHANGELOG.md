@@ -65,6 +65,9 @@ position sat a line or two off after shifting in the chair, and page turns came 
   restarts the camera once by itself when it sends no picture for 5 seconds or its video ends.
   If it can't start, the message says why (no camera found, access blocked, busy), and a camera
   that stops again within a minute is reported, with Try again.
+- **A calibration survives the camera restarting.** If the camera stopped while you were on the
+  calibration dots, it restarted by itself but went back to reading on the old calibration without
+  a word. The dots now start over once the camera is back, with a note saying why.
 - **Switching cameras asks for a recalibration.** A calibration only fits the camera it was made
   with. Gaze Reader now remembers which camera that was and checks it whenever the camera starts,
   however the reading began. When it changes (unplugging an external webcam or undocking a laptop

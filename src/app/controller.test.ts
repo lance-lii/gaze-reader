@@ -5,7 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppEvents, AppSettings, Book, EventBus, FeatureFrame, GazeModel, LightingSignature, LineLayout, PageEndDecision, TextLine } from '../types';
-import type { AccuracyCheckResult, CalibrationResult } from '../ui/calibrationOverlay';
+import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationResult } from '../ui/calibrationOverlay';
 import { AppearanceMonitor } from '../gaze/appearance';
 import { GAZE_MODEL_KIND, GAZE_MODEL_VERSION, deserializeGazeModel } from '../gaze/calibrationModel';
 import { TrackerError } from '../gaze/camera';
@@ -878,6 +878,24 @@ describe('AppController', () => {
     await until(() => camera.running() && !/A different camera/.test(toastText()), 'the offer to go');
     await sleep(100);
     expect(toastText()).not.toMatch(/A different camera/);
+  });
+
+  it('webcam: a camera that stops during a recalibration the reader asked for opens it again after the restart (regression: dropped, reading went on with the old one)', async () => {
+    const { camera } = await readWithWebcam(calibratedModel());
+    // The dots stay up until the overlay is cancelled (the reader is on them).
+    let cancelled: (() => void) | null = null;
+    overlays.run = () =>
+      new Promise((resolve) => {
+        cancelled = () => resolve(null);
+      });
+    vi.spyOn(CalibrationOverlay.prototype, 'cancel').mockImplementation(() => cancelled?.());
+    app.bus.emit('command', { name: 'recalibrate' });
+    await until(() => overlays.modes.length === 1, 'the recalibration');
+    expect(overlays.modes).toEqual(['standard']);
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => overlays.modes.length === 2, 'the calibration to open again after the restart');
+    expect(overlays.modes).toEqual(['standard', 'standard']);
+    expect(toastText()).toMatch(/calibration starts over/);
   });
 
   it('webcam: a denied camera explains how to allow it and offers the mouse and the demo, without retrying', async () => {
