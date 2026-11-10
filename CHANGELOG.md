@@ -138,6 +138,9 @@ position sat a line or two off after shifting in the chair, and page turns came 
 - **Per-scenario gates.** `tests/endToEnd*.test.ts` give each scenario its own limits: clean,
   everyday (also on Relaxed), distracted, fidgety (also on Relaxed), glasses, a noisy webcam and dim
   light. A regression in one kind of light or behaviour can no longer hide in a total over all of them.
+  The noisiest scenarios count three shorter sessions instead of one long one: an early difference
+  can send one long session down a much worse path (one dim hour swung from 14 to 37 missed pages
+  where three 20-minute sessions stayed at 30).
 
 ## 1.1.0 (unreleased, 2026-09-25)
 

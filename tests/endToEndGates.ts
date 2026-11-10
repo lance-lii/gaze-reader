@@ -8,11 +8,11 @@
  * different path, which alone moves a count by about its square root. Seeds differ far more than
  * that (a bad calibration or posture can make one session several times worse than another), so
  * the limits aren't long-run rates: each sits about 1.5 standard deviations above what the code
- * does on the gate seed, ceil(n + 1.5·√max(n, 1)). A real regression in that scenario fails it; a
+ * does on the gate seeds, ceil(n + 1.5·√max(n, 1)). A real regression in that scenario fails it; a
  * reshuffle doesn't. When a change moves a scenario's numbers on purpose, set its limits from the
  * new counts the same way (and check `npm run eval` agrees), never higher to let a regression pass.
  *
- * Noisy webcam misses nearly every page on its gate seed already (published webcam noise is more
+ * Noisy webcam misses nearly every page on its gate seeds already (published webcam noise is more
  * than the reading layer can follow), so its gate guards unintended turns rather than missed ones.
  */
 import { runSession, summarize, type SessionMetrics, type Summary } from '../bench/endtoend/rig';
@@ -21,9 +21,16 @@ import type { Sensitivity } from '../src/types';
 
 export interface Gate {
   scenario: string;
+  /** Length of each session, minutes. */
   minutes: number;
+  /**
+   * Seeds, one session each, counted together (default: GATE_SEED). The noisiest scenarios use
+   * three shorter sessions instead of one long one: an early difference can send one session down
+   * a much worse path for the rest of it, and three of them don't all go the same way.
+   */
+  seeds?: number[];
   sensitivity?: Sensitivity;
-  /** At most this many unintended turns in the session… */
+  /** At most this many unintended turns over the sessions… */
   maxFalse: number;
   /** …and this many finished pages not turned (missed). */
   maxMissed: number;
@@ -33,15 +40,16 @@ export const GATE_SEED = 1;
 /** Simulated hours take a while; a gate session of up to an hour runs in about ten seconds. */
 export const SLOW_MS = 180_000;
 
-const cache = new Map<string, { metrics: SessionMetrics; summary: Summary; falses: number; missed: number }>();
+const cache = new Map<string, { metrics: SessionMetrics[]; summary: Summary; falses: number; missed: number }>();
 
-export function gateSession(g: Gate): { metrics: SessionMetrics; summary: Summary; falses: number; missed: number } {
-  const key = `${g.scenario}/${g.minutes}/${g.sensitivity ?? 'balanced'}`;
+export function gateSession(g: Gate): { metrics: SessionMetrics[]; summary: Summary; falses: number; missed: number } {
+  const seeds = g.seeds ?? [GATE_SEED];
+  const key = `${g.scenario}/${g.minutes}/${g.sensitivity ?? 'balanced'}/${seeds.join(',')}`;
   let s = cache.get(key);
   if (!s) {
-    const metrics = runSession(scenario(g.scenario), GATE_SEED, { minutes: g.minutes, sensitivity: g.sensitivity ?? 'balanced' });
-    const count = (kind: string): number => metrics.turns.filter((t) => t.kind === kind).length;
-    s = { metrics, summary: summarize([metrics]), falses: count('false'), missed: count('missed') };
+    const metrics = seeds.map((seed) => runSession(scenario(g.scenario), seed, { minutes: g.minutes, sensitivity: g.sensitivity ?? 'balanced' }));
+    const count = (kind: string): number => metrics.reduce((a, m) => a + m.turns.filter((t) => t.kind === kind).length, 0);
+    s = { metrics, summary: summarize(metrics), falses: count('false'), missed: count('missed') };
     cache.set(key, s);
   }
   return s;
@@ -57,4 +65,4 @@ export function gateReport(s: Summary): string {
 }
 
 export const gateTitle = (g: Gate): string =>
-  `${g.scenario}${g.sensitivity && g.sensitivity !== 'balanced' ? ` (${g.sensitivity})` : ''}, ${g.minutes} min: ≤ ${g.maxFalse} unintended turns, ≤ ${g.maxMissed} missed`;
+  `${g.scenario}${g.sensitivity && g.sensitivity !== 'balanced' ? ` (${g.sensitivity})` : ''}, ${g.seeds && g.seeds.length > 1 ? `${g.seeds.length} × ` : ''}${g.minutes} min: ≤ ${g.maxFalse} unintended turns, ≤ ${g.maxMissed} missed`;

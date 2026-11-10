@@ -3,9 +3,9 @@ import { describe, expect, it } from 'vitest';
 import { SLOW_MS, gateReport, gateSession, gateTitle, type Gate } from './endToEndGates';
 
 const GATES: Gate[] = [
-  { scenario: 'fidgety', minutes: 15, maxFalse: 5, maxMissed: 9 },
-  { scenario: 'fidgety', minutes: 15, sensitivity: 'relaxed', maxFalse: 3, maxMissed: 13 },
-  { scenario: 'glasses', minutes: 15, maxFalse: 7, maxMissed: 9 },
+  { scenario: 'fidgety', minutes: 10, seeds: [1, 2, 3], maxFalse: 15, maxMissed: 9 },
+  { scenario: 'fidgety', minutes: 10, seeds: [1, 2, 3], sensitivity: 'relaxed', maxFalse: 11, maxMissed: 14 },
+  { scenario: 'glasses', minutes: 10, seeds: [1, 2, 3], maxFalse: 7, maxMissed: 13 },
 ];
 
 describe('end-to-end gates: posture and glasses (simulated reader, fixed seed)', () => {
