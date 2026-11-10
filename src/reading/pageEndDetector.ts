@@ -71,8 +71,11 @@ import { DEFAULT_FIXATION_OPTIONS } from '../signal/fixations';
  *  - Glance-down re-arms only after the gaze has come back up onto the page, so
  *    looking at the keyboard turns one page, not one every cooldown.
  *  - Glance-down counts only a look below the page that starts within GLANCE_ORIGIN_MS of
- *    the gaze being at the end of the last line (on it, θx along), and only once there is a line
- *    estimate; page mode (`pageMode`, no lines to follow) keeps the plain rule. Without that, half of
+ *    the gaze being at the end of the last line (across rule 2's zone, END_SAMPLES in a row), and only
+ *    once there is a line estimate; page mode (`pageMode`, no lines to follow) keeps the plain
+ *    rule. The zone, not θx along the line: Dewey's corner and the screen edge to the right of the
+ *    text armed half of the unintended glance turns left in the harness, and Relaxed's θx = 0.85
+ *    left so little of the line that fidgety readers' own looks down from its end missed. Without that, half of
  *    the end-to-end harness's glance-down turns were unintended (bench/endtoend: a phone
  *    glance mid-page, reading the last lines with the gaze dipping below the page, glare).
  *    With it, unintended turns fell from 12.9 to 7.2 an hour over 32 simulated hours (held-out
@@ -249,8 +252,17 @@ const DOUBT_DWELL_FACTOR = 2;
 const ANCHOR_DOUBT = 0.25;
 /** Glance-down re-arms once the gaze has come back this far above the glance threshold. */
 const GLANCE_REARM_LINES = 1;
-/** Glance-down counts when the look below the page begins at most this long after the gaze was at the end of the last line. */
+/** Glance-down counts when the look below the page begins at most this long after the gaze was at the end of the last line… */
 const GLANCE_ORIGIN_MS = 1500;
+/**
+ * …across rule 2's zone (the right half of the last line, out to the column's edge: not Dewey's
+ * corner or the screen edge beyond it), from END_ABOVE_LINES above the line's top down, for this many
+ * valid samples in a row: one frame on the way down to a phone, or back up from it, doesn't make the
+ * end of the last line. (The zone's own top, a quarter pitch above the line, cost misses in dim light
+ * for no fewer unintended turns: 10 seeds × 5 scenarios, +3.2 points of dim pages missed.)
+ */
+const END_SAMPLES = 2;
+const END_ABOVE_LINES = 0.5;
 /**
  * Bottom-dwell only counts gaze down to this many pitches below the page (slack for
  * vertical noise while reading the last line); further down is a look off the page.
@@ -338,8 +350,9 @@ export class PageEndDetector {
   private settledDocTop: number | null = null;
   private settledRun = 0;
   private glanceArmed = true;
-  /** Last valid sample at the end of the last line (see GLANCE_ORIGIN_MS). */
+  /** Last valid sample at the end of the last line (see GLANCE_ORIGIN_MS), and the run of them leading to it. */
   private endSeenAt = -Infinity;
+  private endRun = 0;
   /** The latest valid sample was below the page, and that look began from the end of the last line. */
   private below = false;
   private belowFromEnd = false;
@@ -379,6 +392,7 @@ export class PageEndDetector {
     this.clearEntry();
     // Likewise the end of the last line the gaze was last seen at.
     this.endSeenAt = -Infinity;
+    this.endRun = 0;
     this.belowFromEnd = false;
   }
 
@@ -399,6 +413,7 @@ export class PageEndDetector {
     this.glanceArmed = true;
     this.lookedUp = true;
     this.endSeenAt = -Infinity;
+    this.endRun = 0;
     this.below = false;
     this.belowFromEnd = false;
   }
@@ -537,7 +552,9 @@ export class PageEndDetector {
         this.below = true;
       } else {
         this.below = false;
-        if (yc >= Lline.top - 0.5 * pitch && progress >= th.minProgress) this.endSeenAt = t;
+        const atEnd = yc >= Lline.top - END_ABOVE_LINES * pitch && x >= zones.zoneLeft && x <= zones.zoneRight;
+        this.endRun = atEnd ? this.endRun + 1 : 0;
+        if (this.endRun >= END_SAMPLES) this.endSeenAt = t;
       }
     }
     // A look at the keyboard or a phone mid-page is an excursion for the line tracker (it keeps its
@@ -675,6 +692,7 @@ export class PageEndDetector {
     this.zoneDwell.reset();
     this.glanceDwell.reset();
     this.disarmSweep();
+    this.endRun = 0;
     this.below = false;
     this.belowFromEnd = false;
   }
