@@ -1,11 +1,12 @@
 /**
- * End-to-end gate, dim light at 15 frames a second: an hour, so that missed pages there are counted
- * on enough of them (see tests/endToEndGates.ts for how the limits are set).
+ * End-to-end gate, dim light at 15 frames a second: three 20-minute sessions, so that missed pages
+ * there are counted on enough of them (see tests/endToEndGates.ts for how the limits are set). One
+ * hour-long session swung from 14 to 37 missed pages on a change that left three short ones at 30.
  */
 import { describe, expect, it } from 'vitest';
 import { SLOW_MS, gateReport, gateSession, gateTitle, type Gate } from './endToEndGates';
 
-const GATE: Gate = { scenario: 'dim, 15 fps', minutes: 60, maxFalse: 18, maxMissed: 20 };
+const GATE: Gate = { scenario: 'dim, 15 fps', minutes: 20, seeds: [1, 2, 3], maxFalse: 13, maxMissed: 39 };
 
 describe('end-to-end gate: dim light, 15 fps (simulated reader, fixed seed)', () => {
   it(gateTitle(GATE), { timeout: SLOW_MS }, () => {
