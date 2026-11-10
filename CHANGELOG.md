@@ -75,9 +75,10 @@ position sat a line or two off after shifting in the chair, and page turns came 
   falls back to the built-in one), it says so and offers to recalibrate, and keeps offering until
   you do or the old camera is back. Meanwhile it re-learns where your gaze sits.
 - **The right message when the browser can't run the face model.** With WebAssembly turned off or
-  blocked (some managed or locked-down browsers), the message asked you to check your internet
-  connection and offered Try again, which could never work. It now says this browser can't run
-  the face tracker, and offers the mouse and the demo.
+  blocked (some managed or locked-down browsers, or a site served with a security policy that
+  forbids it), the message asked you to check your internet connection and offered Try again, which
+  could never work. It now says this browser can't run the face tracker, and offers the mouse and
+  the demo.
 - **One zoom step asks for the quick refresh.** Zooming the page by one step (to 90 % or 110 %)
   changed the window by less than the size check allowed, so the calibration kept reading your gaze
   about a tenth off, roughly two lines at the bottom of the page. Any zoom change now offers the

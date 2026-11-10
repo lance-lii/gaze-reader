@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS, sanitizeSettings } from '../core/settings';
 import type { AppSettings, TextLine } from '../types';
 import {
@@ -34,6 +34,7 @@ import {
   textEndsOnScreen,
   trackerErrorCode,
   type TrackingContext,
+  webAssemblyUsable,
 } from './logic';
 
 const running = (over: Partial<TrackingContext> = {}): TrackingContext => ({
@@ -684,5 +685,29 @@ describe('settings schema', () => {
     const patch = resetPatch(DEFAULT_SETTINGS, current);
     expect(patch.gazeSource).toBe('mouse');
     expect(patch.fontSizePx).toBe(DEFAULT_SETTINGS.fontSizePx);
+  });
+});
+
+describe('webAssemblyUsable', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('is true where WebAssembly compiles (here)', () => {
+    expect(webAssemblyUsable()).toBe(true);
+  });
+
+  it('is false with WebAssembly turned off, and with it there but compiling refused (a CSP, a policy)', () => {
+    vi.stubGlobal('WebAssembly', undefined);
+    expect(webAssemblyUsable()).toBe(false);
+    vi.unstubAllGlobals();
+    const real = WebAssembly;
+    vi.stubGlobal('WebAssembly', {
+      ...real,
+      Module: class {
+        constructor() {
+          throw new real.CompileError('Refused to compile or instantiate WebAssembly module');
+        }
+      },
+    });
+    expect(webAssemblyUsable()).toBe(false);
   });
 });

@@ -683,6 +683,22 @@ export function cameraStoppedInfo(times = 2): CameraErrorInfo {
   };
 }
 
+/**
+ * Whether this browser can compile WebAssembly, which the face model needs: false when it is turned
+ * off (no WebAssembly object), and also when it is there but blocked (a Content-Security-Policy
+ * without 'wasm-unsafe-eval', a managed-browser policy), where compiling throws.
+ */
+export function webAssemblyUsable(): boolean {
+  try {
+    const wasm = (globalThis as { WebAssembly?: typeof WebAssembly }).WebAssembly;
+    if (typeof wasm !== 'object' || wasm === null) return false;
+    // The smallest valid module (magic number and version): compiling it is what a policy refuses.
+    return new wasm.Module(new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])) instanceof wasm.Module;
+  } catch {
+    return false;
+  }
+}
+
 /** The face model can't run in this browser at all (WebAssembly is off or blocked): no retry helps. */
 export function faceTrackerUnsupportedInfo(): CameraErrorInfo {
   return {
