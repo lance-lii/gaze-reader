@@ -19,7 +19,8 @@ function sessions(schedule: Schedule, extra: Partial<SessionConfig> = {}, seeds:
 
 const badTurns = (s: SessionSummary): number => s.premature + s.unsafe;
 
-describe('reading layer under gaze offsets (fast guards; full scoreboard in bench/reading)', () => {
+// Each case simulates several sessions; on a CI runner the heaviest takes over vitest's 5 s default.
+describe('reading layer under gaze offsets (fast guards; full scoreboard in bench/reading)', { timeout: 20_000 }, () => {
   it('reads without an offset as before: ≥ 99 % on the true line, every turn on time', () => {
     const s = sessions(noOffset);
     expect(s.turns).toBe(7 * SEEDS.length);
@@ -105,7 +106,7 @@ describe('reading layer under gaze offsets (fast guards; full scoreboard in benc
   });
 });
 
-describe('single pages on the app layout (fast guards)', () => {
+describe('single pages on the app layout (fast guards)', { timeout: 20_000 }, () => {
   const PAGES = Array.from({ length: 24 }, (_, i) => i + 1);
 
   it('turns the first page after a calibration safely when re-reading long gapless paragraphs', () => {

@@ -11,7 +11,7 @@
 import { CSS_PREFIX } from '../core/constants';
 import { createEventBus } from '../core/events';
 import { createSettingsStore, type SettingsStore } from '../core/settings';
-import { readJSON, writeJSON } from '../core/storage';
+import { readJSON, removeKey, writeJSON } from '../core/storage';
 import { FULL_APP_URL, IS_ARTIFACT } from '../core/target';
 import type {
   AppEvents,
@@ -59,7 +59,7 @@ import { deleteBook, findLibraryBook, getBook, getProgress, listBooks, saveBook,
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
 import { LineTracker } from '../reading/lineTracker';
-import { PageEndDetector } from '../reading/pageEndDetector';
+import { MIN_TRACKING_HZ, PageEndDetector } from '../reading/pageEndDetector';
 import { SimulatedReaderSource } from '../reading/simulatedReader';
 import { FixationDetector } from '../signal/fixations';
 import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationMode } from '../ui/calibrationOverlay';
@@ -90,11 +90,13 @@ import {
   calibrationFitsViewport,
   calibrationOriginFits,
   cameraErrorInfo,
+  cameraStoppedInfo,
   coachFlag,
   computeWpm,
   correctedGazeBus,
   driftOwnerKey,
   errorMessage,
+  faceTrackerUnsupportedInfo,
   firstFullyVisibleIndex,
   formatLines,
   formatMinutes,
@@ -110,6 +112,8 @@ import {
   shouldIgnoreShortcut,
   textEndsOnScreen,
   trackerErrorCode,
+  webAssemblyUsable,
+  type CameraErrorInfo,
   type SourcePhase,
   type TrackingStatus,
 } from './logic';
@@ -141,6 +145,20 @@ interface ReadingSession {
 const HEARTBEAT_MS = 250;
 const PROGRESS_EVERY_MS = 5000;
 const HIDDEN_STOP_MS = 60_000;
+/** No camera frame for this long while it runs and the tab is visible: it froze (after the laptop slept, a muted track). */
+const CAMERA_STALL_MS = 5000;
+/** A camera that stops again this soon after being restarted on its own is reported, not restarted… */
+const CAMERA_RESTART_MIN_GAP_MS = 60_000;
+/** …and so is one that was already restarted this many times in this long (it keeps stopping). */
+const CAMERA_RESTARTS_PER_WINDOW = 2;
+const CAMERA_RESTART_WINDOW_MS = 10 * 60_000;
+/**
+ * After this long below MIN_TRACKING_HZ frames a second (the rate the page-end detector needs to
+ * follow the lines, and below which it holds every turn) the reader is told why pages don't turn…
+ */
+const SLOW_CAMERA_MS = 5000;
+/** …and told again when it happens again after the camera was fast enough, at most this often. */
+const SLOW_CAMERA_REPEAT_MS = 10 * 60_000;
 const SCROLL_SETTLE_MS = 120;
 const SAVE_POSITION_MS = 1000;
 const ESTIMATE_EMIT_MS = 100;
@@ -160,6 +178,10 @@ const LIGHTING_HOLD_MS = 5000;
 const APPEARANCE_DEBUG_MS = 250;
 /** Remembers that the "tracker upgraded, please recalibrate once" explanation was given. */
 const UPGRADE_EXPLAINED_KEY = 'calibrationUpgradeExplained.v1';
+/** The browser's id for the camera the saved calibration was made with, and others the reader chose to read with: `{ deviceId, accepted? }`. */
+const CALIBRATION_CAMERA_KEY = 'calibrationCamera.v1';
+/** What the status pill says while page turns wait for the reader's choice after a camera switch. */
+const CAMERA_HOLD_REASON = 'Page turns wait: this isn’t the camera you calibrated with. Press C to recalibrate, or P for the choices.';
 
 /** What a calibration run did to the model. */
 type CalibrationOutcome = 'standard' | 'refresh' | 'unchanged';
@@ -280,10 +302,27 @@ export class AppController {
   private sourceGen = 0;
   private camera: CameraFeatureSource | null = null;
   private offCameraError: Unsubscribe | null = null;
+  /** performance.now() of the last camera frame (with or without a face); the stall watch reads it. */
+  private lastCameraFrameAt = Number.NEGATIVE_INFINITY;
+  /** When the camera was restarted on its own, in the last CAMERA_RESTART_WINDOW_MS. */
+  private cameraRestarts: number[] = [];
+  private slowCameraSince: number | null = null;
+  private slowCameraShownAt = Number.NEGATIVE_INFINITY;
+  /** The camera has been fast enough since the slow-camera message was last shown (or it never was). */
+  private slowCameraRecovered = true;
   /** undefined = not loaded from storage yet. */
   private model: GazeModel | null | undefined = undefined;
   private savedCalibration = false;
   private calibration: CalibrationOverlay | null = null;
+  /** The mode of the calibration overlay that is open (see calibrate). */
+  private calibrationMode: CalibrationMode | null = null;
+  /** A calibration the camera stopped in the middle of: the restart opens it again (see recoverCamera). */
+  private resumeCalibration: CalibrationMode | null = null;
+  /**
+   * The webcam running isn't the one the calibration was made with (its id): automatic page turns
+   * wait until the reader recalibrates or chooses to keep reading on the old calibration.
+   */
+  private cameraHold: string | null = null;
   private forceCalibration = false;
   private webcamHold: WebcamHold | null = null;
   private hiddenLong = false;
@@ -894,6 +933,7 @@ export class AppController {
     const session = this.session;
     if (!session) return;
     if (!document.hidden) {
+      this.watchCamera(now);
       this.tickLighting(now);
       this.pollGuidance(now);
     }
@@ -1087,6 +1127,9 @@ export class AppController {
     this.recordInput({ k: 'pipeline-reset', t: performance.now(), full: tracker !== 'none', keepDrift, ...(calibrated ? { calibrated } : {}) });
     this.pipelineWasBlocked = false;
     this.lastEstimateEmitAt = Number.NEGATIVE_INFINITY;
+    // A book just opened, or a calibration just ended: the reading layer has nothing to go on yet,
+    // so whatever the reader looks at first (the phone, the keyboard) waits out a cooldown.
+    this.notifyScrolled();
   }
 
   /** Who the drift learned from here on belongs to: the source that is (or will be) running, and its calibration. */
@@ -1138,7 +1181,8 @@ export class AppController {
       this.notifyScrolled();
       return;
     }
-    if (!this.store.get().autoScroll) return;
+    // Paused, or held after a camera switch until the reader chooses (see checkCamera).
+    if (!this.store.get().autoScroll || this.cameraHeld()) return;
     void this.turnPage({ auto: true, reason: decision.reason, decision });
   }
 
@@ -1385,6 +1429,8 @@ export class AppController {
   /** Brings the running source in line with desiredSource(). Idempotent; safe to call at any time. */
   private syncSource(): void {
     const want = this.desiredSource();
+    // The reader chose another source: a calibration the camera interrupted isn't theirs to finish now.
+    if (this.store.get().gazeSource !== 'webcam') this.resumeCalibration = null;
     if (want !== null && want === this.sourceKind) return;
     const gen = ++this.sourceGen;
     this.teardownSource();
@@ -1530,10 +1576,17 @@ export class AppController {
     this.updateOverlays();
 
     const model = this.currentModel();
-    if (!model || this.forceCalibration) {
-      const outcome = await this.calibrate('standard', gen);
+    // The camera restarted in the middle of a calibration: open it again, and say why.
+    const resume = this.resumeCalibration;
+    this.resumeCalibration = null;
+    if (resume) {
+      this.toasts.show({ id: 'calibration-restart', message: 'The camera stopped and started again, so the calibration starts over.' });
+    }
+    if (!model || this.forceCalibration || resume) {
+      const outcome = await this.calibrate(model && resume ? resume : 'standard', gen);
       if (!outcome) return null;
       this.afterCalibration(outcome, 'bring-up');
+      this.checkCamera(camera);
       return camera;
     }
     const fit = this.calibrationFit(model);
@@ -1546,14 +1599,17 @@ export class AppController {
       const outcome = await this.calibrate('quick', gen);
       if (!outcome) return null;
       this.afterCalibration(outcome, 'bring-up');
+      this.checkCamera(camera); // a 5-dot touch-up doesn't make the calibration another camera's
       return camera;
     }
+    this.checkCamera(camera);
     return camera;
   }
 
-  private cameraFailed(err: unknown): void {
+  private cameraFailed(err: unknown, override?: CameraErrorInfo): void {
     const code = trackerErrorCode(err);
-    const info = cameraErrorInfo(code);
+    // A model that can't load because the browser can't run WebAssembly (off, or blocked) isn't a network problem.
+    const info = override ?? (code === 'model-load-failed' && !webAssemblyUsable() ? faceTrackerUnsupportedInfo() : cameraErrorInfo(code));
     console.warn(`[app] camera unavailable (${code})`, err);
     this.webcamHold = { reason: 'failed', detail: info.title };
     const actions: ToastAction[] = [];
@@ -1564,11 +1620,148 @@ export class AppController {
     this.bus.emit('buddy-say', { text: info.buddyLine, priority: 'high', mood: 'worried' });
   }
 
-  /** The camera stopped on its own after starting (unplugged, taken by another app). */
+  /** The camera stopped on its own after starting (unplugged, permission revoked, taken by another app, the laptop slept). */
   private onCameraRuntimeError(err: unknown): void {
     if (this.sourceKind !== 'webcam') return;
-    this.cameraFailed(err);
+    this.recoverCamera(err);
+  }
+
+  /** Frames stopped arriving while the camera runs and the tab is visible: it froze (often after the laptop slept). */
+  private watchCamera(now: number): void {
+    const camera = this.camera;
+    if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !camera?.running) {
+      this.slowCameraSince = null;
+      return;
+    }
+    if (now - this.lastCameraFrameAt >= CAMERA_STALL_MS) {
+      this.recoverCamera(new Error('The camera stopped sending pictures.'));
+      return;
+    }
+    // Frames still come, but too few to follow the lines (an overloaded or throttled machine).
+    const fps = camera.fps;
+    if (!(fps > 0 && fps < MIN_TRACKING_HZ)) {
+      this.slowCameraSince = null;
+      if (fps >= MIN_TRACKING_HZ) this.slowCameraRecovered = true;
+      return;
+    }
+    this.slowCameraSince ??= now;
+    if (now - this.slowCameraSince < SLOW_CAMERA_MS || !this.slowCameraRecovered || now - this.slowCameraShownAt < SLOW_CAMERA_REPEAT_MS) return;
+    this.slowCameraShownAt = now;
+    this.slowCameraRecovered = false;
+    this.toasts.show({
+      id: 'slow-camera',
+      tone: 'warn',
+      title: 'The camera is running slowly',
+      message: `About ${Math.max(1, Math.round(fps))} pictures a second is too few to follow your reading, so pages won’t turn on their own until it speeds up. Closing other apps or tabs, or plugging in a laptop, usually helps.`,
+      durationMs: 15_000,
+    });
+  }
+
+  /**
+   * The camera stopped mid-session. Restart it on our own, as "Try again" would: after the laptop
+   * wakes that is usually all it needs, and if it can't start the failure says why (no camera,
+   * access blocked, busy). Stopping again within a minute, or a third time in 10 minutes, is
+   * reported instead.
+   */
+  private recoverCamera(err: unknown): void {
+    const now = performance.now();
+    // A calibration the reader was in the middle of (or had asked for) is cancelled with the camera:
+    // the next start (on its own, or Try again) opens it again instead of reading on the old one.
+    if (this.calibration) this.resumeCalibration = this.calibrationMode ?? 'standard';
+    this.cameraRestarts = this.cameraRestarts.filter((at) => now - at < CAMERA_RESTART_WINDOW_MS);
+    const last = this.cameraRestarts[this.cameraRestarts.length - 1] ?? Number.NEGATIVE_INFINITY;
+    if (now - last < CAMERA_RESTART_MIN_GAP_MS || this.cameraRestarts.length >= CAMERA_RESTARTS_PER_WINDOW) {
+      // It keeps stopping: restarting it again and again would only flicker; say so instead.
+      this.cameraFailed(err, cameraStoppedInfo(this.cameraRestarts.length + 1));
+      this.syncSource();
+      return;
+    }
+    this.cameraRestarts.push(now);
+    console.warn('[app] the camera stopped; restarting it', err);
+    this.sourceKind = null; // syncSource() then brings the webcam up afresh
     this.syncSource();
+  }
+
+  /**
+   * A calibration only fits the camera it was made with: compares the one now running with the one
+   * stored with the calibration. Runs after every bring-up, whichever way it went, and offers the
+   * recalibration again each time until they match. Meanwhile the reading layer re-learns its offset,
+   * since the gaze from another camera sits somewhere else.
+   */
+  private checkCamera(camera: CameraFeatureSource): void {
+    const id = camera.deviceId;
+    if (!id || !this.model) return;
+    const saved = readJSON<{ deviceId?: unknown; accepted?: unknown } | null>(CALIBRATION_CAMERA_KEY, null);
+    const calibratedWith = saved && typeof saved.deviceId === 'string' ? saved.deviceId : null;
+    // Cameras the reader chose to keep reading with on this calibration (see keepReadingOnOldCalibration).
+    const accepted = saved && Array.isArray(saved.accepted) ? saved.accepted.filter((a): a is string => typeof a === 'string') : [];
+    if (calibratedWith === null) {
+      // A calibration from before cameras were recorded: take it to be this camera's.
+      writeJSON(CALIBRATION_CAMERA_KEY, { deviceId: id });
+      return;
+    }
+    if (calibratedWith === id || accepted.includes(id)) {
+      this.toasts.dismiss('camera-switch');
+      this.setCameraHold(null);
+      return;
+    }
+    const now = performance.now();
+    this.lineTracker.appearanceChangedAt(now);
+    this.recordInput({ k: 'appearance', t: now, at: now });
+    // Through another camera the calibration reads gaze in the wrong place: no automatic turns until
+    // the reader says what to do (a wrong turn loses their place; a held one only waits for a key).
+    this.setCameraHold(id);
+    this.showCameraChoice();
+  }
+
+  /** The choice a camera switch asks for; it stays up until made, and P brings it back. */
+  private showCameraChoice(): void {
+    this.toasts.show({
+      id: 'camera-switch',
+      tone: 'warn',
+      title: 'A different camera',
+      message:
+        'Gaze Reader is using another camera than the one you calibrated with, so it would read your gaze in the wrong place. Pages won’t turn on their own until you recalibrate, or choose to keep reading on the old calibration.',
+      actions: [
+        { label: 'Recalibrate', primary: true, run: () => this.recalibrate() },
+        { label: 'Keep reading', run: () => this.keepReadingOnOldCalibration() },
+      ],
+      durationMs: 0,
+    });
+  }
+
+  /** The reader chose to read on through this camera with the calibration made with another one. */
+  private keepReadingOnOldCalibration(): void {
+    const id = this.cameraHold;
+    if (id === null) return;
+    const saved = readJSON<{ deviceId?: unknown; accepted?: unknown } | null>(CALIBRATION_CAMERA_KEY, null);
+    if (saved && typeof saved.deviceId === 'string') {
+      const accepted = Array.isArray(saved.accepted) ? saved.accepted.filter((a): a is string => typeof a === 'string') : [];
+      writeJSON(CALIBRATION_CAMERA_KEY, { deviceId: saved.deviceId, accepted: [...new Set([...accepted, id])] });
+    }
+    this.toasts.dismiss('camera-switch');
+    this.setCameraHold(null);
+    this.toasts.show({ id: 'camera-switch-kept', message: 'Pages turn on their own again, with the old calibration. Recalibrate (C) whenever you like.' });
+  }
+
+  private setCameraHold(id: string | null): void {
+    if (this.cameraHold === id) return;
+    this.cameraHold = id;
+    this.refreshTracking(performance.now());
+  }
+
+  /** Automatic page turns wait for the reader's choice after a camera switch (the webcam only). */
+  private cameraHeld(): boolean {
+    return this.cameraHold !== null && this.sourceKind === 'webcam';
+  }
+
+  /** A new calibration (not a refresh of one) was just made with the running camera: it is now the reference. */
+  private rememberCalibrationCamera(): void {
+    const id = this.camera?.deviceId ?? null;
+    if (id) writeJSON(CALIBRATION_CAMERA_KEY, { deviceId: id });
+    else removeKey(CALIBRATION_CAMERA_KEY);
+    this.toasts.dismiss('camera-switch');
+    this.setCameraHold(null);
   }
 
   private introduceSource(kind: GazeSourceKind): void {
@@ -1685,6 +1878,7 @@ export class AppController {
       featureNames: FEATURE_NAMES,
     });
     this.calibration = overlay;
+    this.calibrationMode = mode;
     this.lastCalibrationPhase = null;
     this.syncModalState();
     overlay.mount(this.root);
@@ -1694,7 +1888,10 @@ export class AppController {
       result = await overlay.run();
       check = overlay.lastAccuracyCheck;
     } finally {
-      if (this.calibration === overlay) this.calibration = null;
+      if (this.calibration === overlay) {
+        this.calibration = null;
+        this.calibrationMode = null;
+      }
       this.forceCalibration = false;
       // Un-inert the page before the overlay goes, so focus can return to the reader.
       this.syncModalState();
@@ -1706,6 +1903,8 @@ export class AppController {
     if (result) {
       const outcome: CalibrationOutcome = base && sameRidgeCore(result.model.toJSON(), base.toJSON()) ? 'refresh' : 'standard';
       this.adoptModel(result.model, result.report);
+      // A refresh touches up the same calibration: its camera stays the reference.
+      if (outcome === 'standard') this.rememberCalibrationCamera();
       if (mode === 'check' && outcome === 'refresh') this.reportAccuracyCheck(check);
       return outcome;
     }
@@ -1914,6 +2113,9 @@ export class AppController {
 
   private forgetCalibration(): void {
     clearCalibration();
+    removeKey(CALIBRATION_CAMERA_KEY);
+    this.toasts.dismiss('camera-switch');
+    this.setCameraHold(null);
     this.model = null;
     this.savedCalibration = false;
     this.applyEnvironment(null);
@@ -1981,6 +2183,7 @@ export class AppController {
   // rate-limited offer of the 5-dot touch-up, shown only when the reader pauses.
 
   private readonly onCameraFrame = (frame: FeatureFrame): void => {
+    this.lastCameraFrameAt = performance.now();
     this.recorder.frame(frame);
     if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !this.session || document.hidden) return;
     this.lightingWatch.onFrame(frame);
@@ -2194,7 +2397,10 @@ export class AppController {
     this.phase = phase;
     this.phaseDetail = detail;
     const now = performance.now();
-    if (phase === 'running') this.tracking.reset(now);
+    if (phase === 'running') {
+      this.tracking.reset(now);
+      this.lastCameraFrameAt = now;
+    }
     this.refreshTracking(now);
     this.updateOverlays();
   }
@@ -2212,6 +2418,7 @@ export class AppController {
       kind: this.sourceKind,
       autoScroll: this.store.get().autoScroll,
       detail: this.phaseDetail,
+      ...(this.cameraHeld() ? { holdReason: CAMERA_HOLD_REASON } : {}),
     });
     const cameraOn = this.camera?.running ?? false;
     const kind = this.sourceKind;
@@ -2277,7 +2484,10 @@ export class AppController {
     const s = this.store.get();
     switch (name) {
       case 'toggle-autoscroll':
-        this.setAutoScroll(!s.autoScroll);
+        // Held after a camera switch: P brings the choice back rather than flipping a setting that
+        // wouldn't turn pages anyway.
+        if (this.cameraHeld()) this.showCameraChoice();
+        else this.setAutoScroll(!s.autoScroll);
         break;
       case 'pause':
         this.setAutoScroll(false);
@@ -2470,6 +2680,8 @@ export class AppController {
     }
     this.timers.clear('hidden-stop');
     this.dragDepth = 0;
+    // Frames were throttled while hidden: the stall watch starts afresh.
+    this.lastCameraFrameAt = performance.now();
     if (this.hiddenLong) {
       this.hiddenLong = false;
       this.syncSource();

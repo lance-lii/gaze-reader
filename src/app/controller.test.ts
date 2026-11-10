@@ -5,9 +5,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppEvents, AppSettings, Book, EventBus, FeatureFrame, GazeModel, LightingSignature, LineLayout, PageEndDecision, TextLine } from '../types';
-import type { AccuracyCheckResult, CalibrationResult } from '../ui/calibrationOverlay';
+import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationResult } from '../ui/calibrationOverlay';
 import { AppearanceMonitor } from '../gaze/appearance';
 import { GAZE_MODEL_KIND, GAZE_MODEL_VERSION, deserializeGazeModel } from '../gaze/calibrationModel';
+import { TrackerError } from '../gaze/camera';
 import { CameraFeatureSource } from '../gaze/faceTracker';
 import { LightingWatch, type LightingWatchUpdate } from '../gaze/lighting';
 import { LineTracker } from '../reading/lineTracker';
@@ -19,6 +20,7 @@ import { loadBookFromText } from '../reader/bookLoader';
 import { getBook, listBooks, saveBook, saveProgress } from '../reader/library';
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
+import { Toaster } from '../ui/toast';
 import { PageEndDetector } from '../reading/pageEndDetector';
 import { AppController } from './controller';
 
@@ -124,7 +126,12 @@ async function openPastedText(text = 'The eyes jump along the line. '.repeat(120
 function stubCamera() {
   let running = false;
   const listeners = new Set<(f: FeatureFrame) => void>();
-  vi.spyOn(CameraFeatureSource.prototype, 'start').mockImplementation(async () => {
+  const errorListeners = new Set<(err: TrackerError) => void>();
+  const startErrors: unknown[] = [];
+  const state = { deviceId: null as string | null, fps: 0 };
+  const start = vi.spyOn(CameraFeatureSource.prototype, 'start').mockImplementation(async () => {
+    const err = startErrors.shift();
+    if (err) throw err;
     running = true;
   });
   vi.spyOn(CameraFeatureSource.prototype, 'stop').mockImplementation(() => {
@@ -133,7 +140,14 @@ function stubCamera() {
   vi.spyOn(CameraFeatureSource.prototype, 'running', 'get').mockImplementation(() => running);
   vi.spyOn(CameraFeatureSource.prototype, 'video', 'get').mockReturnValue(null);
   vi.spyOn(CameraFeatureSource.prototype, 'lastLandmarks', 'get').mockReturnValue(null);
-  vi.spyOn(CameraFeatureSource.prototype, 'onError').mockImplementation(() => () => undefined);
+  vi.spyOn(CameraFeatureSource.prototype, 'onError').mockImplementation((cb) => {
+    errorListeners.add(cb);
+    return () => {
+      errorListeners.delete(cb);
+    };
+  });
+  vi.spyOn(CameraFeatureSource.prototype, 'deviceId', 'get').mockImplementation(() => state.deviceId);
+  vi.spyOn(CameraFeatureSource.prototype, 'fps', 'get').mockImplementation(() => state.fps);
   vi.spyOn(CameraFeatureSource.prototype, 'onFrame').mockImplementation((cb) => {
     listeners.add(cb);
     return () => {
@@ -147,6 +161,19 @@ function stubCamera() {
     subscribers: () => listeners.size,
     /** Whether the camera (light) is on. */
     running: () => running,
+    /** How many times the camera was started. */
+    starts: () => start.mock.calls.length,
+    /** The next start() calls reject with these, in order. */
+    failStarts: (...errs: unknown[]) => {
+      startErrors.push(...errs);
+    },
+    /** The camera stops on its own (its track ended: unplugged, permission revoked, the laptop slept). */
+    end: (err: TrackerError) => {
+      running = false;
+      for (const cb of [...errorListeners]) cb(err);
+    },
+    /** What the camera reports: its device id, and frames a second. */
+    state,
   };
 }
 
@@ -657,10 +684,11 @@ describe('AppController', () => {
   });
 
   /** Rebuilds the app on the webcam with `model` saved, opens a book and waits for tracking to run. */
-  async function readWithWebcam(model: GazeModel | null, opts: { open?: boolean; settings?: Partial<AppSettings> } = {}) {
+  async function readWithWebcam(model: GazeModel | null, opts: { open?: boolean; settings?: Partial<AppSettings>; deviceId?: string } = {}) {
     app.destroy();
     saved.model = model;
     const camera = stubCamera();
+    if (opts.deviceId) camera.state.deviceId = opts.deviceId;
     localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false, ...opts.settings }));
     root = document.createElement('div');
     document.body.appendChild(root);
@@ -684,6 +712,9 @@ describe('AppController', () => {
   };
 
   const toastButton = (label: string) => [...document.querySelectorAll<HTMLButtonElement>('.gr-toast__actions button')].find((b) => b.textContent === label);
+  /** A button on a toast that is showing (not on one leaving after being replaced). */
+  const liveToastButton = (label: string) =>
+    [...document.querySelectorAll<HTMLButtonElement>('.gr-toast:not([data-leaving]) .gr-toast__actions button')].find((b) => b.textContent === label);
 
   it('webcam: the camera runs only while a book is open, never in the library (privacy)', async () => {
     const { camera } = await readWithWebcam(calibratedModel(), { open: false });
@@ -712,6 +743,364 @@ describe('AppController', () => {
     hidden = false;
     document.dispatchEvent(new Event('visibilitychange'));
     await until(() => camera.running() && camera.subscribers() >= 2, 'the camera to come back');
+  });
+
+  it('webcam: a camera that freezes (the laptop slept) is restarted once on its own; freezing again within a minute is reported', async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    const { camera, states } = await readWithWebcam(calibratedModel());
+    camera.emit(webcamFrame());
+    const before = camera.starts();
+    skew += 6000; // six seconds without a frame, the tab in view
+    await until(() => camera.starts() === before + 1 && camera.running(), 'the camera to be restarted');
+    expect(toastText()).not.toMatch(/camera stopped/i);
+    camera.emit(webcamFrame());
+    skew += 6000; // frozen again
+    await until(() => /The camera stopped/.test(toastText()), 'the camera-stopped toast');
+    expect(camera.running()).toBe(false);
+    expect(camera.starts()).toBe(before + 1);
+    expect(states.at(-1)?.state).toBe('error');
+    toastButton('Try again')!.click();
+    await until(() => camera.running() && camera.starts() === before + 2, 'Try again to start the camera');
+  });
+
+  it('webcam: a camera that ends (unplugged, access revoked) is restarted once, and a failed restart says why', async () => {
+    const { camera } = await readWithWebcam(calibratedModel());
+    const before = camera.starts();
+    // Woken from sleep: the track ended, and starting again just works.
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => camera.running() && camera.starts() === before + 1, 'the camera to be restarted');
+    expect(toastText()).toBe('');
+    // Access revoked within the minute: no second restart, and the toast says the camera stopped.
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => /The camera stopped/.test(toastText()), 'the camera-stopped toast');
+    expect(camera.starts()).toBe(before + 1);
+    // Try again with access blocked: the toast says so, and offers the mouse instead of a retry.
+    camera.failStarts(new TrackerError('camera-denied'));
+    toastButton('Try again')!.click();
+    await until(() => /Camera access is blocked/.test(toastText()), 'the blocked-camera toast');
+    expect(camera.running()).toBe(false);
+    expect(liveToastButton('Try again')).toBeUndefined();
+    expect(liveToastButton('Use my mouse')).toBeTruthy();
+  });
+
+  it('webcam: the camera unplugged for good: the automatic restart reports no camera, with nothing left running', async () => {
+    const { camera, states } = await readWithWebcam(calibratedModel());
+    camera.failStarts(new TrackerError('no-camera'));
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => /No camera found/.test(toastText()), 'the no-camera toast');
+    expect(camera.running()).toBe(false);
+    expect(states.at(-1)?.state).toBe('error');
+    expect(toastButton('Try again')).toBeTruthy();
+    expect(toastButton('Use my mouse')).toBeTruthy();
+  });
+
+  it('webcam: switching to another camera asks for a recalibration', async () => {
+    const { camera } = await readWithWebcam(calibratedModel());
+    camera.state.deviceId = 'built-in';
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => camera.running(), 'the camera to be restarted');
+    expect(toastText()).toBe(''); // the first camera seen this session
+    // The external camera is unplugged an hour later; the restart picks the built-in one.
+    const realNow = performance.now.bind(performance);
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+    camera.state.deviceId = 'external';
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => /A different camera/.test(toastText()), 'the different-camera toast');
+    expect(toastButton('Recalibrate')).toBeTruthy();
+  });
+
+  const unplug = (camera: ReturnType<typeof stubCamera>, to: string) => {
+    camera.state.deviceId = to;
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+  };
+
+  it('webcam: notices a camera switch after a reading that began with a calibration (regression: only when the saved one fitted)', async () => {
+    overlays.run = async (bus) => {
+      bus.emit('calibration', { phase: 'start' });
+      bus.emit('calibration', { phase: 'done', report: REPORT });
+      return { model: calibratedModel({ trainedAt: 5000 }), report: REPORT };
+    };
+    // First use: no saved calibration, so the dots come first, with the external webcam.
+    const { camera } = await readWithWebcam(null, { deviceId: 'external-usb' });
+    await until(() => camera.subscribers() >= 2 && camera.running(), 'tracking after the calibration');
+    expect(overlays.modes).toEqual(['standard']);
+    const relearn = vi.spyOn(LineTracker.prototype, 'appearanceChangedAt');
+    // An hour on, the external webcam is unplugged and the restart picks the built-in one.
+    const realNow = performance.now.bind(performance);
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+    unplug(camera, 'built-in');
+    await until(() => /A different camera/.test(toastText()), 'the different-camera offer');
+    expect(liveToastButton('Recalibrate')).toBeTruthy();
+    expect(relearn).toHaveBeenCalled(); // the reading layer re-learns its offset meanwhile
+  });
+
+  it('webcam: notices a camera switch hidden behind the 5-dot refresh a smaller window asks for (undocking)', async () => {
+    const { camera } = await readWithWebcam(calibratedModel(), { deviceId: 'external-usb' });
+    const w0 = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+    const h0 = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    try {
+      // The lid closes and the laptop leaves its dock: on wake the window is on the smaller screen.
+      Object.defineProperty(window, 'innerWidth', { value: Math.round(window.innerWidth * 0.7), configurable: true });
+      Object.defineProperty(window, 'innerHeight', { value: Math.round(window.innerHeight * 0.75), configurable: true });
+      overlays.run = async (bus) => {
+        bus.emit('calibration', { phase: 'start' });
+        bus.emit('calibration', { phase: 'done', report: REPORT });
+        return { model: calibratedModel({ adjustOy: 12 }), report: REPORT }; // the same calibration, touched up
+      };
+      const realNow = performance.now.bind(performance);
+      vi.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+      unplug(camera, 'built-in');
+      await until(() => overlays.modes.length === 1, 'the 5-dot refresh');
+      expect(overlays.modes).toEqual(['quick']);
+      await until(() => /A different camera/.test(toastText()), 'the different-camera offer');
+    } finally {
+      if (w0) Object.defineProperty(window, 'innerWidth', w0);
+      if (h0) Object.defineProperty(window, 'innerHeight', h0);
+    }
+  });
+
+  it('webcam: keeps offering the recalibration until the camera matches the calibration again, and only then', async () => {
+    const { camera } = await readWithWebcam(calibratedModel(), { deviceId: 'external-usb' }); // made with this one
+    unplug(camera, 'built-in');
+    await until(() => /A different camera/.test(toastText()), 'the different-camera offer');
+    // The reader reads on; switching to the mouse and back (any restart) brings the offer back.
+    app.bus.emit('settings-patch', { gazeSource: 'mouse' });
+    await until(() => !camera.running(), 'the camera to stop');
+    document.querySelectorAll('.gr-toast').forEach((t) => t.remove());
+    app.bus.emit('settings-patch', { gazeSource: 'webcam' });
+    await until(() => /A different camera/.test(toastText()), 'the offer again');
+    // The external webcam is plugged back in: the calibration's own camera, nothing to offer.
+    const realNow = performance.now.bind(performance);
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+    unplug(camera, 'external-usb');
+    await until(() => camera.running() && !/A different camera/.test(toastText()), 'the offer to go');
+    await sleep(100);
+    expect(toastText()).not.toMatch(/A different camera/);
+  });
+
+  it('webcam: a camera that stops during a recalibration the reader asked for opens it again after the restart (regression: dropped, reading went on with the old one)', async () => {
+    const { camera } = await readWithWebcam(calibratedModel());
+    // The dots stay up until the overlay is cancelled (the reader is on them).
+    let cancelled: (() => void) | null = null;
+    overlays.run = () =>
+      new Promise((resolve) => {
+        cancelled = () => resolve(null);
+      });
+    vi.spyOn(CalibrationOverlay.prototype, 'cancel').mockImplementation(() => cancelled?.());
+    app.bus.emit('command', { name: 'recalibrate' });
+    await until(() => overlays.modes.length === 1, 'the recalibration');
+    expect(overlays.modes).toEqual(['standard']);
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => overlays.modes.length === 2, 'the calibration to open again after the restart');
+    expect(overlays.modes).toEqual(['standard', 'standard']);
+    expect(toastText()).toMatch(/calibration starts over/);
+  });
+
+  it('webcam: a camera that keeps stopping a little over a minute apart is reported on the third stop (regression: restarted silently forever)', async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    const { camera } = await readWithWebcam(calibratedModel());
+    const before = camera.starts();
+    for (let i = 1; i <= 2; i++) {
+      skew += 61_000;
+      camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+      await until(() => camera.running() && camera.starts() === before + i, `restart ${i}`);
+      expect(toastText()).not.toMatch(/camera stopped/i);
+    }
+    skew += 61_000;
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => /It has stopped 3 times in 10 minutes/.test(toastText()), 'the camera-stopped toast');
+    expect(camera.starts()).toBe(before + 2);
+    expect(toastButton('Try again')).toBeTruthy();
+    // Ten quiet minutes later a stop is restarted on its own again.
+    toastButton('Try again')!.click();
+    await until(() => camera.running() && camera.starts() === before + 3, 'Try again');
+    skew += 11 * 60_000;
+    camera.end(new TrackerError('camera-in-use', 'The camera stopped sending video.'));
+    await until(() => camera.running() && camera.starts() === before + 4, 'the restart after a quiet spell');
+  });
+
+  it('webcam: after a camera switch, pages don\'t turn on their own until the reader recalibrates or keeps reading, and the pill says why', async () => {
+    vi.spyOn(ReaderView.prototype, 'measureLayout').mockImplementation(() => layout(false));
+    const turn = vi.spyOn(ScrollController.prototype, 'turnPage').mockResolvedValue(undefined);
+    vi.spyOn(ScrollController.prototype, 'atEnd').mockReturnValue(false);
+    let fire = false;
+    vi.spyOn(PageEndDetector.prototype, 'update').mockImplementation(() => (fire ? PAGE_END : IDLE));
+    const { camera, states } = await readWithWebcam(calibratedModel(), { deviceId: 'external-usb' });
+    unplug(camera, 'built-in');
+    await until(() => /A different camera/.test(toastText()), 'the choice');
+    await until(() => states.at(-1)?.state === 'paused' && /isn’t the camera you calibrated with/.test(states.at(-1)?.detail ?? ''), 'the pill to say why');
+    // The reader finishes a page: it waits.
+    fire = true;
+    camera.emit(webcamFrame());
+    await sleep(50);
+    expect(turn).not.toHaveBeenCalled();
+    // The message was closed; P brings the choice back (and doesn't flip auto-scroll).
+    document.querySelectorAll('.gr-toast').forEach((t) => t.remove());
+    pressKey('p');
+    await until(() => /A different camera/.test(toastText()), 'the choice again');
+    expect(JSON.parse(localStorage.getItem('gazeReader.settings.v1')!).autoScroll).not.toBe(false);
+    // Keep reading on the old calibration: pages turn again…
+    liveToastButton('Keep reading')!.click();
+    camera.emit(webcamFrame());
+    await until(() => turn.mock.calls.length > 0, 'a page turn');
+    await until(() => states.at(-1)?.state !== 'paused', 'the pill to stop saying paused');
+    // …and the same camera after a later restart doesn't ask again.
+    fire = false;
+    const realNow = performance.now.bind(performance);
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+    unplug(camera, 'built-in');
+    await until(() => camera.running() && camera.subscribers() >= 2, 'the restart');
+    await sleep(100);
+    expect(toastText()).not.toMatch(/A different camera/);
+  });
+
+  it('webcam: a denied camera explains how to allow it and offers the mouse and the demo, without retrying', async () => {
+    saved.model = calibratedModel();
+    const camera = stubCamera();
+    camera.failStarts(new TrackerError('camera-denied'));
+    app.destroy();
+    localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false }));
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    await app.start();
+    const seen = record(app, 'tracking-state');
+    await openPastedText();
+    await until(() => /Camera access is blocked/.test(toastText()), 'the blocked-camera toast');
+    expect(toastText()).toMatch(/Allow the camera for this site/);
+    expect(liveToastButton('Try again')).toBeUndefined();
+    expect(toastButton('Use my mouse')).toBeTruthy();
+    expect(toastButton('Watch a demo')).toBeTruthy();
+    await sleep(300);
+    expect(camera.starts()).toBe(1);
+    expect(camera.running()).toBe(false);
+    expect(seen.at(-1)?.state).toBe('error');
+  });
+
+  it('webcam: offline (the face model fails to load): says so, leaves the camera off, and Try again recovers', async () => {
+    saved.model = calibratedModel();
+    const camera = stubCamera();
+    camera.failStarts(new TrackerError('model-load-failed'));
+    app.destroy();
+    localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false }));
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    await app.start();
+    await openPastedText();
+    await until(() => /Couldn.t load the face model/.test(toastText()), 'the model toast');
+    expect(toastText()).toMatch(/Check your connection/);
+    expect(camera.running()).toBe(false);
+    toastButton('Try again')!.click();
+    await until(() => camera.running() && camera.subscribers() >= 2, 'the webcam to run after Try again');
+  });
+
+  it('webcam: without WebAssembly the face model can\'t run: says so, with no pointless retry', async () => {
+    vi.stubGlobal('WebAssembly', undefined);
+    saved.model = calibratedModel();
+    const camera = stubCamera();
+    camera.failStarts(new TrackerError('model-load-failed', "Couldn't load the face-tracking runtime."));
+    app.destroy();
+    localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false }));
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    await app.start();
+    await openPastedText();
+    await until(() => /can.t run the face tracker/.test(toastText()), 'the unsupported-browser toast');
+    expect(toastText()).not.toMatch(/connection/);
+    expect(liveToastButton('Try again')).toBeUndefined();
+    expect(toastButton('Use my mouse')).toBeTruthy();
+  });
+
+  it('webcam: WebAssembly there but blocked (a CSP without wasm-unsafe-eval, a policy): says the browser can\'t run it, not the network (regression)', async () => {
+    const real = WebAssembly;
+    vi.stubGlobal('WebAssembly', {
+      ...real,
+      Module: class {
+        constructor() {
+          throw new real.CompileError('Refused to compile or instantiate WebAssembly module');
+        }
+      },
+    });
+    saved.model = calibratedModel();
+    const camera = stubCamera();
+    camera.failStarts(new TrackerError('model-load-failed', "Couldn't load the face-tracking runtime."));
+    app.destroy();
+    localStorage.setItem('gazeReader.settings.v1', JSON.stringify({ gazeSource: 'webcam', buddyEnabled: false }));
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    app = new AppController(root);
+    await app.start();
+    await openPastedText();
+    await until(() => /can.t run the face tracker/.test(toastText()), 'the unsupported-browser toast');
+    expect(toastText()).not.toMatch(/connection/);
+    expect(liveToastButton('Try again')).toBeUndefined();
+  });
+
+  it('webcam: a camera too slow to follow the lines says why pages don\'t turn, once', async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    const { camera } = await readWithWebcam(calibratedModel());
+    camera.state.fps = 3;
+    for (let i = 0; i < 4; i++) {
+      skew += 2000;
+      camera.emit(webcamFrame()); // frames still come, a few a second
+      await sleep(300);
+    }
+    await until(() => /The camera is running slowly/.test(toastText()), 'the slow-camera toast');
+    expect(toastText()).toMatch(/About 3 pictures a second/);
+    expect(camera.running()).toBe(true);
+  });
+
+  it('webcam: the slow-camera message covers every rate too slow to follow the lines, and comes back after the camera recovered (regression: silent at 5–7 a second, then shown once a visit)', { timeout: 20_000 }, async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    const show = vi.spyOn(Toaster.prototype, 'show');
+    const shown = (): number => show.mock.calls.filter(([o]) => o.id === 'slow-camera').length;
+    const { camera } = await readWithWebcam(calibratedModel());
+    const run = async (fps: number, ms: number): Promise<void> => {
+      camera.state.fps = fps;
+      for (let left = ms; left > 0; left -= 2000) {
+        skew += 2000;
+        camera.emit(webcamFrame()); // frames keep coming, only slowly
+        await sleep(300);
+      }
+    };
+    // 6 a second: fixations can't form (the page-end detector holds every turn), so the reader is told.
+    await run(6, 8000);
+    await until(() => shown() === 1, 'the slow-camera message at 6 fps');
+    expect(toastText()).toMatch(/About 6 pictures a second/);
+    // Still slow, or slow again soon: not repeated.
+    await run(6, 8000);
+    await run(30, 4000);
+    await run(6, 8000);
+    expect(shown()).toBe(1);
+    // Fast for a while, then slow again 10 minutes on: said again.
+    await run(30, 4000);
+    skew += 10 * 60_000;
+    await run(4, 8000);
+    await until(() => shown() === 2, 'the slow-camera message again');
+  });
+
+  it('starts the page-end cooldown when a book opens and after a calibration (regression: a first look at the phone turned page 1)', async () => {
+    const cooldown = vi.spyOn(PageEndDetector.prototype, 'notifyScrolled');
+    await readWithWebcam(calibratedModel());
+    expect(cooldown).toHaveBeenCalled(); // the book opened: the reading layer started over
+    const n = cooldown.mock.calls.length;
+    overlays.run = async (bus) => {
+      bus.emit('calibration', { phase: 'start' });
+      bus.emit('calibration', { phase: 'done', report: REPORT });
+      return { model: { ...calibratedModel({ trainedAt: 3000 }), toJSON: () => ({ version: 1, kind: 'gr-ridge-poly2-iris5', wx: [2], wy: [3] }) }, report: REPORT };
+    };
+    app.bus.emit('command', { name: 'recalibrate' });
+    await until(() => cooldown.mock.calls.length > n, 'the cooldown after the calibration');
   });
 
   it('webcam: reports the light every second; a changed light re-learns the reading offset and offers a touch-up at a pause', async () => {
@@ -938,11 +1327,13 @@ describe('AppController', () => {
       };
     });
     const mayOffer = vi.spyOn(GuidanceGate.prototype, 'mayOffer'); // the real gate, watched
-    await readWithWebcam(calibratedModel());
+    const { camera } = await readWithWebcam(calibratedModel());
     const offers = (): number => (/The light changed/.test(toastText()) ? 1 : 0);
 
     // +10 s after opening the book the light is judged changed: too early (the book settles for 20 s).
+    // (The camera sends a frame whenever the clock jumps, as a running camera would: else it froze.)
     offset += 10_000;
+    camera.emit(webcamFrame());
     changed = true;
     transition = 'changed';
     await until(() => mayOffer.mock.results.some((r) => r.value === false), 'the gate to hold the offer back');
@@ -951,6 +1342,7 @@ describe('AppController', () => {
 
     // +21 s: the first pause (there's no reading at all here) brings the offer.
     offset += 11_000;
+    camera.emit(webcamFrame());
     await until(() => offers() === 1, 'the offer');
     expect(toastText()).toMatch(/A quick 5-dot refresh keeps page turns accurate/);
     toastButton('Not now')!.click();
@@ -958,6 +1350,7 @@ describe('AppController', () => {
 
     // Snooze and interval over, same light: that change has had its offer.
     offset += 31 * 60_000;
+    camera.emit(webcamFrame());
     const asked = mayOffer.mock.calls.length;
     await sleep(800);
     expect(offers()).toBe(0);

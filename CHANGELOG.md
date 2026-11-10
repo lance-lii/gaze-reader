@@ -29,6 +29,55 @@ position sat a line or two off after shifting in the chair, and page turns came 
   or missed turn; single-paragraph pages 83 % instead of 69 %; and on web articles (the extension)
   a 15 % stretch costs no turn and keeps 94–98 % on the line. Not yet fixed: if gaze reads 2–3 lines low from the start, the first page of a
   long paragraph still often turns early. The debug overlay shows the learned stretch ("gain").
+- **Two lines of context after a page turn.** The line you were reading and the one above it now
+  stay at the top of the next page, instead of only the last one. A page that turns while you're
+  still on its second-to-last line no longer takes that line away: in the end-to-end simulation,
+  turns that cost you your place fell from 12.3 to 7.1 an hour on Balanced, with no more missed
+  turns. This is only the default. Settings are saved as a whole, so if you have changed any
+  setting before, yours keep one line until you set "Lines kept for context" to 2.
+- **The reading position holds your line when you shift in your seat.** Leaning in or settling back
+  moves where the webcam thinks you look by a line or more within seconds, and the reading layer
+  put that down to you having moved up or down a line: its most common mistake. While tracking is
+  steady it now trusts the direction of your eye movements (a step to the right stays on the
+  line), lets the offset follow faster, tells lines apart by where they end (a return sweep starts
+  at the end of the line it leaves, so a paragraph's short last line sets lines apart), and
+  re-learns the offset on each page from the line you resume on. In the end-to-end simulation, on
+  seeds it wasn't tuned on (27 hours), fixations on the right line went from 71 % to 75 % and
+  those on a wrong line with the tracker sure of itself from 5.1 % to 3.9 %; unintended page turns
+  fell from 7.0 to 6.1 an hour and missed ones from 20 % to 15 % of pages.
+- **A glance at your phone no longer turns the page.** Looking below the page turns it
+  (glance-down), but whenever the reading layer wasn't sure which line you were on, any look down
+  counted: a glance at your phone or the keyboard mid-page, or the gaze dipping below the page
+  while you read the last lines. A look down now counts only when it starts at the end of the last
+  line, where you finish the page: its right half, held for a moment, and not a glance at Dewey
+  in the corner beside it, the edge of the screen, or one frame on the way to your phone. When the
+  gaze reads a little low at the bottom of the page (dim light, after shifting in your seat), the
+  end of the last line can sit just below the page edge; it still counts as where you finished.
+  The extension's page mode, which has no lines to follow, still turns on any look down.
+
+  With this and the other page-turn changes below, in the end-to-end simulation (`npm run eval`,
+  33 simulated hours per preset) unintended page turns fell from 17.0 to 6.9 an hour on Balanced and
+  from 13.2 to 4.2 on Relaxed. Missed turns rose from 17.5 to 20.4 % of pages on Balanced and from
+  24.6 to 27.2 % on Relaxed: about one more missed page for every three or four unintended turns
+  prevented, mostly in dim light, with glasses and with noisy webcams. Both rises are within the
+  simulation's 95 % intervals (± 9 to 13 points over all scenarios). A missed turn waits for you to
+  look down again or press a key; an unintended one loses your place.
+- **No page turns before you have read anything.** When a book opened or a calibration ended, the
+  reading layer had nothing to go on until your first look at the text, and until then any look
+  below the page counted as the turn gesture: glancing at your phone or the keyboard as the camera
+  came up turned page 1, unread. A look down now counts only once the reading layer has placed you
+  on the page, and opening a book or finishing a calibration starts the usual short wait after a
+  turn. The extension's page mode, which has no lines to follow, still turns on any look down.
+- **No page turns on tracking too slow to follow you.** Below about 7 frames a second (an
+  overloaded or throttled machine, or face tracking on the CPU) no fixation can form, so there are
+  no lines to follow, and in the end-to-end simulation a glance at a phone then turned the page
+  about 5 times an hour. Page turns now wait until tracking is fast enough again. After 5 seconds the
+  web app says why, and says it again if the camera slows down again later (at most every 10
+  minutes). At 10 frames a second and above nothing changes.
+- **A page no longer turns the moment you come back.** Gaze resting at the end of the page counts up
+  towards a turn. If tracking stopped meanwhile (you opened Settings, switched tabs, or the camera
+  froze and restarted), the count carried on from where it was, so a page could turn a frame or two
+  after you came back. A gap of more than 0.4 s now starts the count over, as a long blink already did.
 - **Calibration starts over when the window changes.** Resizing or zooming the window, or moving it
   to another screen, in the middle of the dots mixed dots from before and after the change into one
   calibration, which then read your gaze in the wrong place. The dots now start over from the first
@@ -36,6 +85,31 @@ position sat a line or two off after shifting in the chair, and page turns came 
 
 ### Web app
 
+- **A camera that stops comes back on its own.** After a laptop wakes from sleep the camera often
+  freezes or stops: a frozen camera left the reader at "looking for you" for good, and a stopped
+  one got a toast blaming another app, even when the camera had been unplugged. Gaze Reader now
+  restarts the camera by itself when it sends no picture for 5 seconds or its video ends. If it
+  can't start, the message says why (no camera found, access blocked, busy). A camera that stops
+  again within a minute, or for the third time in 10 minutes, is reported with Try again instead of
+  being restarted over and over.
+- **After a camera switch, pages wait for you.** Read through another camera than the one you
+  calibrated with, the calibration puts your gaze in the wrong place, and a wrong page turn loses
+  your place. So after a switch, pages don't turn on their own until you recalibrate or choose
+  Keep reading on the old calibration (remembered for that camera). The status pill says why, and
+  P brings the choice back if you closed it.
+- **A calibration survives the camera restarting.** If the camera stopped while you were on the
+  calibration dots, it restarted by itself but went back to reading on the old calibration without
+  a word. The dots now start over once the camera is back, with a note saying why.
+- **Switching cameras asks for a recalibration.** A calibration only fits the camera it was made
+  with. Gaze Reader now remembers which camera that was and checks it whenever the camera starts,
+  however the reading began. When it changes (unplugging an external webcam or undocking a laptop
+  falls back to the built-in one), it says so and offers to recalibrate, and keeps offering until
+  you do or the old camera is back. Meanwhile it re-learns where your gaze sits.
+- **The right message when the browser can't run the face model.** With WebAssembly turned off or
+  blocked (some managed or locked-down browsers, or a site served with a security policy that
+  forbids it), the message asked you to check your internet connection and offered Try again, which
+  could never work. It now says this browser can't run the face tracker, and offers the mouse and
+  the demo.
 - **One zoom step asks for the quick refresh.** Zooming the page by one step (to 90 % or 110 %)
   changed the window by less than the size check allowed, so the calibration kept reading your gaze
   about a tenth off, roughly two lines at the bottom of the page. Any zoom change now offers the
@@ -75,6 +149,37 @@ position sat a line or two off after shifting in the chair, and page turns came 
 - **The camera promises are tested.** Automated tests now check that the camera stays off in the
   library and stops when you go back to it, and that it stops after a tab has been hidden for a
   minute and comes back with the tab, as [PRIVACY.md](PRIVACY.md) says.
+
+### Testing
+
+- **A harder end-to-end simulation, compared scenario by scenario.** The simulated reader of
+  `npm run eval` now also does what made the page-end rules look better than they are:
+  - after finishing a page, now and then pauses or re-reads for 1.6–4 s before looking below it to turn it;
+  - glances at the phone or the keyboard as a book opens or is reopened, and after a calibration refresh;
+  - glances at the keyboard mid-page (unlike most phone glances, the keyboard is within the tracker's reach);
+  - closes and reopens the book, which starts the reading layer over.
+
+  The cooldown after a turn now starts when the scroll ends, as in the app. The eval runs the Balanced and
+  Relaxed presets in parallel shards, with three seeds for the two-hour row, and gives 95 % intervals.
+  `GR_EVAL_BASELINE=deployed` adds the deployed page-end detector on the same seeds and shows, per scenario,
+  each difference with its interval and the missed pages per unintended turn prevented.
+- **The simulation follows the app's new cooldown after a book opens or a calibration ends**, and
+  the eval's "missed pages per unintended turn prevented" is left blank when a change prevents
+  fewer than 0.1 an hour (it divided by almost nothing before).
+- **Per-scenario gates.** `tests/endToEnd*.test.ts` give each scenario its own limits: clean,
+  everyday (also on Relaxed), distracted, fidgety (also on Relaxed), glasses, a noisy webcam and dim
+  light. A regression in one kind of light or behaviour can no longer hide in a total over all of them.
+  The noisiest scenarios count three shorter sessions instead of one long one: an early difference
+  can send one long session down a much worse path (one dim hour swung from 14 to 37 missed pages
+  where three 20-minute sessions stayed at 30).
+
+### Development
+
+- **A scoreboard for the line tracker itself.** `npm run bench -- bench/reading/lineTracker` scores,
+  in every scenario of the end-to-end simulation, how often the tracker is on the line the reader
+  is really reading, how often it is wrong while sure of itself, and how often it puts the reader on
+  the last line while they are two or more lines above it (the kind of error that turns pages
+  early), apart from what the page-end detector then does with it.
 
 ## 1.1.0 (unreleased, 2026-09-25)
 

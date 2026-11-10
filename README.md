@@ -32,7 +32,7 @@ What's new in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 - **Hands-free page turns.** A one-minute calibration maps your eyes to the screen. From then on,
   Gaze Reader notices when you finish the last line and scrolls the next page into place, keeping
-  a line of context at the top.
+  two lines of context at the top.
 - **Tracking that understands reading.** Webcam gaze is noisy, especially vertically, so the app
   follows the structure of reading instead of trusting raw coordinates. It groups gaze into
   fixations, tracks which line you're on with a hidden Markov model, spots return sweeps to the
@@ -233,15 +233,21 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
      its end for a moment, or you finish it and your eyes jump back to the left looking for a
      next line that isn't there;
    - your gaze rests at the bottom right of the text (a fallback for when the tracker is unsure);
-   - you deliberately look below the page (glance-down, which you can switch off). It is ignored
-     while the tracker is confident you're still above the last two lines, so a look at the
-     keyboard mid-page doesn't turn it.
+   - you deliberately look below the page from the end of the last line (glance-down, which you
+     can switch off). A look down that starts anywhere else, at the keyboard or a phone mid-page,
+     Dewey in the corner or the edge of the screen, doesn't turn it; neither does one while the
+     tracker is confident you're still above the last two lines, or before it has placed you on
+     the page at all (a book just opened). If you finish a page and think or re-read for a moment
+     before looking down, look back at the end of the last line first: in the end-to-end simulation
+     that pause is where most of the missed turns are.
 
-   Guards prevent false turns: a cooldown after every scroll, enough valid tracking in the last
-   second, some reading on the new page, and never a turn during a blink. After a turn, the
+   Guards prevent false turns: a cooldown after every scroll and after a book opens or a
+   calibration ends, enough valid tracking in the last second (and tracking fast enough to follow
+   the lines: at least 7 frames a second), some reading on the new page, and never a turn during a
+   blink. After a turn, the
    detector waits for your eyes to come back up the page, so a resting gaze or mouse can't page
    through the book on its own.
-6. **Scrolling** puts the next unread line near the top (keeping 1 line of context by default)
+6. **Scrolling** puts the next unread line near the top (keeping 2 lines of context by default)
    with an eased animation, or instantly if you prefer reduced motion. Scrolling or pressing a key
    during the animation cancels it.
 
@@ -337,7 +343,9 @@ extension/                  Chrome MV3 extension: service worker, offscreen trac
                             script, popup, camera setup page
 scripts/                    Extension and Artifact builds, MediaPipe WASM copy, icon generator
 bench/                      Slow scoreboards: lighting robustness of the gaze features, reading-layer
-                            offset tolerance, replay of diagnostics recordings (npm run bench)
+                            offset tolerance, replay of diagnostics recordings (npm run bench), and
+                            the end-to-end harness: simulated hours of reading from webcam landmarks
+                            to page turns (npm run eval)
 docs/ARCHITECTURE.md        Module contracts and design notes
 ```
 
@@ -355,6 +363,7 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 | `npm test` | Run the unit and integration tests (Vitest, with jsdom for DOM tests) |
 | `npm run check` | All of the above: typecheck, tests, app build, extension build |
 | `npm run bench` | Slow accuracy scoreboards in `bench/` (several minutes). `GR_REPLAY=file.json npm run bench -- bench/replay` replays a diagnostics recording |
+| `npm run eval` | End-to-end scoreboard (a few minutes, in parallel shards): a simulated reader with ground-truth gaze, through landmark noise, frame drops, blinks, glare, posture changes, a second face, glances at a phone or the keyboard (also right as a book opens), and pauses or re-reading after finishing a page, scored on unintended and missed page turns (with 95 % intervals), turn latency, gaze error, recalibration prompts and CPU, for the Balanced and Relaxed presets. `GR_EVAL_BASELINE=deployed` also runs the deployed page-end detector on the same seeds and prints each scenario's difference with its interval, and the missed pages per unintended turn prevented. `GR_EVAL_SEEDS`, `GR_EVAL_SEED_BASE`, `GR_EVAL_MINUTES`, `GR_EVAL_SENS`, `GR_EVAL_ONLY` and `GR_EVAL_OUT=file.json` vary it (see `bench/endtoend/eval.ts`); the per-scenario gates are `tests/endToEnd*.test.ts` |
 
 ## Known limitations
 

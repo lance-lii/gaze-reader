@@ -64,7 +64,12 @@ export interface TrackingContext {
   autoScroll: boolean;
   /** Extra explanation for the `off` / `error` phases (e.g. "Camera access was blocked"). */
   detail?: string;
+  /** Automatic page turns are held for this reason (whatever the auto-scroll setting): the pill says it. */
+  holdReason?: string;
 }
+
+/** The detail of a plain auto-scroll pause (the pill then says how to resume). */
+export const AUTO_SCROLL_PAUSED = 'Auto-scroll is paused';
 
 export interface TrackingStatus {
   state: TrackingState;
@@ -159,7 +164,8 @@ export class TrackingStateMachine {
     }
 
     if (this.noFace) return { state: 'no-face', detail: 'Face not visible' };
-    if (!ctx.autoScroll) return { state: 'paused', detail: 'Auto-scroll is paused' };
+    if (ctx.holdReason) return { state: 'paused', detail: ctx.holdReason };
+    if (!ctx.autoScroll) return { state: 'paused', detail: AUTO_SCROLL_PAUSED };
     if (this.poor) return { state: 'poor', detail: 'Low tracking confidence' };
     return { state: 'tracking' };
   }
@@ -211,10 +217,12 @@ export interface PillView {
  * make that obvious (privacy), so every webcam state mentions the camera in
  * its description.
  */
-export function statusPill(state: TrackingState, kind: GazeSourceKind | null, cameraOn: boolean): PillView {
+export function statusPill(state: TrackingState, kind: GazeSourceKind | null, cameraOn: boolean, detail?: string): PillView {
   const cam = cameraOn ? 'Camera on (video stays on this device). ' : '';
   if (state === 'paused') {
-    return { label: 'Paused', tone: 'idle', description: `${cam}Auto-scroll is paused. Press P to resume.` };
+    // Held for a reason of its own (a camera switch): say it, rather than how to resume auto-scroll.
+    const why = detail && detail !== AUTO_SCROLL_PAUSED ? detail : 'Auto-scroll is paused. Press P to resume.';
+    return { label: 'Paused', tone: 'idle', description: `${cam}${why}` };
   }
   if (kind === 'mouse' && (state === 'tracking' || state === 'no-face' || state === 'poor')) {
     return { label: 'Mouse', tone: 'info', description: 'Following your mouse pointer instead of your eyes.' };
@@ -667,6 +675,46 @@ export function cameraErrorInfo(code: TrackerErrorCode): CameraErrorInfo {
         retryable: true,
       };
   }
+}
+
+/**
+ * The camera stopped mid-session (froze, or its track ended) and restarting it didn't last: it
+ * stopped again within a minute, or `times` stops (3 and up) within 10 minutes.
+ */
+export function cameraStoppedInfo(times = 2): CameraErrorInfo {
+  const again = times >= 3 ? `It has stopped ${times} times in 10 minutes` : 'It stopped sending pictures';
+  return {
+    title: 'The camera stopped',
+    message: `${again}: unplugged, switched off, or taken by another app. Try again, or read with your mouse for now.`,
+    buddyLine: 'The camera went quiet on me. Shall we try again?',
+    retryable: true,
+  };
+}
+
+/**
+ * Whether this browser can compile WebAssembly, which the face model needs: false when it is turned
+ * off (no WebAssembly object), and also when it is there but blocked (a Content-Security-Policy
+ * without 'wasm-unsafe-eval', a managed-browser policy), where compiling throws.
+ */
+export function webAssemblyUsable(): boolean {
+  try {
+    const wasm = (globalThis as { WebAssembly?: typeof WebAssembly }).WebAssembly;
+    if (typeof wasm !== 'object' || wasm === null) return false;
+    // The smallest valid module (magic number and version): compiling it is what a policy refuses.
+    return new wasm.Module(new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])) instanceof wasm.Module;
+  } catch {
+    return false;
+  }
+}
+
+/** The face model can't run in this browser at all (WebAssembly is off or blocked): no retry helps. */
+export function faceTrackerUnsupportedInfo(): CameraErrorInfo {
+  return {
+    title: 'This browser can’t run the face tracker',
+    message: 'WebAssembly is turned off or blocked here, so the face model can’t run. Read with your mouse or the demo, or try another browser.',
+    buddyLine: 'This browser won’t run my face model. The mouse works nicely too!',
+    retryable: false,
+  };
 }
 
 // ────────────────────────────── Calibration fit ─────────────────────────────

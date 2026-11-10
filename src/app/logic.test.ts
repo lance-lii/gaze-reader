@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS, sanitizeSettings } from '../core/settings';
 import type { AppSettings, TextLine } from '../types';
 import {
@@ -34,6 +34,7 @@ import {
   textEndsOnScreen,
   trackerErrorCode,
   type TrackingContext,
+  webAssemblyUsable,
 } from './logic';
 
 const running = (over: Partial<TrackingContext> = {}): TrackingContext => ({
@@ -684,5 +685,44 @@ describe('settings schema', () => {
     const patch = resetPatch(DEFAULT_SETTINGS, current);
     expect(patch.gazeSource).toBe('mouse');
     expect(patch.fontSizePx).toBe(DEFAULT_SETTINGS.fontSizePx);
+  });
+});
+
+describe('webAssemblyUsable', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('is true where WebAssembly compiles (here)', () => {
+    expect(webAssemblyUsable()).toBe(true);
+  });
+
+  it('is false with WebAssembly turned off, and with it there but compiling refused (a CSP, a policy)', () => {
+    vi.stubGlobal('WebAssembly', undefined);
+    expect(webAssemblyUsable()).toBe(false);
+    vi.unstubAllGlobals();
+    const real = WebAssembly;
+    vi.stubGlobal('WebAssembly', {
+      ...real,
+      Module: class {
+        constructor() {
+          throw new real.CompileError('Refused to compile or instantiate WebAssembly module');
+        }
+      },
+    });
+    expect(webAssemblyUsable()).toBe(false);
+  });
+});
+
+describe('a hold on page turns (a camera switch waiting for the reader)', () => {
+  it('shows as paused with its own reason, whatever the auto-scroll setting, and the pill says it', () => {
+    const m = new TrackingStateMachine();
+    const reason = 'Page turns wait: this isn’t the camera you calibrated with.';
+    m.reset(0);
+    feed(m, 0, 2000, true);
+    expect(m.evaluate(2000, { phase: 'running', kind: 'webcam', autoScroll: true, holdReason: reason })).toEqual({ state: 'paused', detail: reason });
+    expect(m.evaluate(2000, { phase: 'running', kind: 'webcam', autoScroll: false, holdReason: reason })).toEqual({ state: 'paused', detail: reason });
+    expect(statusPill('paused', 'webcam', true, reason).description).toBe(`Camera on (video stays on this device). ${reason}`);
+    // A plain pause still says how to resume.
+    const plain = m.evaluate(2000, { phase: 'running', kind: 'webcam', autoScroll: false });
+    expect(statusPill(plain.state, 'webcam', true, plain.detail).description).toMatch(/Press P to resume/);
   });
 });

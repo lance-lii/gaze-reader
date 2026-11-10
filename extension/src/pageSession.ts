@@ -1093,7 +1093,7 @@ export class PageSession {
     if (!scroll || this.turning || scroll.animating || this.paused || !this.getSettings().autoScroll) return;
     // Page mode's pseudo-lines were never read: only the geometric rules (glance-down, bottom-dwell) may fire.
     const estimate = this.readingMode === 'page' ? null : this.tracker.estimate;
-    const decision = this.pageEnd.update({ t: s.t, gaze: s, estimate, layout: this.layout });
+    const decision = this.pageEnd.update({ t: s.t, gaze: s, estimate, layout: this.layout, pageMode: this.readingMode === 'page' });
     if (!decision.trigger) return;
     if (this.turnVia() === 'scroll' && scroll.atEnd()) {
       this.pageEnd.notifyScrolled(s.t);
