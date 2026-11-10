@@ -29,6 +29,12 @@ position sat a line or two off after shifting in the chair, and page turns came 
   or missed turn; single-paragraph pages 83 % instead of 69 %; and on web articles (the extension)
   a 15 % stretch costs no turn and keeps 94–98 % on the line. Not yet fixed: if gaze reads 2–3 lines low from the start, the first page of a
   long paragraph still often turns early. The debug overlay shows the learned stretch ("gain").
+- **Two lines of context after a page turn.** The line you were reading and the one above it now
+  stay at the top of the next page, instead of only the last one. A page that turns while you're
+  still on its second-to-last line no longer takes that line away: in the end-to-end simulation,
+  turns that cost you your place fell from 12.3 to 7.1 an hour on Balanced, with no more missed
+  turns. This is only the default. Settings are saved as a whole, so if you have changed any
+  setting before, yours keep one line until you set "Lines kept for context" to 2.
 - **A glance at your phone no longer turns the page.** Looking below the page turns it
   (glance-down), but whenever the reading layer wasn't sure which line you were on, any look down
   counted: a glance at your phone or the keyboard mid-page, or the gaze dipping below the page

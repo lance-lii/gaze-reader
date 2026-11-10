@@ -7,7 +7,7 @@ export const DEFAULT_SETTINGS: Readonly<AppSettings> = Object.freeze({
   gazeSource: IS_ARTIFACT ? 'simulated' : 'webcam',
   autoScroll: true,
   sensitivity: 'balanced',
-  overlapLines: 1,
+  overlapLines: 2,
   scrollDurationMs: 650,
   glanceDownToTurn: true,
 

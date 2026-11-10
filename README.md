@@ -32,7 +32,7 @@ What's new in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 - **Hands-free page turns.** A one-minute calibration maps your eyes to the screen. From then on,
   Gaze Reader notices when you finish the last line and scrolls the next page into place, keeping
-  a line of context at the top.
+  two lines of context at the top.
 - **Tracking that understands reading.** Webcam gaze is noisy, especially vertically, so the app
   follows the structure of reading instead of trusting raw coordinates. It groups gaze into
   fixations, tracks which line you're on with a hidden Markov model, spots return sweeps to the
@@ -247,7 +247,7 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
    blink. After a turn, the
    detector waits for your eyes to come back up the page, so a resting gaze or mouse can't page
    through the book on its own.
-6. **Scrolling** puts the next unread line near the top (keeping 1 line of context by default)
+6. **Scrolling** puts the next unread line near the top (keeping 2 lines of context by default)
    with an eased animation, or instantly if you prefer reduced motion. Scrolling or pressing a key
    during the animation cancels it.
 
