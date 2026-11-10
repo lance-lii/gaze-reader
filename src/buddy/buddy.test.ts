@@ -567,6 +567,17 @@ describe('Buddy', () => {
       expect(QUIPS.trackingLost).toContain(s.said());
     });
 
+    it('is relieved when the face is back even if the line is still unsure (the camera sees you again)', () => {
+      const s = make();
+      s.bus.emit('tracking-state', { state: 'no-face' });
+      vi.advanceTimersByTime(WORRY_AFTER_MS + 10);
+      expect(s.mood()).toBe('worried');
+      s.bus.emit('tracking-state', { state: 'unsure' });
+      vi.advanceTimersByTime(1_300);
+      expect(s.mood()).toBe('happy');
+      expect(QUIPS.trackingBack).toContain(s.said());
+    });
+
     it('does not fuss when tracking is paused on purpose', () => {
       const s = make();
       s.bus.emit('tracking-state', { state: 'no-face' });

@@ -256,7 +256,7 @@ compute error, show results: mean error in px and as "≈ N lines at your text s
 `calibration` events for every phase so Dewey can coach. Esc cancels. Full-viewport overlay with
 z-index `Z.calibration`; hide the cursor during targets; big, high-contrast, accessible.
 
-### C · Reading intelligence — `src/signal/fixations.ts`, `src/reading/{lineTracker,pageEndDetector,simulatedReader}.ts`, `src/ui/{debugOverlay,gazeDot}.ts`
+### C · Reading intelligence — `src/signal/fixations.ts`, `src/reading/{lineTracker,lineConfidence,pageEndDetector,simulatedReader}.ts`, `src/ui/{debugOverlay,gazeDot}.ts`
 
 ```ts
 // fixations.ts — online dispersion (I-DT) detector tuned for noisy webcam gaze
@@ -279,6 +279,16 @@ export class LineTracker {
   appearanceChangedAt(t: number): void;          // the gaze bias may have jumped at t: keep the line, re-learn the drift
   reset(opts?: { keepDrift?: boolean; calibrated?: boolean }): void;
   readonly estimate: LineEstimate | null;        // a TrackedLineEstimate (σ_y, excursions, drift belief range, gain)
+}
+
+// lineConfidence.ts — does the tracker know the reader's line? (the pill's "Unsure of your line")
+export interface LineConfidenceOptions { weight: number; enter: number; enterAfterMs: number; exit: number; exitAfterMs: number; minShownMs: number; maxStepMs: number }
+export class LineConfidenceWatch {
+  constructor(opts?: Partial<LineConfidenceOptions>);
+  push(e: LineEstimate): boolean; // each completed fixation's estimate; excursions and estimates without a line are ignored
+  readonly unsure: boolean;       // smoothed probability < 0.45 for 10 s of reading; clears ≥ 0.6 for 5 s, shown ≥ 15 s
+  readonly smoothed: number | null;
+  reset(): void;                  // new source, calibration or book
 }
 
 // pageEndDetector.ts
@@ -624,7 +634,10 @@ The controller wires everything (see diagram) and owns lifecycle:
 * Layout re-measure: on open, after scroll settles (debounced ~120 ms; manual scrolls also call
   `notifyScrolled` and `setLayout(…, 'scroll')`), resize, settings affecting typography. Emit `layout`.
 * Tracking state derivation: `tracking` / `no-face` (invalid > 1 s) / `poor` (low confidence) /
-  `paused` / `off` / `error`; emit `tracking-state` on change.
+  `unsure` (the line tracker unsure of the line for ~10 s of reading: `LineConfidenceWatch`, fed
+  each fixation's estimate under the webcam, reset with the pipeline) / `paused` / `off` / `error`;
+  emit `tracking-state` on change. The first `unsure` of a session also shows a hint toast (Space
+  turns the page; light or a recalibration helps).
 * Progress: save position (debounced), `book-progress` every ~5 s with fraction, words read,
   WPM (words advanced ÷ active reading minutes), pages turned, minutes reading. Break timer →
   `break-due`.

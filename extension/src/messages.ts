@@ -131,6 +131,7 @@ const TRACKING_STATES: readonly TrackingState[] = [
   'tracking',
   'no-face',
   'poor',
+  'unsure',
   'paused',
   'error',
 ];
