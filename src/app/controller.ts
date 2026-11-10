@@ -307,6 +307,10 @@ export class AppController {
   private model: GazeModel | null | undefined = undefined;
   private savedCalibration = false;
   private calibration: CalibrationOverlay | null = null;
+  /** The mode of the calibration overlay that is open (see calibrate). */
+  private calibrationMode: CalibrationMode | null = null;
+  /** A calibration the camera stopped in the middle of: the restart opens it again (see recoverCamera). */
+  private resumeCalibration: CalibrationMode | null = null;
   private forceCalibration = false;
   private webcamHold: WebcamHold | null = null;
   private hiddenLong = false;
@@ -1412,6 +1416,8 @@ export class AppController {
   /** Brings the running source in line with desiredSource(). Idempotent; safe to call at any time. */
   private syncSource(): void {
     const want = this.desiredSource();
+    // The reader chose another source: a calibration the camera interrupted isn't theirs to finish now.
+    if (this.store.get().gazeSource !== 'webcam') this.resumeCalibration = null;
     if (want !== null && want === this.sourceKind) return;
     const gen = ++this.sourceGen;
     this.teardownSource();
@@ -1557,8 +1563,14 @@ export class AppController {
     this.updateOverlays();
 
     const model = this.currentModel();
-    if (!model || this.forceCalibration) {
-      const outcome = await this.calibrate('standard', gen);
+    // The camera restarted in the middle of a calibration: open it again, and say why.
+    const resume = this.resumeCalibration;
+    this.resumeCalibration = null;
+    if (resume) {
+      this.toasts.show({ id: 'calibration-restart', message: 'The camera stopped and started again, so the calibration starts over.' });
+    }
+    if (!model || this.forceCalibration || resume) {
+      const outcome = await this.calibrate(model && resume ? resume : 'standard', gen);
       if (!outcome) return null;
       this.afterCalibration(outcome, 'bring-up');
       this.checkCamera(camera);
@@ -1639,6 +1651,9 @@ export class AppController {
    */
   private recoverCamera(err: unknown): void {
     const now = performance.now();
+    // A calibration the reader was in the middle of (or had asked for) is cancelled with the camera:
+    // the next start (on its own, or Try again) opens it again instead of reading on the old one.
+    if (this.calibration) this.resumeCalibration = this.calibrationMode ?? 'standard';
     if (now - this.lastCameraRestartAt < CAMERA_RESTART_MIN_GAP_MS) {
       this.cameraFailed(err, cameraStoppedInfo());
       this.syncSource();
@@ -1805,6 +1820,7 @@ export class AppController {
       featureNames: FEATURE_NAMES,
     });
     this.calibration = overlay;
+    this.calibrationMode = mode;
     this.lastCalibrationPhase = null;
     this.syncModalState();
     overlay.mount(this.root);
@@ -1814,7 +1830,10 @@ export class AppController {
       result = await overlay.run();
       check = overlay.lastAccuracyCheck;
     } finally {
-      if (this.calibration === overlay) this.calibration = null;
+      if (this.calibration === overlay) {
+        this.calibration = null;
+        this.calibrationMode = null;
+      }
       this.forceCalibration = false;
       // Un-inert the page before the overlay goes, so focus can return to the reader.
       this.syncModalState();
