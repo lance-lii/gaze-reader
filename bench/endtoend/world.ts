@@ -50,7 +50,7 @@ import type { CalibrationSample } from '../../src/types';
 
 export const VIEWPORT = Object.freeze({ left: 0, top: 0, right: VIEW.width, bottom: VIEW.height });
 /** Bumped whenever the world or the rig changes what a seed produces: saved results only compare within a version. */
-export const HARNESS_VERSION = 'e2e-2';
+export const HARNESS_VERSION = 'e2e-3';
 /** The app's default typography: 22 px × 1.9 line height, a 62-character column centred in the window. */
 export const PITCH = 42;
 const COLUMN = { left: 315, right: 965 };

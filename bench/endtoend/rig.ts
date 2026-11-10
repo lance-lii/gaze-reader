@@ -178,6 +178,9 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
   tracker.reset({ calibrated: true });
   tracker.setLayout(world.layout, 'initial');
   const detector: PageEndDetectorLike = opts.detector ? opts.detector(sensitivity) : new PageEndDetector({ sensitivity });
+  // The controller starts the cooldown whenever it resets the reading pipeline (resetPipeline): the
+  // book has just opened, and the reader may look anywhere first.
+  detector.notifyScrolled(0);
   const appearance = new AppearanceMonitor(null);
   appearance.setBaseline(model.environment?.appearance ?? null, null);
   const changes = new AppearanceChangeFilter();
@@ -334,6 +337,7 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
       tracker.reset({ keepDrift: true });
       tracker.setLayout(world.layout, 'initial');
       detector.reset();
+      detector.notifyScrolled(wf.t);
       driftWatch.reset();
       wasBlocked = false;
       pageSweeps = 0;
@@ -381,6 +385,7 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
           world.arrive(world.t);
           fixations.reset();
           detector.reset();
+          detector.notifyScrolled(world.t); // resetPipeline('none') after the refresh, as in the app
           tracker.appearanceChangedAt(world.t);
           driftWatch.reset();
           guidance.noteFixed(world.t);
@@ -740,7 +745,7 @@ export interface Delta {
   /** after − before, points of pages missed, and its 95 % half-width. */
   dMissed: number;
   dMissedCI: number;
-  /** Extra missed pages per hour for each unintended turn per hour prevented (NaN unless it prevents some). */
+  /** Extra missed pages per hour for each unintended turn per hour prevented (NaN unless it prevents at least 0.1 an hour). */
   missedPerPrevented: number;
 }
 
@@ -759,7 +764,7 @@ export function delta(before: Summary, after: Summary): Delta {
     missedAfter: after.missedPct,
     dMissed: after.missedPct - before.missedPct,
     dMissedCI: 100 * 1.96 * se(missedSE(before.seeds), missedSE(after.seeds)),
-    missedPerPrevented: dFalse < 0 ? (missedPerHour(after) - missedPerHour(before)) / -dFalse : NaN,
+    missedPerPrevented: dFalse <= -0.1 ? (missedPerHour(after) - missedPerHour(before)) / -dFalse : NaN,
   };
 }
 
