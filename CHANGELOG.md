@@ -102,6 +102,14 @@ position sat a line or two off after shifting in the chair, and page turns came 
   library and stops when you go back to it, and that it stops after a tab has been hidden for a
   minute and comes back with the tab, as [PRIVACY.md](PRIVACY.md) says.
 
+### Development
+
+- **A scoreboard for the line tracker itself.** `npm run bench -- bench/reading/lineTracker` scores,
+  in every scenario of the end-to-end simulation, how often the tracker is on the line the reader
+  is really reading, how often it is wrong while sure of itself, and how often it puts the reader on
+  the last line while they are two or more lines above it (the kind of error that turns pages
+  early), apart from what the page-end detector then does with it.
+
 ## 1.1.0 (unreleased, 2026-09-25)
 
 Lighting robustness. Beta readers found that "if there's light then it sometimes offsets where
