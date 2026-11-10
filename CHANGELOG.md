@@ -102,6 +102,23 @@ position sat a line or two off after shifting in the chair, and page turns came 
   library and stops when you go back to it, and that it stops after a tab has been hidden for a
   minute and comes back with the tab, as [PRIVACY.md](PRIVACY.md) says.
 
+### Testing
+
+- **A harder end-to-end simulation, compared scenario by scenario.** The simulated reader of
+  `npm run eval` now also does what made the page-end rules look better than they are:
+  - after finishing a page, now and then pauses or re-reads for 1.6–4 s before looking below it to turn it;
+  - glances at the phone or the keyboard as a book opens or is reopened, and after a calibration refresh;
+  - glances at the keyboard mid-page (unlike most phone glances, the keyboard is within the tracker's reach);
+  - closes and reopens the book, which starts the reading layer over.
+
+  The cooldown after a turn now starts when the scroll ends, as in the app. The eval runs the Balanced and
+  Relaxed presets in parallel shards, with three seeds for the two-hour row, and gives 95 % intervals.
+  `GR_EVAL_BASELINE=deployed` adds the deployed page-end detector on the same seeds and shows, per scenario,
+  each difference with its interval and the missed pages per unintended turn prevented.
+- **Per-scenario gates.** `tests/endToEnd*.test.ts` give each scenario its own limits: clean,
+  everyday (also on Relaxed), distracted, fidgety (also on Relaxed), glasses, a noisy webcam and dim
+  light. A regression in one kind of light or behaviour can no longer hide in a total over all of them.
+
 ## 1.1.0 (unreleased, 2026-09-25)
 
 Lighting robustness. Beta readers found that "if there's light then it sometimes offsets where
