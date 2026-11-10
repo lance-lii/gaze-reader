@@ -1111,6 +1111,9 @@ export class AppController {
     this.recordInput({ k: 'pipeline-reset', t: performance.now(), full: tracker !== 'none', keepDrift, ...(calibrated ? { calibrated } : {}) });
     this.pipelineWasBlocked = false;
     this.lastEstimateEmitAt = Number.NEGATIVE_INFINITY;
+    // A book just opened, or a calibration just ended: the reading layer has nothing to go on yet,
+    // so whatever the reader looks at first (the phone, the keyboard) waits out a cooldown.
+    this.notifyScrolled();
   }
 
   /** Who the drift learned from here on belongs to: the source that is (or will be) running, and its calibration. */

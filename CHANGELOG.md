@@ -36,6 +36,12 @@ position sat a line or two off after shifting in the chair, and page turns came 
   line, where you finish the page. In the new end-to-end simulation (`npm run eval`), unintended
   page turns fell from 12.9 to 7.2 an hour, for one more missed turn in a hundred. The extension's
   page mode, which has no lines to follow, still turns on any look down.
+- **No page turns before you have read anything.** When a book opened or a calibration ended, the
+  reading layer had nothing to go on until your first look at the text, and until then any look
+  below the page counted as the turn gesture: glancing at your phone or the keyboard as the camera
+  came up turned page 1, unread. A look down now counts only once the reading layer has placed you
+  on the page, and opening a book or finishing a calibration starts the usual short wait after a
+  turn. The extension's page mode, which has no lines to follow, still turns on any look down.
 - **No page turns on tracking too slow to follow you.** Below about 7 frames a second (an
   overloaded or throttled machine, or face tracking on the CPU) no fixation can form, so there are
   no lines to follow, and in the end-to-end simulation a glance at a phone then turned the page
