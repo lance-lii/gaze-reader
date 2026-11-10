@@ -64,7 +64,12 @@ export interface TrackingContext {
   autoScroll: boolean;
   /** Extra explanation for the `off` / `error` phases (e.g. "Camera access was blocked"). */
   detail?: string;
+  /** Automatic page turns are held for this reason (whatever the auto-scroll setting): the pill says it. */
+  holdReason?: string;
 }
+
+/** The detail of a plain auto-scroll pause (the pill then says how to resume). */
+export const AUTO_SCROLL_PAUSED = 'Auto-scroll is paused';
 
 export interface TrackingStatus {
   state: TrackingState;
@@ -159,7 +164,8 @@ export class TrackingStateMachine {
     }
 
     if (this.noFace) return { state: 'no-face', detail: 'Face not visible' };
-    if (!ctx.autoScroll) return { state: 'paused', detail: 'Auto-scroll is paused' };
+    if (ctx.holdReason) return { state: 'paused', detail: ctx.holdReason };
+    if (!ctx.autoScroll) return { state: 'paused', detail: AUTO_SCROLL_PAUSED };
     if (this.poor) return { state: 'poor', detail: 'Low tracking confidence' };
     return { state: 'tracking' };
   }
@@ -211,10 +217,12 @@ export interface PillView {
  * make that obvious (privacy), so every webcam state mentions the camera in
  * its description.
  */
-export function statusPill(state: TrackingState, kind: GazeSourceKind | null, cameraOn: boolean): PillView {
+export function statusPill(state: TrackingState, kind: GazeSourceKind | null, cameraOn: boolean, detail?: string): PillView {
   const cam = cameraOn ? 'Camera on (video stays on this device). ' : '';
   if (state === 'paused') {
-    return { label: 'Paused', tone: 'idle', description: `${cam}Auto-scroll is paused. Press P to resume.` };
+    // Held for a reason of its own (a camera switch): say it, rather than how to resume auto-scroll.
+    const why = detail && detail !== AUTO_SCROLL_PAUSED ? detail : 'Auto-scroll is paused. Press P to resume.';
+    return { label: 'Paused', tone: 'idle', description: `${cam}${why}` };
   }
   if (kind === 'mouse' && (state === 'tracking' || state === 'no-face' || state === 'poor')) {
     return { label: 'Mouse', tone: 'info', description: 'Following your mouse pointer instead of your eyes.' };

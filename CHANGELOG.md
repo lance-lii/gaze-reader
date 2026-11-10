@@ -76,6 +76,11 @@ position sat a line or two off after shifting in the chair, and page turns came 
   can't start, the message says why (no camera found, access blocked, busy). A camera that stops
   again within a minute, or for the third time in 10 minutes, is reported with Try again instead of
   being restarted over and over.
+- **After a camera switch, pages wait for you.** Read through another camera than the one you
+  calibrated with, the calibration puts your gaze in the wrong place, and a wrong page turn loses
+  your place. So after a switch, pages don't turn on their own until you recalibrate or choose
+  Keep reading on the old calibration (remembered for that camera). The status pill says why, and
+  P brings the choice back if you closed it.
 - **A calibration survives the camera restarting.** If the camera stopped while you were on the
   calibration dots, it restarted by itself but went back to reading on the old calibration without
   a word. The dots now start over once the camera is back, with a note saying why.

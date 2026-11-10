@@ -178,8 +178,10 @@ const LIGHTING_HOLD_MS = 5000;
 const APPEARANCE_DEBUG_MS = 250;
 /** Remembers that the "tracker upgraded, please recalibrate once" explanation was given. */
 const UPGRADE_EXPLAINED_KEY = 'calibrationUpgradeExplained.v1';
-/** The browser's id for the camera the saved calibration was made with: `{ deviceId }`. */
+/** The browser's id for the camera the saved calibration was made with, and others the reader chose to read with: `{ deviceId, accepted? }`. */
 const CALIBRATION_CAMERA_KEY = 'calibrationCamera.v1';
+/** What the status pill says while page turns wait for the reader's choice after a camera switch. */
+const CAMERA_HOLD_REASON = 'Page turns wait: this isn’t the camera you calibrated with. Press C to recalibrate, or P for the choices.';
 
 /** What a calibration run did to the model. */
 type CalibrationOutcome = 'standard' | 'refresh' | 'unchanged';
@@ -316,6 +318,11 @@ export class AppController {
   private calibrationMode: CalibrationMode | null = null;
   /** A calibration the camera stopped in the middle of: the restart opens it again (see recoverCamera). */
   private resumeCalibration: CalibrationMode | null = null;
+  /**
+   * The webcam running isn't the one the calibration was made with (its id): automatic page turns
+   * wait until the reader recalibrates or chooses to keep reading on the old calibration.
+   */
+  private cameraHold: string | null = null;
   private forceCalibration = false;
   private webcamHold: WebcamHold | null = null;
   private hiddenLong = false;
@@ -1174,7 +1181,8 @@ export class AppController {
       this.notifyScrolled();
       return;
     }
-    if (!this.store.get().autoScroll) return;
+    // Paused, or held after a camera switch until the reader chooses (see checkCamera).
+    if (!this.store.get().autoScroll || this.cameraHeld()) return;
     void this.turnPage({ auto: true, reason: decision.reason, decision });
   }
 
@@ -1683,28 +1691,68 @@ export class AppController {
   private checkCamera(camera: CameraFeatureSource): void {
     const id = camera.deviceId;
     if (!id || !this.model) return;
-    const saved = readJSON<{ deviceId?: unknown } | null>(CALIBRATION_CAMERA_KEY, null);
+    const saved = readJSON<{ deviceId?: unknown; accepted?: unknown } | null>(CALIBRATION_CAMERA_KEY, null);
     const calibratedWith = saved && typeof saved.deviceId === 'string' ? saved.deviceId : null;
+    // Cameras the reader chose to keep reading with on this calibration (see keepReadingOnOldCalibration).
+    const accepted = saved && Array.isArray(saved.accepted) ? saved.accepted.filter((a): a is string => typeof a === 'string') : [];
     if (calibratedWith === null) {
       // A calibration from before cameras were recorded: take it to be this camera's.
       writeJSON(CALIBRATION_CAMERA_KEY, { deviceId: id });
       return;
     }
-    if (calibratedWith === id) {
+    if (calibratedWith === id || accepted.includes(id)) {
       this.toasts.dismiss('camera-switch');
+      this.setCameraHold(null);
       return;
     }
     const now = performance.now();
     this.lineTracker.appearanceChangedAt(now);
     this.recordInput({ k: 'appearance', t: now, at: now });
+    // Through another camera the calibration reads gaze in the wrong place: no automatic turns until
+    // the reader says what to do (a wrong turn loses their place; a held one only waits for a key).
+    this.setCameraHold(id);
+    this.showCameraChoice();
+  }
+
+  /** The choice a camera switch asks for; it stays up until made, and P brings it back. */
+  private showCameraChoice(): void {
     this.toasts.show({
       id: 'camera-switch',
       tone: 'warn',
       title: 'A different camera',
-      message: 'Gaze Reader is using another camera than the one you calibrated with, so it may read your gaze in the wrong place. Recalibrate to keep page turns accurate.',
-      actions: [{ label: 'Recalibrate', primary: true, run: () => this.recalibrate() }],
-      durationMs: 20_000,
+      message:
+        'Gaze Reader is using another camera than the one you calibrated with, so it would read your gaze in the wrong place. Pages won’t turn on their own until you recalibrate, or choose to keep reading on the old calibration.',
+      actions: [
+        { label: 'Recalibrate', primary: true, run: () => this.recalibrate() },
+        { label: 'Keep reading', run: () => this.keepReadingOnOldCalibration() },
+      ],
+      durationMs: 0,
     });
+  }
+
+  /** The reader chose to read on through this camera with the calibration made with another one. */
+  private keepReadingOnOldCalibration(): void {
+    const id = this.cameraHold;
+    if (id === null) return;
+    const saved = readJSON<{ deviceId?: unknown; accepted?: unknown } | null>(CALIBRATION_CAMERA_KEY, null);
+    if (saved && typeof saved.deviceId === 'string') {
+      const accepted = Array.isArray(saved.accepted) ? saved.accepted.filter((a): a is string => typeof a === 'string') : [];
+      writeJSON(CALIBRATION_CAMERA_KEY, { deviceId: saved.deviceId, accepted: [...new Set([...accepted, id])] });
+    }
+    this.toasts.dismiss('camera-switch');
+    this.setCameraHold(null);
+    this.toasts.show({ id: 'camera-switch-kept', message: 'Pages turn on their own again, with the old calibration. Recalibrate (C) whenever you like.' });
+  }
+
+  private setCameraHold(id: string | null): void {
+    if (this.cameraHold === id) return;
+    this.cameraHold = id;
+    this.refreshTracking(performance.now());
+  }
+
+  /** Automatic page turns wait for the reader's choice after a camera switch (the webcam only). */
+  private cameraHeld(): boolean {
+    return this.cameraHold !== null && this.sourceKind === 'webcam';
   }
 
   /** A new calibration (not a refresh of one) was just made with the running camera: it is now the reference. */
@@ -1713,6 +1761,7 @@ export class AppController {
     if (id) writeJSON(CALIBRATION_CAMERA_KEY, { deviceId: id });
     else removeKey(CALIBRATION_CAMERA_KEY);
     this.toasts.dismiss('camera-switch');
+    this.setCameraHold(null);
   }
 
   private introduceSource(kind: GazeSourceKind): void {
@@ -2065,6 +2114,8 @@ export class AppController {
   private forgetCalibration(): void {
     clearCalibration();
     removeKey(CALIBRATION_CAMERA_KEY);
+    this.toasts.dismiss('camera-switch');
+    this.setCameraHold(null);
     this.model = null;
     this.savedCalibration = false;
     this.applyEnvironment(null);
@@ -2367,6 +2418,7 @@ export class AppController {
       kind: this.sourceKind,
       autoScroll: this.store.get().autoScroll,
       detail: this.phaseDetail,
+      ...(this.cameraHeld() ? { holdReason: CAMERA_HOLD_REASON } : {}),
     });
     const cameraOn = this.camera?.running ?? false;
     const kind = this.sourceKind;
@@ -2432,7 +2484,10 @@ export class AppController {
     const s = this.store.get();
     switch (name) {
       case 'toggle-autoscroll':
-        this.setAutoScroll(!s.autoScroll);
+        // Held after a camera switch: P brings the choice back rather than flipping a setting that
+        // wouldn't turn pages anyway.
+        if (this.cameraHeld()) this.showCameraChoice();
+        else this.setAutoScroll(!s.autoScroll);
         break;
       case 'pause':
         this.setAutoScroll(false);

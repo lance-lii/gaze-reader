@@ -923,6 +923,41 @@ describe('AppController', () => {
     await until(() => camera.running() && camera.starts() === before + 4, 'the restart after a quiet spell');
   });
 
+  it('webcam: after a camera switch, pages don\'t turn on their own until the reader recalibrates or keeps reading, and the pill says why', async () => {
+    vi.spyOn(ReaderView.prototype, 'measureLayout').mockImplementation(() => layout(false));
+    const turn = vi.spyOn(ScrollController.prototype, 'turnPage').mockResolvedValue(undefined);
+    vi.spyOn(ScrollController.prototype, 'atEnd').mockReturnValue(false);
+    let fire = false;
+    vi.spyOn(PageEndDetector.prototype, 'update').mockImplementation(() => (fire ? PAGE_END : IDLE));
+    const { camera, states } = await readWithWebcam(calibratedModel(), { deviceId: 'external-usb' });
+    unplug(camera, 'built-in');
+    await until(() => /A different camera/.test(toastText()), 'the choice');
+    await until(() => states.at(-1)?.state === 'paused' && /isn’t the camera you calibrated with/.test(states.at(-1)?.detail ?? ''), 'the pill to say why');
+    // The reader finishes a page: it waits.
+    fire = true;
+    camera.emit(webcamFrame());
+    await sleep(50);
+    expect(turn).not.toHaveBeenCalled();
+    // The message was closed; P brings the choice back (and doesn't flip auto-scroll).
+    document.querySelectorAll('.gr-toast').forEach((t) => t.remove());
+    pressKey('p');
+    await until(() => /A different camera/.test(toastText()), 'the choice again');
+    expect(JSON.parse(localStorage.getItem('gazeReader.settings.v1')!).autoScroll).not.toBe(false);
+    // Keep reading on the old calibration: pages turn again…
+    liveToastButton('Keep reading')!.click();
+    camera.emit(webcamFrame());
+    await until(() => turn.mock.calls.length > 0, 'a page turn');
+    await until(() => states.at(-1)?.state !== 'paused', 'the pill to stop saying paused');
+    // …and the same camera after a later restart doesn't ask again.
+    fire = false;
+    const realNow = performance.now.bind(performance);
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+    unplug(camera, 'built-in');
+    await until(() => camera.running() && camera.subscribers() >= 2, 'the restart');
+    await sleep(100);
+    expect(toastText()).not.toMatch(/A different camera/);
+  });
+
   it('webcam: a denied camera explains how to allow it and offers the mouse and the demo, without retrying', async () => {
     saved.model = calibratedModel();
     const camera = stubCamera();
