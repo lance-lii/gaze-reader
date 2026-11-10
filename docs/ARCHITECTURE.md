@@ -411,9 +411,12 @@ none.
 2. **bottom-dwell** (fallback when the HMM is unsure): `(gaze.y − driftY) ≥ L.top − 0.25·pitch`
    and `gaze.x` in the right half of the column for ≥ `Tzone` ms.
 3. **glance-down** (if enabled): gaze at/below `viewport.bottom − 0.2·pitch` (off-screen below
-   counts) for ≥ `Tglance` ms — an intentional "turn the page" gesture. With a line estimate it
-   counts only a look down that began ≤ 1500 ms after the gaze was at the end of `L` (drift-
-   corrected y ≥ `L.top − 0.5·pitch`, x ≥ θx along it); page mode (no estimate) counts any.
+   counts) for ≥ `Tglance` ms — an intentional "turn the page" gesture. On text it needs a line
+   estimate, and counts only a look down that began ≤ 1500 ms after the gaze was at the end of `L`:
+   2 valid samples in a row across rule 2's zone (x from the middle of `L` to `zoneRight`,
+   drift-corrected y from `L.top − 0.5·pitch` down to `zoneBottom`, so a last line read a little low
+   still counts; an end seen during a look below the page makes it one from the end). In page mode
+   (`PageEndInput.pageMode`) any look down counts.
 
 | preset | θp | θx | dwell | Tzone | Tglance | cooldown |
 |---|---|---|---|---|---|---|
