@@ -403,6 +403,8 @@ export type TrackingState =
   | 'tracking'
   | 'no-face'
   | 'poor'
+  /** The camera is fine, but the line tracker has been unsure which line the reader is on for a while. */
+  | 'unsure'
   | 'paused'
   | 'error';
 

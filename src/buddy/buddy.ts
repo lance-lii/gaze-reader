@@ -645,7 +645,7 @@ export class Buddy implements Mountable {
       this.worriedSpoken = false;
       return;
     }
-    if (state === 'tracking' || state === 'poor') {
+    if (state === 'tracking' || state === 'poor' || state === 'unsure') {
       if (!this.timers.has('recover')) this.timers.set('recover', RECOVER_MS, () => this.endWorry(true));
     } else {
       // Tracking was stopped on purpose (paused, off, calibrating…): no fuss.

@@ -54,6 +54,7 @@ import { LightingWatch, parseLightingSignature } from '../gaze/lighting';
 import { MouseGazeSource } from '../gaze/mouseGazeSource';
 import { WebcamGazeSource } from '../gaze/webcamGazeSource';
 import { isTrackedLineEstimate } from '../reading/lineTracker';
+import { LineConfidenceWatch } from '../reading/lineConfidence';
 import { listSampleBooks, loadBookFromFile, loadBookFromText, loadBookFromUrl, loadSampleBook, type SampleBookInfo } from '../reader/bookLoader';
 import { deleteBook, findLibraryBook, getBook, getProgress, listBooks, saveBook, saveProgress } from '../reader/library';
 import { ReaderView } from '../reader/readerView';
@@ -330,11 +331,14 @@ export class AppController {
 
   // Tracking state
   private readonly tracking = new TrackingStateMachine();
+  /** Whether the line tracker knows the reader's line (the pill's "Unsure of your line"). */
+  private readonly lineConfidence = new LineConfidenceWatch();
   private phase: SourcePhase = 'off';
   private phaseDetail: string | undefined;
   private status: TrackingStatus | null = null;
   private pillKey = '';
   private poorHintShown = false;
+  private unsureHintShown = false;
   private lastValidGazeAt = Number.NEGATIVE_INFINITY;
   private lastInputAt = Number.NEGATIVE_INFINITY;
 
@@ -1081,6 +1085,7 @@ export class AppController {
     if (e.lineIndex < 0) return;
     this.guidance.noteReading(e.t);
     if (this.sourceKind !== 'webcam') return;
+    this.lineConfidence.push(e);
     const pitch = this.layout?.linePitch ?? NaN;
     const sd = isTrackedLineEstimate(e) ? (e.driftSdY ?? NaN) : NaN;
     const pinned = e.probability >= PINNED_MIN_PROBABILITY && !(sd > PINNED_MAX_DRIFT_SD_LINES * pitch);
@@ -1115,6 +1120,8 @@ export class AppController {
   private resetPipeline(tracker: 'none' | 'auto' | 'fresh'): void {
     this.fixations.reset();
     this.pageEnd.reset();
+    // Even with the tracker kept (an in-place refresh), its confidence belongs to the old gaze model.
+    this.lineConfidence.reset();
     let keepDrift = false;
     const calibrated = tracker === 'fresh';
     if (tracker !== 'none') {
@@ -2399,6 +2406,7 @@ export class AppController {
     const now = performance.now();
     if (phase === 'running') {
       this.tracking.reset(now);
+      this.lineConfidence.reset();
       this.lastCameraFrameAt = now;
     }
     this.refreshTracking(now);
@@ -2418,6 +2426,7 @@ export class AppController {
       kind: this.sourceKind,
       autoScroll: this.store.get().autoScroll,
       detail: this.phaseDetail,
+      lineUnsure: this.lineConfidence.unsure,
       ...(this.cameraHeld() ? { holdReason: CAMERA_HOLD_REASON } : {}),
     });
     const cameraOn = this.camera?.running ?? false;
@@ -2432,6 +2441,8 @@ export class AppController {
     this.bus.emit('tracking-state', status);
     if (status.state === 'poor' && !this.poorHintShown) this.timers.set('poor-hint', () => this.showPoorHint(), POOR_HINT_AFTER_MS);
     else if (status.state !== 'poor') this.timers.clear('poor-hint');
+    // The state itself takes 10 s of reading to set in and stays at least 15 s: no wait for this one.
+    if (status.state === 'unsure' && !this.unsureHintShown) this.showUnsureHint();
   }
 
   private showPoorHint(): void {
@@ -2440,8 +2451,21 @@ export class AppController {
     this.toasts.show({
       id: 'poor',
       tone: 'warn',
-      title: 'Tracking is a little unsure',
+      title: 'Tracking is a little shaky',
       message: 'More light on your face, and sitting about an arm’s length away, usually help.',
+      actions: [{ label: 'Recalibrate', run: () => this.recalibrate() }],
+    });
+  }
+
+  /** Once a session: why pages may stop turning by themselves while the tracker can't tell the lines apart. */
+  private showUnsureHint(): void {
+    if (this.status?.state !== 'unsure' || this.unsureHintShown) return;
+    this.unsureHintShown = true;
+    this.toasts.show({
+      id: 'unsure',
+      tone: 'warn',
+      title: 'Not sure which line you’re on',
+      message: 'Pages may not turn by themselves for now: press Space for the next one. More light on your face, or recalibrating, usually helps.',
       actions: [{ label: 'Recalibrate', run: () => this.recalibrate() }],
     });
   }

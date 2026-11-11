@@ -177,6 +177,8 @@ export interface RigOptions {
   tracker?: () => LineTracker;
   onStep?: (step: RigStep) => void;
   onFixation?: (fix: RigFixation) => void;
+  /** The reading layer started over (a reopened book, a calibration refresh), as the app's resetPipeline does it. */
+  onReset?: (t: number) => void;
 }
 
 export function runSession(scenario: Scenario, seed: number, opts: { minutes?: number } & RigOptions = {}): SessionMetrics {
@@ -364,6 +366,7 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
       detector.reset();
       detector.notifyScrolled(wf.t);
       driftWatch.reset();
+      opts.onReset?.(wf.t);
       wasBlocked = false;
       pageSweeps = 0;
       pageStartDocTop = null;
@@ -413,6 +416,7 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
           detector.notifyScrolled(world.t); // resetPipeline('none') after the refresh, as in the app
           tracker.appearanceChangedAt(world.t);
           driftWatch.reset();
+          opts.onReset?.(world.t);
           guidance.noteFixed(world.t);
           continue;
         }

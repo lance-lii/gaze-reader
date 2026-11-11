@@ -204,6 +204,7 @@ describe('one-shot message guards', () => {
     const on = { ...PAGE_OFF, enabled: true, tracking: 'tracking', source: 'webcam', calibrated: true, fps: 30 };
     expect(isPageState(on)).toBe(true);
     expect(isPageState({ ...on, tracking: 'confused' })).toBe(false);
+    expect(isPageState({ ...on, tracking: 'unsure' })).toBe(true);
     expect(isPageState({ ...on, fps: Number.NaN })).toBe(false);
     expect(isPageState({ ...on, pageMode: true })).toBe(true);
     expect(isPageState({ ...on, pageMode: 'yes' })).toBe(false);

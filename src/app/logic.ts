@@ -66,6 +66,8 @@ export interface TrackingContext {
   detail?: string;
   /** Automatic page turns are held for this reason (whatever the auto-scroll setting): the pill says it. */
   holdReason?: string;
+  /** The line tracker has been unsure of the reader's line for a while (LineConfidenceWatch). */
+  lineUnsure?: boolean;
 }
 
 /** The detail of a plain auto-scroll pause (the pill then says how to resume). */
@@ -85,9 +87,9 @@ export interface SampleLike {
 
 /**
  * Derives the user-facing tracking state from the source lifecycle and the
- * stream of gaze samples. `no-face` and `poor` only apply to the webcam: a
- * mouse pointer leaving the window or the demo reader idling is not a
- * tracking problem, and Dewey shouldn't fret about it.
+ * stream of gaze samples. `no-face`, `poor` and `unsure` only apply to the
+ * webcam: a mouse pointer leaving the window or the demo reader idling is not
+ * a tracking problem, and Dewey shouldn't fret about it.
  */
 export class TrackingStateMachine {
   private readonly th: TrackingThresholds;
@@ -167,6 +169,7 @@ export class TrackingStateMachine {
     if (ctx.holdReason) return { state: 'paused', detail: ctx.holdReason };
     if (!ctx.autoScroll) return { state: 'paused', detail: AUTO_SCROLL_PAUSED };
     if (this.poor) return { state: 'poor', detail: 'Low tracking confidence' };
+    if (ctx.lineUnsure && ctx.kind === 'webcam') return { state: 'unsure', detail: 'Unsure of the line' };
     return { state: 'tracking' };
   }
 
@@ -224,10 +227,11 @@ export function statusPill(state: TrackingState, kind: GazeSourceKind | null, ca
     const why = detail && detail !== AUTO_SCROLL_PAUSED ? detail : 'Auto-scroll is paused. Press P to resume.';
     return { label: 'Paused', tone: 'idle', description: `${cam}${why}` };
   }
-  if (kind === 'mouse' && (state === 'tracking' || state === 'no-face' || state === 'poor')) {
+  const live = state === 'tracking' || state === 'no-face' || state === 'poor' || state === 'unsure';
+  if (kind === 'mouse' && live) {
     return { label: 'Mouse', tone: 'info', description: 'Following your mouse pointer instead of your eyes.' };
   }
-  if (kind === 'simulated' && (state === 'tracking' || state === 'no-face' || state === 'poor')) {
+  if (kind === 'simulated' && live) {
     return { label: 'Demo', tone: 'info', description: 'A simulated reader is reading this page.' };
   }
   switch (state) {
@@ -236,7 +240,13 @@ export function statusPill(state: TrackingState, kind: GazeSourceKind | null, ca
     case 'no-face':
       return { label: 'Looking for you', tone: 'warn', description: `${cam}Your face isn't visible to the camera.` };
     case 'poor':
-      return { label: 'Low confidence', tone: 'warn', description: `${cam}Tracking is unsure: try more light on your face, about an arm’s length from the screen.` };
+      return { label: 'Low confidence', tone: 'warn', description: `${cam}Tracking is shaky: try more light on your face, about an arm’s length from the screen.` };
+    case 'unsure':
+      return {
+        label: 'Unsure of your line',
+        tone: 'warn',
+        description: `${cam}Not sure which line you’re reading, so pages may not turn by themselves: press Space for the next one. More light on your face, or recalibrating (C), usually helps.`,
+      };
     case 'starting':
       return kind === 'webcam'
         ? { label: 'Starting camera', tone: 'info', description: `${cam}Getting the camera and face model ready.` }

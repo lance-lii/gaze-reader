@@ -12,6 +12,7 @@ import { TrackerError } from '../gaze/camera';
 import { CameraFeatureSource } from '../gaze/faceTracker';
 import { LightingWatch, type LightingWatchUpdate } from '../gaze/lighting';
 import { LineTracker } from '../reading/lineTracker';
+import { LineConfidenceWatch } from '../reading/lineConfidence';
 import { parseRecording } from './diagnostics';
 import { GuidanceGate, SustainedFlags } from './logic';
 import { FEATURE_NAMES } from '../gaze/features';
@@ -956,6 +957,40 @@ describe('AppController', () => {
     await until(() => camera.running() && camera.subscribers() >= 2, 'the restart');
     await sleep(100);
     expect(toastText()).not.toMatch(/A different camera/);
+  });
+
+  it('webcam: says when the line tracker has been unsure of the line for a while, and once how to turn the page meanwhile', { timeout: 20_000 }, async () => {
+    vi.spyOn(ReaderView.prototype, 'measureLayout').mockImplementation(() => layout(false));
+    const push = vi.spyOn(LineConfidenceWatch.prototype, 'push');
+    const reset = vi.spyOn(LineConfidenceWatch.prototype, 'reset');
+    let unsure = false;
+    vi.spyOn(LineConfidenceWatch.prototype, 'unsure', 'get').mockImplementation(() => unsure);
+    const { camera, states } = await readWithWebcam(calibratedModel());
+    expect(reset).toHaveBeenCalled(); // opening the book started the reading layer over
+    const frames = setInterval(() => camera.emit(webcamFrame()), 33);
+    try {
+      // Every fixation's line estimate reaches the watch (a steady gaze ends one every 600 ms).
+      await until(() => push.mock.calls.length > 0, 'a fixation to reach the watch', 5000);
+      expect(states.at(-1)?.state).toBe('tracking');
+      unsure = true;
+      await until(() => states.at(-1)?.state === 'unsure', 'the pill to say unsure');
+      expect(document.querySelector('.gr-pill__label')!.textContent).toBe('Unsure of your line');
+      await until(() => /Not sure which line you’re on/.test(toastText()), 'the hint');
+      expect(toastText()).toMatch(/press Space/);
+      // Sure again, then unsure again: the pill follows, and the hint isn't repeated.
+      document.querySelectorAll('.gr-toast').forEach((t) => t.remove());
+      unsure = false;
+      await until(() => states.at(-1)?.state === 'tracking', 'the pill to clear');
+      unsure = true;
+      await until(() => states.at(-1)?.state === 'unsure', 'unsure again');
+      await sleep(300);
+      expect(toastText()).not.toMatch(/Not sure which line/);
+      // Paused, the pill says so instead: no page is waiting on the line.
+      pressKey('p');
+      await until(() => states.at(-1)?.state === 'paused', 'the pause');
+    } finally {
+      clearInterval(frames);
+    }
   });
 
   it('webcam: a denied camera explains how to allow it and offers the mouse and the demo, without retrying', async () => {
