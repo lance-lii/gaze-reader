@@ -107,6 +107,12 @@ describe('PagePill', () => {
     expect(q('.gr-pill')!.classList.contains('gr-pill--quiet')).toBe(true);
     pill.setStatus(status({ state: 'no-face' }));
     expect(q('.gr-pill')!.classList.contains('gr-pill--quiet')).toBe(false);
+    // Unsure of the line: pages may not turn by themselves, so the pill says it and stays awake.
+    pill.setStatus(status({ state: 'unsure' }));
+    vi.advanceTimersByTime(10_000);
+    expect(q('.gr-pill-label')!.textContent).toBe('Unsure of your line');
+    expect(q('.gr-pill')!.dataset.tone).toBe('warn');
+    expect(q('.gr-pill')!.classList.contains('gr-pill--quiet')).toBe(false);
 
     const help = byLabel('Keyboard shortcuts')!;
     help.click();

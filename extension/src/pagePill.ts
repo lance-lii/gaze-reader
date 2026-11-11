@@ -345,6 +345,8 @@ function describe({ state, source, paused }: PillStatus): [Tone, string] {
       return ['warn', source === 'mouse' ? 'Point at the page to read' : "Can't see your eyes"];
     case 'poor':
       return ['warn', 'Tracking is shaky: more light helps'];
+    case 'unsure':
+      return ['warn', 'Unsure of your line'];
     case 'paused':
       return ['off', 'Auto-scroll paused'];
     case 'error':

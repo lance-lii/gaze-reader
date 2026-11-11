@@ -484,6 +484,34 @@ describe('PageSession lighting', () => {
     session.destroy();
   });
 
+  it('says when the tracker has been unsure of the line for a while, explains once how to turn the page, and clears when it is sure again', async () => {
+    const t = setup({ calibration: storedModel() });
+    const session = await start(t.deps);
+    const notify = vi.spyOn(PagePill.prototype, 'notify');
+    await t.cameraRunning();
+    let probability = 0.2;
+    let fixations = 0;
+    vi.spyOn(LineTracker.prototype, 'onFixation').mockImplementation(
+      (f): LineEstimate => ({ t: f.end, lineIndex: 8, probability, posterior: [], progressX: 0.5, lastSaccade: 'forward', driftY: 0, fixationsOnPage: ++fixations }),
+    );
+    const explained = () => notices(notify).filter((n) => /Not sure which line/.test(n.text));
+    await t.stream(6_000, reading);
+    expect(session.state()).toMatchObject({ tracking: 'tracking' }); // a few unsure seconds are nothing
+    await t.stream(14_000, reading);
+    expect(session.state()).toMatchObject({ tracking: 'unsure' });
+    expect(explained()).toHaveLength(1);
+    expect(explained()[0]!.text).toMatch(/Alt\+Shift\+↓ turns it/);
+
+    probability = 0.95;
+    await t.stream(20_000, reading);
+    expect(session.state()).toMatchObject({ tracking: 'tracking' });
+    probability = 0.2;
+    await t.stream(20_000, reading);
+    expect(session.state()).toMatchObject({ tracking: 'unsure' });
+    expect(explained()).toHaveLength(1); // once a session
+    session.destroy();
+  });
+
   it('keeps the learned offset when the camera comes back or Gaze Reader is turned on again, not after a new calibration', async () => {
     const t = setup({ calibration: storedModel() });
     const session = await start(t.deps);

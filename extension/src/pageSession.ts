@@ -40,6 +40,7 @@ import { FEATURE_NAMES } from '../../src/gaze/features';
 import { CalibrationOverlay, type CalibrationMode } from '../../src/ui/calibrationOverlay';
 import { FixationDetector } from '../../src/signal/fixations';
 import { LineTracker } from '../../src/reading/lineTracker';
+import { LineConfidenceWatch } from '../../src/reading/lineConfidence';
 import { PageEndDetector, lastFullyVisibleLine } from '../../src/reading/pageEndDetector';
 import { measureLines } from '../../src/reader/lineGeometry';
 import { ScrollController } from '../../src/reader/scrollController';
@@ -282,6 +283,9 @@ export class PageSession {
   private confidence = 1;
   /** When the smoothed confidence dropped under the "poor" threshold (null while above it). */
   private lowSince: number | null = null;
+  /** Whether the line tracker knows the reader's line (the pill's "Unsure of your line"), on text only. */
+  private readonly lineConfidence = new LineConfidenceWatch();
+  private unsureExplained = false;
   private readingMs = 0;
   private totalReadingMs = 0;
   private lastProgressAt = 0;
@@ -646,6 +650,8 @@ export class PageSession {
     this.readingMode = mode;
     this.bindScroller(this.pickScroller());
     this.fixations.reset();
+    // Page mode has no lines to be unsure of; back on text, the confidence starts over.
+    this.lineConfidence.reset();
     this.pageEnd.notifyScrolled(performance.now()); // no turn on the very first sample of the new mode
     this.refreshState();
     if (mode !== 'page' || pageModeExplained) return;
@@ -1228,6 +1234,7 @@ export class PageSession {
     const model = this.model;
     if (this.sourceKind !== 'webcam' || !model || this.readingMode !== 'text') return;
     this.driftOwner = { trainedAt: model.trainedAt, at: performance.now() };
+    this.lineConfidence.push(estimate);
     const pitch = this.layout?.linePitch ?? 0;
     const offer = this.paused ? null : this.touchUp.onEstimate(estimate, pitch);
     if (offer) this.offerTouchUp(offer);
@@ -1271,6 +1278,7 @@ export class PageSession {
     this.fixations.reset();
     this.tracker.reset(!keepDrift && opts.calibrated === true ? { keepDrift, calibrated: true } : { keepDrift });
     this.pageEnd.reset();
+    this.lineConfidence.reset();
     if (this.layout) this.tracker.setLayout(this.layout, 'initial');
     // Fresh baselines, so the watchdogs don't report "no face" before the first frame.
     this.lastValidAt = performance.now();
@@ -1292,10 +1300,24 @@ export class PageSession {
       const poor =
         this.base === 'poor' ? this.confidence < 0.4 : this.lowSince !== null && now - this.lowSince >= POOR_AFTER_MS;
       if (poor) this.setBase('poor', this.poorDetail());
+      else if (this.lineConfidence.unsure) this.setUnsure();
       else this.setBase('tracking');
     } else if (now - this.lastValidAt > 1_000) {
       this.setBase('no-face');
     }
+  }
+
+  /** The line tracker can't tell the lines apart: say so, and once a session how to turn the page meanwhile. */
+  private setUnsure(): void {
+    this.setBase('unsure');
+    if (this.unsureExplained) return;
+    this.unsureExplained = true;
+    this.pill.notify({
+      text: 'Not sure which line you’re on, so the page may not turn by itself: Alt+Shift+↓ turns it. More light on your face, or recalibrating, usually helps.',
+      tone: 'warn',
+      actions: [{ label: 'Recalibrate', run: () => this.recalibrate() }],
+      timeoutMs: 15_000,
+    });
   }
 
   /** "Shaky" plus what the lighting measurements say is wrong, when they say something. */
@@ -1443,7 +1465,7 @@ export class PageSession {
 
 /** States in which live gaze quality decides what we show. */
 function isLiveState(s: TrackingState): boolean {
-  return s === 'tracking' || s === 'no-face' || s === 'poor';
+  return s === 'tracking' || s === 'no-face' || s === 'poor' || s === 'unsure';
 }
 
 function countWords(text: string): number {

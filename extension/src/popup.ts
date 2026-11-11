@@ -359,6 +359,8 @@ function describePage(page: PageState, restricted: boolean): ['ok' | 'warn' | 'e
     case 'poor':
       // The page words what the light measurements blame ("Shaky: bright light behind you").
       return ['warn', page.detail ?? 'Tracking is shaky: try more light'];
+    case 'unsure':
+      return ['warn', 'Unsure which line you’re on'];
     case 'paused':
       return ['off', page.detail ?? 'Auto-scroll paused'];
     case 'error':

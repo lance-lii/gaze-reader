@@ -85,6 +85,13 @@ describe('popup', () => {
     expect($('#status').textContent).toBe('Reading along · 30 fps');
   });
 
+  it('says when the page is unsure which line the reader is on', async () => {
+    const c = installChrome();
+    c.pageAnswers.push({ ...ON, tracking: 'unsure' });
+    await openPopup();
+    expect($('#status').textContent).toBe('Unsure which line you’re on');
+  });
+
   it('explains pages Chrome never lets extensions touch, and disables the switch', async () => {
     installChrome({ url: 'chrome://extensions/' });
     await openPopup();

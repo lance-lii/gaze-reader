@@ -45,6 +45,20 @@ position sat a line or two off after shifting in the chair, and page turns came 
   seeds it wasn't tuned on (27 hours), fixations on the right line went from 71 % to 75 % and
   those on a wrong line with the tracker sure of itself from 5.1 % to 3.9 %; unintended page turns
   fell from 7.0 to 6.1 an hour and missed ones from 20 % to 15 % of pages.
+- **The status pill says when it isn't sure which line you're on.** Before, a page that didn't
+  turn just didn't, with nothing to say why. Now, once the reading layer has been unsure of your
+  line for about 10 seconds of reading, the pill says **Unsure of your line** instead of
+  "Tracking". The first time in a session, a message explains that pages may not turn by
+  themselves for now, that Space turns one (Alt+Shift+↓ in the extension), and that more light on
+  your face or a recalibration usually helps. The pill goes back to normal after 5 seconds of
+  steady tracking. Once it appears it stays at least 15 seconds, so it doesn't flicker. In the
+  end-to-end simulation, on seeds it wasn't tuned on (an hour per scenario), it shows about 1 % of
+  the time in clean light and in everyday reading (about twice an hour), and 88 % of the time with
+  a noisy webcam. There the reading layer is on your line for only about one fixation in five, and
+  93 % of the pages missed were missed while the pill said so (56 % of the missed pages over all
+  scenarios). Page turning itself is unchanged. The "Low confidence"
+  pill, which means the camera can't see your eyes well, now says "shaky" rather than "unsure",
+  so the two don't read alike.
 - **A glance at your phone no longer turns the page.** Looking below the page turns it
   (glance-down), but whenever the reading layer wasn't sure which line you were on, any look down
   counted: a glance at your phone or the keyboard mid-page, or the gaze dipping below the page
@@ -172,6 +186,9 @@ position sat a line or two off after shifting in the chair, and page turns came 
   The noisiest scenarios count three shorter sessions instead of one long one: an early difference
   can send one long session down a much worse path (one dim hour swung from 14 to 37 missed pages
   where three 20-minute sessions stayed at 30).
+- **A gate for "Unsure of your line".** `tests/endToEnd.unsure.test.ts` checks, on fixed seeds,
+  that the pill is up most of the time with a noisy webcam, and covers most of the pages missed
+  there, and that it stays down in clean light and everyday reading.
 
 ### Development
 
@@ -179,7 +196,9 @@ position sat a line or two off after shifting in the chair, and page turns came 
   in every scenario of the end-to-end simulation, how often the tracker is on the line the reader
   is really reading, how often it is wrong while sure of itself, and how often it puts the reader on
   the last line while they are two or more lines above it (the kind of error that turns pages
-  early), apart from what the page-end detector then does with it.
+  early), apart from what the page-end detector then does with it. It also scores the pill's
+  "Unsure of your line": how often it is up, how often the tracker is on the line with it up and
+  without, and how many of the missed pages were missed while it was up.
 
 ## 1.1.0 (unreleased, 2026-09-25)
 

@@ -241,6 +241,12 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
      before looking down, look back at the end of the last line first: in the end-to-end simulation
      that pause is where most of the missed turns are.
 
+   When the tracker has been unsure which line you're on for about 10 seconds of reading (a noisy
+   webcam, dim light), the status pill says **Unsure of your line**: the first rule needs the
+   tracker to be sure of the last line, so pages may not turn by themselves then. Press Space to
+   turn one; more light on your face, or recalibrating, usually helps. It clears once tracking has
+   been steady for a few seconds.
+
    Guards prevent false turns: a cooldown after every scroll and after a book opens or a
    calibration ends, enough valid tracking in the last second (and tracking fast enough to follow
    the lines: at least 7 frames a second), some reading on the new page, and never a turn during a
@@ -329,7 +335,8 @@ src/core/                   Event bus, settings store, storage, constants
 src/gaze/                   Camera, MediaPipe face tracker, eye features, head pose,
                             ridge regression + calibration model, webcam and mouse gaze sources
 src/signal/                 One Euro filter, fixation detector, saccade classification
-src/reading/                Line tracker (HMM), page-end detector, simulated reader (demo + tests)
+src/reading/                Line tracker (HMM) and how sure it is of the line, page-end detector,
+                            simulated reader (demo + tests)
 src/reader/                 Book loading (txt/md/html/epub/pdf), sanitizer, library (IndexedDB),
                             reader view, line measurement, scroll controller
 src/buddy/                  Dewey: avatar, behaviour, quips, styles
