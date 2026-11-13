@@ -6,3 +6,4 @@ public/mediapipe/
 *.log
 .DS_Store
 release/
+.vexp/
