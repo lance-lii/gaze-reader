@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { reconstructBlocks, type PdfPageText, type PdfTextItem } from './pdf';
+import { layoutPdfPages, reconstructBlocks, takePdfSource, type PdfPageText, type PdfTextItem } from './pdf';
 
 const SIZE = 10;
 const CHAR_W = 5; // a monospaced stand-in: every character 5 units wide
@@ -195,5 +195,66 @@ describe('reconstructBlocks', () => {
     expect(blocks[0]).toEqual({ kind: 'heading', level: 2, text: 'PART ONE The Beginning of Things' });
     expect(blocks[1]).toEqual({ kind: 'heading', level: 3, text: 'A Smaller Section' });
     expect(blocks[2].kind).toBe('paragraph');
+  });
+});
+
+describe('layoutPdfPages (the pages view)', () => {
+  it('gives one box per line of a page, where the line is, in reading order', () => {
+    const [layout] = layoutPdfPages([
+      page([{ lines: ['The first line of the page runs on to here', 'and the second line ends sooner'] }, { lines: ['A second paragraph'], gapBefore: 10 }]),
+    ]);
+    expect(layout!.width).toBe(600);
+    expect(layout!.height).toBe(800);
+    expect(layout!.columns).toBe(false);
+    expect(layout!.lines.map((l) => l.text)).toEqual(['The first line of the page runs on to here', 'and the second line ends sooner', 'A second paragraph']);
+    const [first, second, third] = layout!.lines;
+    expect(first!.x0).toBe(LEFT + 15); // the paragraph indent
+    expect(second!.x0).toBe(LEFT);
+    expect(first!.y).toBe(100);
+    expect(second!.y).toBe(100 + PITCH);
+    expect(third!.y).toBe(100 + 2 * PITCH + 10);
+    expect(first!.size).toBe(SIZE);
+    // The box ends where the last word does.
+    expect(first!.x1).toBeCloseTo(LEFT + 15 + 'The first line of the page runs on to here'.length * CHAR_W, 6);
+    for (const l of layout!.lines) expect(l.x1).toBeGreaterThan(l.x0);
+  });
+
+  it('keeps running heads and folios (they are on the page), and flags a two-column page', () => {
+    const single = layoutPdfPages([page([{ lines: ['Body text of the page'] }], { head: 'THE RUNNING HEAD', folio: '12' })])[0]!;
+    expect(single.lines.map((l) => l.text)).toEqual(['THE RUNNING HEAD', 'Body text of the page', '12']);
+
+    const items: PdfTextItem[] = [];
+    for (let i = 0; i < 12; i++) {
+      items.push(...lineItems(`left column line number ${i}`, 60, 100 + i * PITCH));
+      items.push(...lineItems(`right column line number ${i}`, 330, 100 + i * PITCH));
+    }
+    const two = layoutPdfPages([{ width: 600, height: 800, items }])[0]!;
+    expect(two.columns).toBe(true);
+    // Reading order: the left column, then the right.
+    expect(two.lines[0]!.text).toBe('left column line number 0');
+    expect(two.lines[11]!.text).toBe('left column line number 11');
+    expect(two.lines[12]!.text).toBe('right column line number 0');
+  });
+
+  it('copes with empty and broken pages', () => {
+    expect(layoutPdfPages([])).toEqual([]);
+    const [empty, broken] = layoutPdfPages([
+      { width: 600, height: 800, items: [] },
+      { width: Number.NaN, height: 0, items: lineItems('text on a page without a size', 10, 10) },
+    ]);
+    expect(empty).toEqual({ width: 600, height: 800, columns: false, lines: [] });
+    expect(broken!.lines).toEqual([]);
+    expect(broken!.width).toBeGreaterThan(0);
+    expect(broken!.height).toBeGreaterThan(0);
+    // Text outside the page, and absurdly long lines.
+    const [odd] = layoutPdfPages([
+      { width: 600, height: 800, items: [...lineItems('off the page', 700, 100), { str: 'x'.repeat(2000), x: 10, y: 200, width: 500, height: 10 }] },
+    ]);
+    expect(odd!.lines).toHaveLength(1);
+    expect(odd!.lines[0]!.text).toHaveLength(400);
+  });
+
+  it('takePdfSource hands nothing out for books it never parsed', () => {
+    expect(takePdfSource('no-such-book')).toBeNull();
   });
 });

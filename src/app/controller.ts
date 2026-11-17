@@ -56,7 +56,10 @@ import { WebcamGazeSource } from '../gaze/webcamGazeSource';
 import { isTrackedLineEstimate } from '../reading/lineTracker';
 import { LineConfidenceWatch } from '../reading/lineConfidence';
 import { listSampleBooks, loadBookFromFile, loadBookFromText, loadBookFromUrl, loadSampleBook, type SampleBookInfo } from '../reader/bookLoader';
-import { deleteBook, findLibraryBook, getBook, getProgress, listBooks, saveBook, saveProgress } from '../reader/library';
+import { LibraryError, deleteBook, findLibraryBook, getBook, getProgress, listBooks, saveBook, saveProgress } from '../reader/library';
+import type { PdfDocumentHandle, PdfSource } from '../reader/pdf';
+import { deletePdfSource, getPdfSource, hasPdfSource, savePdfSource } from '../reader/pdfStore';
+import type { PagesSource } from '../reader/readerView';
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
 import { LineTracker } from '../reading/lineTracker';
@@ -182,6 +185,20 @@ const APPEARANCE_DEBUG_MS = 250;
 const UPGRADE_EXPLAINED_KEY = 'calibrationUpgradeExplained.v1';
 /** The browser's id for the camera the saved calibration was made with, and others the reader chose to read with: `{ deviceId, accepted? }`. */
 const CALIBRATION_CAMERA_KEY = 'calibrationCamera.v1';
+/** Per book (the id follows): which view of a PDF the reader chose, and that the pages view was pointed out once. */
+const PDF_VIEW_PREFIX = 'pdfView.';
+const PDF_VIEW_OFFERED_PREFIX = 'pdfViewOffered.';
+
+/** The view this reader last chose for a PDF: its text unless they asked for its pages. */
+function pdfViewOf(bookId: string): 'pages' | 'text' {
+  return readJSON<unknown>(`${PDF_VIEW_PREFIX}${bookId}`, null) === 'pages' ? 'pages' : 'text';
+}
+
+/** An opened PDF: what the pages view shows, and the file handle to close afterwards. */
+interface OpenPdfPages {
+  handle: PdfDocumentHandle;
+  source: PagesSource;
+}
 /** What the status pill says while page turns wait for the reader's choice after a camera switch. */
 const CAMERA_HOLD_REASON = 'Page turns wait: this isn’t the camera you calibrated with. Press C to recalibrate, or P for the choices.';
 
@@ -282,6 +299,10 @@ export class AppController {
   private scroll: ScrollController | null = null;
   private layout: LineLayout | null = null;
   private session: ReadingSession | null = null;
+  /** The open PDF's file, while its own pages are shown (the pages view draws from it). */
+  private pdfDoc: PdfDocumentHandle | null = null;
+  /** The open book is a PDF whose original file is kept: it can be shown as pages or as text. */
+  private pdfAvailable = false;
   private openSeq = 0;
   private samples: readonly SampleBookInfo[] | null = null;
   private hasRecent = false;
@@ -744,6 +765,9 @@ export class AppController {
   }
 
   private async openBook(book: Book, seq: number): Promise<void> {
+    // A PDF that was just read from a file: its original, for the pages view (collected under the
+    // id the parser gave the book, before that id may change below).
+    const freshPdf = book.format === 'pdf' ? await this.collectPdfSource(book.id) : null;
     // Opened before, maybe rendered differently by an earlier version (a new id): keep that entry
     // and its reading position instead of adding a second copy.
     try {
@@ -761,6 +785,13 @@ export class AppController {
       await saveBook(book);
     } catch (err) {
       console.warn('[app] could not save the book to the library', err);
+      // Reading goes on, but say so: otherwise the book is simply missing from the library next time.
+      this.toasts.show({
+        id: 'library-save',
+        tone: 'warn',
+        message: `${err instanceof LibraryError ? err.message : 'This book couldn’t be saved to your library.'} You can read it now, but it won’t be in your library next time.`,
+        durationMs: 12_000,
+      });
     }
     let position: ReadingPosition | null = null;
     try {
@@ -768,14 +799,27 @@ export class AppController {
     } catch {
       position = null;
     }
-    if (seq !== this.openSeq || this.destroyed) return;
+    // A PDF's own pages: kept with a book just read, or from an earlier visit; shown when this
+    // reader chose the pages view for this book.
+    let pdfAvailable = false;
+    let pages: OpenPdfPages | null = null;
+    if (book.format === 'pdf') {
+      if (freshPdf) await savePdfSource(book.id, freshPdf).catch(() => false);
+      pdfAvailable = freshPdf !== null || (await hasPdfSource(book.id).catch(() => false));
+      if (pdfAvailable && pdfViewOf(book.id) === 'pages') pages = await this.loadPdfPages(book.id, freshPdf);
+    }
+    if (seq !== this.openSeq || this.destroyed) {
+      pages?.handle.destroy();
+      return;
+    }
 
     this.endSession();
     this.closePanels();
     // Show the reader before rendering: position restore needs a laid-out scroller.
     this.showScreen('reader');
     try {
-      this.reader.open(book, position);
+      this.renderBook(book, position, pages);
+      this.pdfAvailable = pdfAvailable;
     } catch (err) {
       try {
         this.reader.close();
@@ -792,6 +836,105 @@ export class AppController {
       throw err;
     }
     this.startSession(book, position);
+    if (pdfAvailable && !pages) this.offerPdfPages(book);
+  }
+
+  /** Puts the book on screen: a PDF's own pages when they were asked for and could be opened, its text otherwise. */
+  private renderBook(book: Book, position: ReadingPosition | null, pages: OpenPdfPages | null): void {
+    if (!pages) {
+      this.reader.open(book, position);
+      return;
+    }
+    this.pdfDoc = pages.handle;
+    try {
+      this.reader.openPages(book, pages.source, position);
+    } catch (err) {
+      this.pdfDoc = null;
+      pages.handle.destroy();
+      throw err;
+    }
+  }
+
+  /** The original of a PDF the loader has just parsed (pdf.js and its helpers load only for PDFs). */
+  private async collectPdfSource(bookId: string): Promise<PdfSource | null> {
+    try {
+      const { takePdfSource } = await import('../reader/pdf');
+      return takePdfSource(bookId);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Opens the kept original of a PDF for drawing its pages; null (with a message) when that fails. */
+  private async loadPdfPages(bookId: string, fresh: PdfSource | null = null): Promise<OpenPdfPages | null> {
+    try {
+      const source = fresh ?? (await getPdfSource(bookId));
+      if (!source) return null;
+      const { openPdfDocument } = await import('../reader/pdf');
+      const handle = await openPdfDocument(source.bytes);
+      return {
+        handle,
+        source: { pages: source.pages, render: (i, canvas, width, ratio) => handle.render(i, canvas, width, ratio), cancel: (canvas) => handle.cancel(canvas) },
+      };
+    } catch (err) {
+      console.warn('[app] could not open the PDF’s pages', err);
+      this.toasts.show({ id: 'pdf-pages', tone: 'warn', message: 'This PDF’s original pages couldn’t be opened, so here is its text.' });
+      return null;
+    }
+  }
+
+  /** Once per book: a PDF opens as text (the best page turning); say that its own pages are a key away. */
+  private offerPdfPages(book: Book): void {
+    const key = `${PDF_VIEW_OFFERED_PREFIX}${book.id}`;
+    if (readJSON<unknown>(key, null) !== null) return;
+    writeJSON(key, 1);
+    this.toasts.show({
+      id: 'pdf-pages',
+      message: 'This PDF is shown as plain text, which the eye tracker follows best. Its original pages, with figures and layout, are one key away: V.',
+      actions: [{ label: 'Show the pages', primary: true, run: () => void this.togglePdfView() }],
+      durationMs: 12_000,
+    });
+  }
+
+  /** V, or the top bar's button: the open PDF as its own pages, or back to its text. The reader keeps their place. */
+  private async togglePdfView(): Promise<void> {
+    const session = this.session;
+    if (!session || this.calibration || this.turning) return;
+    const book = session.book;
+    if (book.format !== 'pdf' || !this.pdfAvailable) {
+      this.toasts.show({
+        id: 'pdf-pages',
+        message:
+          book.format === 'pdf'
+            ? 'The original pages of this PDF aren’t kept on this device. Open the file again to see them.'
+            : 'Only PDFs have original pages to switch to.',
+      });
+      return;
+    }
+    const next = this.reader.view === 'pages' ? 'text' : 'pages';
+    const seq = ++this.openSeq;
+    const pages = next === 'pages' ? await this.loadPdfPages(book.id) : null;
+    if (seq !== this.openSeq || this.destroyed || this.session !== session) {
+      pages?.handle.destroy();
+      return;
+    }
+    if (next === 'pages' && !pages) return; // loadPdfPages said why
+    // The same place in the other view: by how far through the book it is (the two views have
+    // different paragraphs to anchor to).
+    const at = this.reader.getPosition();
+    const position: ReadingPosition | null = at ? { bookId: book.id, fraction: at.fraction, updatedAt: Date.now() } : null;
+    writeJSON(`${PDF_VIEW_PREFIX}${book.id}`, next);
+    this.toasts.dismiss('pdf-pages');
+    this.endSession();
+    try {
+      this.renderBook(book, position, pages);
+    } catch (err) {
+      console.warn('[app] could not switch the PDF’s view', err);
+      this.reader.open(book, position);
+    }
+    this.pdfAvailable = true;
+    this.startSession(book, position);
+    if (position) void saveProgress(position).catch(() => undefined);
   }
 
   private closeBook(): void {
@@ -819,9 +962,15 @@ export class AppController {
     const index = Math.max(0, cards.findIndex((c) => c.contains(document.activeElement)));
     let book: Book | null = null;
     let progress: ReadingPosition | null = null;
+    let pdf: PdfSource | null = null;
     try {
       [book, progress] = await Promise.all([getBook(id), getProgress(id)]);
+      // A PDF's original goes with the book, and comes back with Undo.
+      if (book?.format === 'pdf') pdf = await getPdfSource(id).catch(() => null);
       await deleteBook(id);
+      await deletePdfSource(id);
+      removeKey(`${PDF_VIEW_PREFIX}${id}`);
+      removeKey(`${PDF_VIEW_OFFERED_PREFIX}${id}`);
     } catch (err) {
       console.warn('[app] could not remove the book', err);
       this.toasts.show({ tone: 'error', message: `Couldn’t remove “${title}”.` });
@@ -833,16 +982,17 @@ export class AppController {
     this.toasts.show({
       id: `removed:${id}`,
       message: `Removed “${title}” from this device.`,
-      actions: saved ? [{ label: 'Undo', primary: true, run: () => void this.restoreBook(saved, progress) }] : [],
+      actions: saved ? [{ label: 'Undo', primary: true, run: () => void this.restoreBook(saved, progress, pdf) }] : [],
       // Long enough for a keyboard or screen-reader user to reach Undo (WCAG 2.2.1).
       durationMs: 20_000,
     });
   }
 
-  private async restoreBook(book: Book, progress: ReadingPosition | null): Promise<void> {
+  private async restoreBook(book: Book, progress: ReadingPosition | null, pdf: PdfSource | null = null): Promise<void> {
     try {
       await saveBook(book);
       if (progress) await saveProgress(progress);
+      if (pdf) await savePdfSource(book.id, pdf);
     } catch (err) {
       console.warn('[app] could not restore the book', err);
       this.toasts.show({ tone: 'error', message: `Couldn’t restore “${book.title}”.` });
@@ -871,6 +1021,7 @@ export class AppController {
     this.pendingOffer = null;
     this.pendingCoach = null;
     this.topbar.setBook(book);
+    this.topbar.setPdfView(this.pdfAvailable ? this.reader.view : null);
     document.title = `${book.title} · Gaze Reader`;
     this.focusReader();
     this.bus.emit('book-opened', {
@@ -908,6 +1059,10 @@ export class AppController {
     this.pendingUndo = false;
     this.scrollSettling = false;
     this.reader.close();
+    this.pdfDoc?.destroy();
+    this.pdfDoc = null;
+    this.pdfAvailable = false;
+    this.topbar.setPdfView(null);
     this.layout = null;
     // The line tracker keeps its drift for the next book (startSession decides whether it fits).
     this.resetPipeline('none');
@@ -2595,6 +2750,9 @@ export class AppController {
         break;
       case 'check-accuracy':
         this.checkAccuracy();
+        break;
+      case 'toggle-pdf-view':
+        void this.togglePdfView();
         break;
     }
   }

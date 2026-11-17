@@ -210,6 +210,81 @@ function pageLines(page: PdfPageText, pageIndex: number): Line[] {
   ];
 }
 
+// ───────────────────────────── Page layouts (the pages view) ─────────────────────────────
+
+/** One line of text on a PDF page, in page units (the page is `width` × `height`, y grows downwards). */
+export interface PdfLineBox {
+  x0: number;
+  x1: number;
+  /** Baseline. */
+  y: number;
+  /** Font size: the line's box is taken to reach from y − 0.8 × size to y + 0.25 × size. */
+  size: number;
+  text: string;
+}
+
+/** What the pages view needs to know about one page besides its picture. */
+export interface PdfPageLayout {
+  width: number;
+  height: number;
+  /**
+   * The page is set in two columns. Its `lines` are in reading order (heading, left column, right
+   * column, foot), but lines of the two columns share heights, so they can't be followed as one
+   * top-to-bottom sequence: the pages view leaves such a page to the keyboard and to gestures.
+   */
+  columns: boolean;
+  lines: PdfLineBox[];
+}
+
+/** The original file and its pages' line boxes: kept beside the extracted text so the pages can be shown as they are. */
+export interface PdfSource {
+  bytes: ArrayBuffer;
+  pages: PdfPageLayout[];
+}
+
+/** PDFs larger than this are not kept for the pages view (browser storage is limited). */
+export const MAX_PDF_SOURCE_BYTES = 64 * 1024 * 1024;
+/** At most this many characters of a line are kept (a line box only needs to be found, not read from here). */
+const MAX_LINE_TEXT = 400;
+
+/** Line boxes of every page, in reading order. Pure: the same grouping the text reconstruction uses. */
+export function layoutPdfPages(pages: readonly PdfPageText[]): PdfPageLayout[] {
+  return pages.map((page, index) => {
+    const width = Number.isFinite(page.width) && page.width > 0 ? page.width : 0;
+    const height = Number.isFinite(page.height) && page.height > 0 ? page.height : 0;
+    if (!width || !height) return { width: width || 1, height: height || 1, columns: false, lines: [] };
+    const columns = findGutter(pagePieces(page), width) !== null;
+    const lines: PdfLineBox[] = [];
+    for (const l of pageLines(page, index)) {
+      // Inside the page, and wide enough to be a line rather than a stray mark.
+      if (!(l.x1 > l.x0) || l.y <= 0 || l.y - l.size > height || l.x1 <= 0 || l.x0 >= width) continue;
+      lines.push({ x0: Math.max(0, l.x0), x1: Math.min(width, l.x1), y: l.y, size: l.size, text: l.text.slice(0, MAX_LINE_TEXT) });
+    }
+    return { width, height, columns, lines };
+  });
+}
+
+/** Sources of PDFs parsed in this page load, until whoever opens the book collects them (by the parsed book's id). */
+const pendingSources = new Map<string, PdfSource>();
+const MAX_PENDING_SOURCES = 2;
+
+/**
+ * The source of a PDF that parsePdf produced a book with this id from, once: the caller stores it
+ * with the book (library.savePdfSource). Null for anything else, or when the file was too large.
+ */
+export function takePdfSource(bookId: string): PdfSource | null {
+  const source = pendingSources.get(bookId) ?? null;
+  pendingSources.delete(bookId);
+  return source;
+}
+
+function rememberSource(bookId: string, source: PdfSource): void {
+  pendingSources.delete(bookId);
+  pendingSources.set(bookId, source);
+  // Books that were parsed and never opened (a newer request won) don't pile up.
+  while (pendingSources.size > MAX_PENDING_SOURCES) pendingSources.delete(pendingSources.keys().next().value as string);
+}
+
 /**
  * A folio: "12", "Page 12 of 300", "– 12 –", or front-matter Roman numerals — only
  * well-formed ones, so a lone word such as "civil", "mild" or "vivid" at the edge of a
@@ -512,7 +587,7 @@ export async function parsePdf(data: ArrayBuffer, opts: ParseOptions = {}): Prom
     const meta = await doc.getMetadata().catch(() => null);
     const infoTitle = metadataString(meta?.info, 'Title');
     const firstHeading = blocks.find((b) => b.kind === 'heading')?.text ?? null;
-    return finalizeBook(
+    const book = finalizeBook(
       {
         title: infoTitle && !JUNK_TITLE.test(infoTitle) ? infoTitle : firstHeading ? tameShouting(firstHeading) : null,
         author: metadataString(meta?.info, 'Author'),
@@ -521,9 +596,92 @@ export async function parsePdf(data: ArrayBuffer, opts: ParseOptions = {}): Prom
       },
       blocksToDrafts(blocks),
     );
+    // pdf.js was handed a copy, so `data` is still whole: keep it for the pages view. (Not in the
+    // Artifact frame, whose content policy doesn't let pdf.js load a document's embedded fonts.)
+    if (!IS_ARTIFACT && data.byteLength > 0 && data.byteLength <= MAX_PDF_SOURCE_BYTES) {
+      rememberSource(book.id, { bytes: data, pages: layoutPdfPages(pages) });
+    }
+    return book;
   } catch (err) {
     throw err instanceof BookLoadError ? err : pdfError(err);
   } finally {
     void task.destroy();
   }
+}
+
+// ─────────────────────────────── Page pictures ───────────────────────────────
+
+/** An open PDF that draws its pages (the pages view). */
+export interface PdfDocumentHandle {
+  readonly pageCount: number;
+  /**
+   * Draws page `index` (0-based) into `canvas`, `cssWidth` CSS px wide at `pixelRatio` device px
+   * per CSS px (the canvas is resized to fit). Resolves true when the page was drawn, false when
+   * the drawing was cancelled (by `cancel`, a newer render into the same canvas, or `destroy`).
+   */
+  render(index: number, canvas: HTMLCanvasElement, cssWidth: number, pixelRatio: number): Promise<boolean>;
+  /** Stops the drawing into `canvas`, if one is running. */
+  cancel(canvas: HTMLCanvasElement): void;
+  destroy(): void;
+}
+
+/** A page is never drawn larger than this many device px (a canvas that size is ≈ 64 MB). */
+const MAX_PAGE_PIXELS = 16_000_000;
+
+/** Opens a PDF for drawing. Rejects with a BookLoadError when it can't be read. */
+export async function openPdfDocument(bytes: ArrayBuffer): Promise<PdfDocumentHandle> {
+  const pdfjs = await loadPdfJs();
+  // pdf.js detaches the buffer it is given: hand it a copy, the caller keeps theirs.
+  const task = pdfjs.getDocument({ data: new Uint8Array(bytes.slice(0)), verbosity: 0, stopAtErrors: false });
+  let doc: Awaited<typeof task.promise>;
+  try {
+    doc = await task.promise;
+  } catch (err) {
+    void task.destroy();
+    throw pdfError(err);
+  }
+  let destroyed = false;
+  const running = new Map<HTMLCanvasElement, { cancel(): void }>();
+  return {
+    pageCount: doc.numPages,
+    async render(index, canvas, cssWidth, pixelRatio) {
+      if (destroyed || !(cssWidth > 0) || index < 0 || index >= doc.numPages) return false;
+      running.get(canvas)?.cancel();
+      const page = await doc.getPage(index + 1);
+      if (destroyed) return false;
+      const base = page.getViewport({ scale: 1 });
+      let scale = (cssWidth / base.width) * (pixelRatio > 0 ? pixelRatio : 1);
+      const pixels = base.width * base.height * scale * scale;
+      if (pixels > MAX_PAGE_PIXELS) scale *= Math.sqrt(MAX_PAGE_PIXELS / pixels);
+      const viewport = page.getViewport({ scale });
+      canvas.width = Math.max(1, Math.floor(viewport.width));
+      canvas.height = Math.max(1, Math.floor(viewport.height));
+      // Pictures only: no link or form annotations are drawn, and nothing in the file is run.
+      const task = page.render({ canvas, viewport, annotationMode: pdfjs.AnnotationMode.DISABLE });
+      const entry = { cancel: () => task.cancel() };
+      running.set(canvas, entry);
+      try {
+        await task.promise;
+        return !destroyed;
+      } catch (err) {
+        const name = err && typeof err === 'object' && 'name' in err ? String((err as { name: unknown }).name) : '';
+        if (name === 'RenderingCancelledException') return false;
+        throw err;
+      } finally {
+        if (running.get(canvas) === entry) running.delete(canvas);
+        page.cleanup();
+      }
+    },
+    cancel(canvas) {
+      running.get(canvas)?.cancel();
+      running.delete(canvas);
+    },
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      for (const r of running.values()) r.cancel();
+      running.clear();
+      void task.destroy();
+    },
+  };
 }

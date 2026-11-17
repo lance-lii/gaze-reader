@@ -19,6 +19,7 @@ import { FEATURE_NAMES } from '../gaze/features';
 import { MouseGazeSource } from '../gaze/mouseGazeSource';
 import { loadBookFromText } from '../reader/bookLoader';
 import { getBook, listBooks, saveBook, saveProgress } from '../reader/library';
+import { savePdfSource } from '../reader/pdfStore';
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
 import { Toaster } from '../ui/toast';
@@ -61,6 +62,23 @@ vi.mock('../ui/calibrationOverlay', async (importOriginal) => {
   }
   return { ...m, CalibrationOverlay: ScriptedOverlay };
 });
+
+// The pages view draws a PDF with pdf.js; a test only needs to see that the file was opened and closed.
+const pdfDocs = vi.hoisted(() => ({ opened: 0, destroyed: 0 }));
+vi.mock('../reader/pdf', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../reader/pdf')>()),
+  openPdfDocument: () => {
+    pdfDocs.opened++;
+    return Promise.resolve({
+      pageCount: 2,
+      render: () => Promise.resolve(true),
+      cancel: () => undefined,
+      destroy: () => {
+        pdfDocs.destroyed++;
+      },
+    });
+  },
+}));
 
 const PITCH = 40;
 
@@ -251,6 +269,78 @@ describe('AppController', () => {
     await openPastedText(text);
     expect(opened.at(-1)).toMatchObject({ id: 'earlier-render', resumed: true });
     expect((await listBooks()).length).toBe(entries);
+  });
+
+  it('a PDF opens as text, V switches to its own pages and back, and the choice is remembered for that book', async () => {
+    const book: Book = { ...loadBookFromText('A paper about lamps and reading glasses. '.repeat(150), { source: 'paste' }), id: 'paper-1', title: 'A Paper', format: 'pdf', source: 'file' };
+    await saveBook(book);
+    await savePdfSource('paper-1', {
+      bytes: new Uint8Array([37, 80, 68, 70]).buffer,
+      pages: [
+        { width: 600, height: 800, columns: false, lines: [{ x0: 72, x1: 500, y: 100, size: 10, text: 'The first line of the paper' }] },
+        { width: 600, height: 800, columns: true, lines: [] },
+      ],
+    });
+    pdfDocs.opened = 0;
+    pdfDocs.destroyed = 0;
+    const reader = (): HTMLElement => document.querySelector<HTMLElement>('.gr-reader')!;
+    const pdfButton = (): HTMLButtonElement => document.querySelector<HTMLButtonElement>('.gr-topbar__pdf')!;
+    const press = (key: string): void => {
+      reader().dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+    };
+    const open = async (): Promise<void> => {
+      await (app as unknown as { openSaved(id: string): Promise<boolean> }).openSaved('paper-1');
+      await until(() => document.documentElement.dataset.screen === 'reader', 'the reader to open');
+    };
+
+    await open();
+    // As text first (what the eye tracker follows best), with the pages one key away.
+    expect(reader().dataset.view).toBeUndefined();
+    expect(pdfButton().hidden).toBe(false);
+    expect(pdfButton().getAttribute('aria-label')).toBe('Show this PDF’s original pages');
+    expect(toastText()).toContain('original pages');
+    expect(pdfDocs.opened).toBe(0);
+
+    const opened = record(app, 'book-opened');
+    press('v');
+    await until(() => reader().dataset.view === 'pages', 'the pages view');
+    expect(pdfDocs.opened).toBe(1);
+    expect(document.querySelectorAll('.gr-pdf-page')).toHaveLength(2);
+    expect(document.querySelector('.gr-pdf-line')!.textContent).toBe('The first line of the paper');
+    expect(pdfButton().getAttribute('aria-label')).toBe('Show this PDF as plain text');
+    expect(opened.at(-1)).toMatchObject({ id: 'paper-1' });
+    expect(toastText()).not.toContain('one key away');
+
+    // Back in the library and opened again: its pages, as the reader left it.
+    press('l');
+    await until(() => document.documentElement.dataset.screen === 'library', 'the library');
+    expect(pdfDocs.destroyed).toBe(1); // the file is closed with the book
+    await open();
+    expect(reader().dataset.view).toBe('pages');
+    expect(pdfDocs.opened).toBe(2);
+
+    pdfButton().click();
+    await until(() => reader().dataset.view === undefined, 'the text view');
+    expect(pdfDocs.destroyed).toBe(2);
+    expect(document.querySelector('.gr-pdf-page')).toBeNull();
+    expect(document.querySelectorAll('.gr-chapter').length).toBeGreaterThan(0);
+  });
+
+  it('books that aren’t PDFs have no pages to switch to, and a PDF whose file wasn’t kept says so', async () => {
+    await openPastedText();
+    const pdfButton = document.querySelector<HTMLButtonElement>('.gr-topbar__pdf')!;
+    expect(pdfButton.hidden).toBe(true);
+    document.querySelector<HTMLElement>('.gr-reader')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'v', bubbles: true, cancelable: true }));
+    await until(() => toastText().includes('Only PDFs'), 'the explanation');
+
+    const book: Book = { ...loadBookFromText('An older paper, saved before its pages were kept. '.repeat(120), { source: 'paste' }), id: 'paper-old', format: 'pdf', source: 'file' };
+    await saveBook(book);
+    await (app as unknown as { openSaved(id: string): Promise<boolean> }).openSaved('paper-old');
+    await until(() => document.title.includes('Pasted text') || document.querySelector('.gr-topbar__book')!.textContent !== '', 'the book to open');
+    expect(pdfButton.hidden).toBe(true);
+    document.querySelector<HTMLElement>('.gr-reader')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'v', bubbles: true, cancelable: true }));
+    await until(() => toastText().includes('aren’t kept on this device'), 'the explanation');
+    expect(document.querySelector<HTMLElement>('.gr-reader')!.dataset.view).toBeUndefined();
   });
 
   it('keeps books saved before they had a source key, and adds the key when one is opened again', async () => {
