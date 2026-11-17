@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { evaluateModel, GAZE_EXCLUDED_FEATURES, trainGazeModel, type RidgeGazeModel } from '../../src/gaze/calibrationModel';
+import { evaluateModel, fitPoseCompensation, GAZE_EXCLUDED_FEATURES, trainGazeModel, type RidgeGazeModel } from '../../src/gaze/calibrationModel';
 import { FEATURE_NAMES } from '../../src/gaze/features';
 import type { CalibrationSample } from '../../src/types';
-import { BASE_POSE, calibrationSession, DEG, frameFeatures, gauss, headFollow, makeFrame, READING_POINTS, rng, VIEW, WORLDS, type NoiseSpec, type Pose, type WorldName } from './faceSim';
+import { BASE_POSE, calibrationSession, DEG, frameFeatures, gauss, headFollow, headMovementSession, makeFrame, neckPose, READING_POINTS, rng, VIEW, WORLDS, type NoiseSpec, type Pose, type WorldName } from './faceSim';
 import { LINE_PX, mean } from './harness';
 
 /**
@@ -21,11 +21,15 @@ import { LINE_PX, mean } from './harness';
  * - "pose": head yaw and pitch are excluded, roll and head position (tx, ty, tz, faceScale) still
  *   fitted. The corner-referenced iris already says where the eyes point relative to the camera,
  *   head turn included.
- * - "now": no head-pose feature is fitted (all in GAZE_EXCLUDED_FEATURES); a change of distance is
- *   corrected geometrically instead (DepthCompensation in calibrationModel.ts). The simulated
- *   camera sits 83 px above the middle of the viewport's top edge; the model assumes 136 px.
- * - "now, camera 4 cm off": the same with the camera assumed 170 px higher still (a guess that is
+ * - "no head step": no head-pose feature is fitted (all in GAZE_EXCLUDED_FEATURES); a change of
+ *   distance is corrected geometrically instead (DepthCompensation in calibrationModel.ts). The
+ *   simulated camera sits 83 px above the middle of the viewport's top edge; the model assumes 136 px.
+ * - "now": the same, after the calibration's head-movement step (eyes on the middle dot while the
+ *   head nods 6°, turns 7° and tilts 5° about the neck; PoseCompensation, fitPoseCompensation).
+ * - "now, camera 4 cm off": "now" with the camera assumed 170 px higher still (a guess that is
  *   badly off), to show what the assumption is worth.
+ *
+ * The last three postures are what readers end up in: both a turn and a move of the head.
  */
 
 const POSTURES: { label: string; delta: Partial<Pose> }[] = [
@@ -38,6 +42,10 @@ const POSTURES: { label: string; delta: Partial<Pose> }[] = [
   { label: 'chin +4°', delta: { pitch: 0 } },
   { label: 'turn 4°', delta: { yaw: 4 * DEG } },
   { label: 'tilt 4°', delta: { roll: 4 * DEG } },
+  // Postures people really end up in: both a turn and a move of the head.
+  { label: 'slouched', delta: { ...neckPose(BASE_POSE, 0, 6 * DEG, 0), ty: BASE_POSE.ty - 3, tz: BASE_POSE.tz - 3 } },
+  { label: 'head on hand', delta: { ...neckPose(BASE_POSE, 3 * DEG, 2 * DEG, 8 * DEG) } },
+  { label: 'chin −8°', delta: { pitch: 12 * DEG } },
 ];
 
 const VALIDATION = [
@@ -51,24 +59,33 @@ const VALIDATION = [
 ];
 
 const POSE = ['yaw', 'pitch', 'roll', 'tx', 'ty', 'tz', 'faceScale'];
-const CONFIGS: Record<string, { excluded: string[]; camera?: { x: number; y: number } }> = {
+const CONFIGS: Record<string, { excluded: string[]; camera?: { x: number; y: number }; headStep?: boolean }> = {
   '1.1': { excluded: [...GAZE_EXCLUDED_FEATURES].filter((n) => !POSE.includes(n)) },
   pose: { excluded: [...GAZE_EXCLUDED_FEATURES].filter((n) => !POSE.includes(n) || n === 'yaw' || n === 'pitch') },
-  now: { excluded: [...GAZE_EXCLUDED_FEATURES] },
-  'now, camera 4 cm off': { excluded: [...GAZE_EXCLUDED_FEATURES], camera: { x: VIEW.width / 2, y: -306 } },
+  'no head step': { excluded: [...GAZE_EXCLUDED_FEATURES] },
+  now: { excluded: [...GAZE_EXCLUDED_FEATURES], headStep: true },
+  'now, camera 4 cm off': { excluded: [...GAZE_EXCLUDED_FEATURES], camera: { x: VIEW.width / 2, y: -306 }, headStep: true },
 };
 
 const SEEDS = [1, 2, 3, 4, 5, 6, 7, 8];
 
-function train(samples: CalibrationSample[], cfg: { excluded: string[]; camera?: { x: number; y: number } }): { model: RidgeGazeModel; cv: number } {
-  const { model, report } = trainGazeModel(samples, {
+function train(
+  samples: CalibrationSample[],
+  cfg: { excluded: string[]; camera?: { x: number; y: number }; headStep?: boolean },
+  seed: number,
+  noise: NoiseSpec,
+): { model: RidgeGazeModel; cv: number; learned: boolean } {
+  const trained = trainGazeModel(samples, {
     viewport: { ...VIEW },
     maxBlink: 0.85,
     featureNames: FEATURE_NAMES,
     excludedFeatures: cfg.excluded,
     ...(cfg.camera ? { camera: cfg.camera } : {}),
   });
-  return { model, cv: report.meanErrorPx };
+  // The calibration's head-movement step: eyes on the middle dot, the head nods, turns and tilts.
+  const fitted = cfg.headStep ? fitPoseCompensation(trained.model, headMovementSession(seed, { noise }), { maxBlink: 0.85 }) : null;
+  if (fitted && !fitted.ok) console.log(`head step taught nothing (seed ${seed}): ${fitted.reason}`);
+  return { model: fitted?.ok ? fitted.model : trained.model, cv: trained.report.meanErrorPx, learned: !!fitted?.ok };
 }
 
 /** Mean prediction − target over the reading grid in `pose`, px. */
@@ -94,6 +111,7 @@ describe('posture after calibration (scoreboard)', () => {
     const head = ['world', 'model', 'cv', 'val', ...POSTURES.map((p) => p.label)];
     const lines = [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`];
     const worst: Record<string, number> = Object.fromEntries(Object.keys(CONFIGS).map((k) => [k, 0]));
+    let unlearned = 0;
     for (const w of worlds) {
       const noise = WORLDS[w].noise;
       for (const [name, cfg] of Object.entries(CONFIGS)) {
@@ -101,7 +119,8 @@ describe('posture after calibration (scoreboard)', () => {
         const val: number[] = [];
         const cells = POSTURES.map(() => ({ dx: [] as number[], dy: [] as number[] }));
         for (const seed of SEEDS) {
-          const t = train(calibrationSession(seed, { noise }), cfg);
+          const t = train(calibrationSession(seed, { noise }), cfg, seed, noise);
+          if (cfg.headStep && !t.learned) unlearned++;
           cv.push(t.cv);
           val.push(evaluateModel(t.model, calibrationSession(seed + 1000, { noise, targets: VALIDATION }), { maxBlink: 0.85 }).meanErrorPx);
           POSTURES.forEach((p, k) => {
@@ -120,7 +139,10 @@ describe('posture after calibration (scoreboard)', () => {
       }
     }
     console.log(`\n### Posture after calibration (lines; posture cells |dy| lines / |dx| px)\n${lines.join('\n')}`);
+    console.log(`head-movement steps that taught nothing: ${unlearned}`);
+    expect(unlearned).toBe(0);
     expect(worst.now).toBeLessThan(worst['1.1']!);
+    expect(worst.now).toBeLessThan(worst['no head step']!);
     expect(worst.now).toBeLessThanOrEqual(worst.pose!);
   });
 });

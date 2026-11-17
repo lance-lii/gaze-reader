@@ -39,6 +39,21 @@ export type ParsedBook = Omit<Book, 'source' | 'addedAt'>;
 export interface ParseOptions {
   /** Used when the content itself carries no title (usually derived from the file name). */
   fallbackTitle?: string;
+  /** Told what a long load is doing ("Reading scanned page 12 of 300…"), to show the reader. */
+  onProgress?: (message: string) => void;
+  /** Stops a long load (the text recognition of a scanned PDF); the load rejects with its reason. */
+  signal?: AbortSignal;
+  /**
+   * PDFs: how pages without text are read (OCR). Default: the built-in engine (./ocr), except in
+   * the Artifact build, which can't load it. `null` leaves such pages unread. Tests pass their own.
+   */
+  ocr?: ((pages: number) => Promise<import('./ocr').PdfOcrSession>) | null;
+}
+
+/** Options of the loaders that can take a while. */
+export interface LoadOptions {
+  onProgress?: (message: string) => void;
+  signal?: AbortSignal;
 }
 
 // ────────────────────────────── Small helpers ──────────────────────────────
@@ -1654,7 +1669,7 @@ function stamp(parsed: ParsedBook, source: Book['source'], sourceKey?: string): 
 async function parseBytes(
   bytes: Uint8Array,
   kind: SourceKind,
-  opts: { fallbackTitle: string; charset?: string | null; baseUrl?: string },
+  opts: { fallbackTitle: string; charset?: string | null; baseUrl?: string } & LoadOptions,
 ): Promise<ParsedBook> {
   if (kind === 'epub') {
     const { parseEpub } = await import('./epub');
@@ -1662,7 +1677,11 @@ async function parseBytes(
   }
   if (kind === 'pdf') {
     const { parsePdf } = await import('./pdf');
-    return parsePdf(toArrayBuffer(bytes), { fallbackTitle: opts.fallbackTitle });
+    return parsePdf(toArrayBuffer(bytes), {
+      fallbackTitle: opts.fallbackTitle,
+      ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
   }
   if (bytes.length > MAX_TEXT_BYTES) {
     throw new BookLoadError(
@@ -1714,7 +1733,7 @@ function tooLarge(bytes: number): BookLoadError {
 // ─────────────────────────────── Public loaders ───────────────────────────────
 
 /** Opens a user-picked file: .txt .md .markdown .html .htm .xhtml .epub .pdf (sniffed by content, too). */
-export async function loadBookFromFile(file: File): Promise<Book> {
+export async function loadBookFromFile(file: File, opts: LoadOptions = {}): Promise<Book> {
   if (file.size > MAX_BOOK_BYTES) throw tooLarge(file.size);
   if (file.size === 0) throw new BookLoadError('empty', 'That file is empty.');
   let buffer: ArrayBuffer;
@@ -1727,7 +1746,7 @@ export async function loadBookFromFile(file: File): Promise<Book> {
   const kind = sniffKind(bytes, file.name, file.type);
   // Keyed before parsing: pdf.js detaches the buffer it is handed.
   const sourceKey = sourceKeyOf(bytes);
-  return stamp(await parseBytes(bytes, kind, { fallbackTitle: titleFromFileName(file.name) }), 'file', sourceKey);
+  return stamp(await parseBytes(bytes, kind, { fallbackTitle: titleFromFileName(file.name), ...opts }), 'file', sourceKey);
 }
 
 /** Builds a book from pasted or programmatic text. `opts.title` wins over any detected title. */
@@ -1904,7 +1923,7 @@ function titleFromUrl(url: URL): string {
  */
 export async function loadBookFromUrl(
   url: string,
-  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+  opts: { timeoutMs?: number } & LoadOptions = {},
 ): Promise<Book> {
   const target = normalizeUserUrl(url);
   const fetched = await fetchBytes(target.href, opts.timeoutMs ?? DEFAULT_URL_TIMEOUT_MS, opts.signal);
@@ -1922,6 +1941,8 @@ export async function loadBookFromUrl(
     fallbackTitle: titleFromUrl(finalUrl),
     charset,
     baseUrl: finalUrl.href,
+    ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
+    ...(opts.signal ? { signal: opts.signal } : {}),
   });
   return stamp(parsed, 'url', sourceKey);
 }

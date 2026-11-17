@@ -58,6 +58,7 @@ import type {
 } from '../types';
 import { readJSON, removeKey, writeJSON } from '../core/storage';
 import { FEATURE_NAMES, type FeatureName } from './features';
+import { cameraAnglesInHead } from './headPose';
 import { RidgeNormalEquations, dot, ridgeFit } from './ridge';
 
 export const GAZE_MODEL_VERSION = 1;
@@ -188,6 +189,65 @@ export interface DepthCompensation {
   scaleIndex: number;
   yawIndex: number;
 }
+/**
+ * Head-pose compensation. The eye features measure the iris against the eye corners, and the
+ * corners are not at the eyeball's centre of rotation: they sit a few millimetres in front of it.
+ * When the head turns or moves across the camera's view while the eyes stay on the same word, the
+ * corners shift against the eyeball as the camera sees them, and the iris seems to have moved: in
+ * simulation a chin 4° lower reads as 1.0–1.4 lines lower, the head 2 cm lower as 0.5–0.8.
+ *
+ * How much depends on the reader's face (how deep-set the eyes are) and on how the tracker's pose
+ * estimate is scaled, so it is measured, not assumed: at the end of a calibration the reader keeps
+ * their eyes on one dot and moves their head (nods, turns, tilts). The gaze hasn't moved, so
+ * whatever the prediction did is this effect, and a straight-line fit of it against the head's
+ * pose gives the correction ({@link fitPoseCompensation}):
+ *
+ *     prediction += gain · (camera's direction in the head's frame, now − at calibration)
+ *
+ * The pose enters as {@link cameraAnglesInHead}: one quantity for a turn of the head and for a
+ * move of the head, so what is learned from nodding also corrects sliding down in the chair.
+ *
+ * A tilt of the head (roll) is a different thing: the features are measured along the line through
+ * the eye corners, so tilting rotates the measured gaze about the camera. That is undone by
+ * rotating the prediction back, by `rollGain` × the tilt (learned as well: about ±1).
+ *
+ * A model fresh from training carries the reference pose with all gains 0 (nothing is corrected
+ * until a fit), and so does one whose reader skipped the step.
+ */
+export interface PoseCompensation {
+  /** The camera's direction in the head's frame and the head's roll at calibration (medians over its samples), radians. */
+  ref: { a: number; b: number; roll: number };
+  /** px of model space per radian: dx/da, dx/db, dy/da, dy/db. */
+  gain: [number, number, number, number];
+  /** Share of a change of roll undone as a rotation of the prediction about the camera. */
+  rollGain: number;
+  /** The corrections follow the pose this far from the reference (radians), and hold beyond it. */
+  maxAngle: number;
+  maxRoll: number;
+  /** Where the camera is taken to be (as {@link DepthCompensation.camera}). */
+  camera: Point;
+  /** Indices into the feature vector of yaw, pitch, roll, tx, ty, tz. */
+  index: [number, number, number, number, number, number];
+}
+/** Gains beyond this (px per radian) aren't an anatomy, they are a fit gone wrong: ≈ 3 lines per degree. */
+const POSE_GAIN_MAX = 7000;
+const POSE_ROLL_GAIN_MAX = 1.5;
+/**
+ * A head-movement step teaches a direction only if the head moved at least this much in it: half
+ * the distance between the 10th and 90th percentiles, radians (1.5°). Percentiles, because the
+ * head is still in a direction most of the time (it nods, then turns, then tilts), which a
+ * median-based spread reads as "never moved"; and not the extremes, which one glitch can set.
+ */
+const POSE_MIN_SPREAD = 1.5 * (Math.PI / 180);
+/** The correction follows the pose to this multiple of the largest movement it was fitted on, at most POSE_MAX_ANGLE. */
+const POSE_RANGE_FACTOR = 1.5;
+const POSE_MAX_ANGLE = 20 * (Math.PI / 180);
+const POSE_MIN_SAMPLES = 30;
+/** A fit is kept only if it explains this share of what the prediction did while the head moved. */
+const POSE_MIN_GAIN_IN_ERROR = 0.2;
+/** Frames averaged together when measuring that (about a quarter of a second). */
+const POSE_ERROR_BLOCK = 8;
+
 /** The distance ratio is clamped to this range: beyond it the reader has moved too far for the calibration anyway. */
 const DEPTH_RATIO_MIN = 0.7;
 const DEPTH_RATIO_MAX = 1.4;
@@ -261,6 +321,8 @@ export interface TrainOptions {
    * doesn't use it (it is excluded); a model that fits its own weight to faceScale gets none.
    */
   depthCompensation?: boolean;
+  /** Keep the reference for head-pose compensation (default true; needs the pose features excluded). See {@link PoseCompensation}. */
+  poseCompensation?: boolean;
   /** Where the camera is, in viewport px (default: just above the middle of the screen's top edge). */
   camera?: Point;
 }
@@ -379,6 +441,8 @@ export interface GazeModelParams {
   environment?: CalibrationEnvironment | null;
   /** Distance compensation, applied to the ridge prediction before `adjust`; null/absent: none (older models). */
   depth?: DepthCompensation | null;
+  /** Head-pose compensation; null/absent: none (older models). */
+  pose?: PoseCompensation | null;
 }
 
 const IDENTITY: Readonly<AxisAffine> = Object.freeze({ sx: 1, ox: 0, sy: 1, oy: 0 });
@@ -401,6 +465,9 @@ export class RidgeGazeModel implements GazeModel {
   readonly environment: CalibrationEnvironment | null;
   /** Distance compensation in use, or null (see {@link DepthCompensation}). */
   readonly depthCompensation: Readonly<DepthCompensation> | null;
+  /** Head-pose compensation carried by the model, or null (see {@link PoseCompensation}); its gains are 0 until a fit. */
+  readonly poseCompensation: Readonly<PoseCompensation> | null;
+  private readonly poseActive: boolean;
   private readonly params: GazeModelParams;
   private readonly glitchCheck: readonly number[];
   // Scratch buffers: predict runs at camera rate, so avoid per-call allocation.
@@ -421,6 +488,8 @@ export class RidgeGazeModel implements GazeModel {
     this.excludedFeatures = Object.freeze([...(params.excluded ?? [])]);
     this.environment = params.environment ? cloneEnvironment(params.environment) : null;
     this.depthCompensation = params.depth ? Object.freeze({ ...params.depth, camera: { ...params.depth.camera } }) : null;
+    this.poseCompensation = params.pose ? Object.freeze(clonePose(params.pose)) : null;
+    this.poseActive = !!params.pose && (params.pose.gain.some((g) => g !== 0) || params.pose.rollGain !== 0);
     this.zBuf = new Float64Array(params.featureLength);
     this.phiBuf = new Float64Array(params.expMean.length);
   }
@@ -445,6 +514,45 @@ export class RidgeGazeModel implements GazeModel {
 
   predictScreenFromVector(v: ArrayLike<number>): Point | null {
     const P = this.params;
+    const raw = this.ridgeAt(v);
+    if (!raw) return null;
+    let sx = raw.x;
+    let sy = raw.y;
+    // The head's pose since calibration: what it did to the eye features, taken back out.
+    const pose = this.poseCompensation;
+    let turn = 0;
+    if (pose && this.poseActive) {
+      const now = poseAngles(v, pose.index);
+      if (now) {
+        const da = clamp(now.a - pose.ref.a, -pose.maxAngle, pose.maxAngle);
+        const db = clamp(now.b - pose.ref.b, -pose.maxAngle, pose.maxAngle);
+        sx += pose.gain[0] * da + pose.gain[1] * db;
+        sy += pose.gain[2] * da + pose.gain[3] * db;
+        turn = pose.rollGain * clamp(now.roll - pose.ref.roll, -pose.maxRoll, pose.maxRoll);
+      }
+    }
+    const depth = this.depthCompensation;
+    if (depth) {
+      const k = depthRatio(depth, v);
+      sx = depth.camera.x + k * (sx - depth.camera.x);
+      sy = depth.camera.y + k * (sy - depth.camera.y);
+    }
+    if (pose && turn !== 0) {
+      const c = Math.cos(turn);
+      const s = Math.sin(turn);
+      const dx = sx - pose.camera.x;
+      const dy = sy - pose.camera.y;
+      sx = pose.camera.x + c * dx - s * dy;
+      sy = pose.camera.y + s * dx + c * dy;
+    }
+    const x = P.adjust.sx * sx + P.adjust.ox;
+    const y = P.adjust.sy * sy + P.adjust.oy;
+    return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+  }
+
+  /** The ridge maps' own answer in screen space: before the pose and distance corrections and `adjust`. */
+  private ridgeAt(v: ArrayLike<number>): Point | null {
+    const P = this.params;
     if (v.length !== P.featureLength) return null;
     const z = this.zBuf;
     for (let j = 0; j < P.featureLength; j++) {
@@ -460,17 +568,163 @@ export class RidgeGazeModel implements GazeModel {
     expandInto(z, P.quad, phi);
     for (let k = 0; k < phi.length; k++) phi[k] = (phi[k] - P.expMean[k]) / P.expStd[k];
 
-    let sx = P.bx + dot(P.wx, phi) + P.origin.x;
-    let sy = P.by + dot(P.wy, phi) + P.origin.y;
-    const depth = this.depthCompensation;
-    if (depth) {
-      const k = depthRatio(depth, v);
-      sx = depth.camera.x + k * (sx - depth.camera.x);
-      sy = depth.camera.y + k * (sy - depth.camera.y);
+    const sx = P.bx + dot(P.wx, phi) + P.origin.x;
+    const sy = P.by + dot(P.wy, phi) + P.origin.y;
+    return Number.isFinite(sx) && Number.isFinite(sy) ? { x: sx, y: sy } : null;
+  }
+
+  /**
+   * A copy whose pose compensation is fitted to `samples`: frames of the reader looking at one or
+   * a few fixed targets while moving their head (see {@link PoseCompensation}). Not ok when the
+   * model carries no pose reference, or the samples teach nothing (too few, the head hardly moved,
+   * or the fit explains too little): the model is then best left as it is.
+   */
+  withPoseFit(samples: readonly CalibrationSample[], opts: { maxBlink?: number } = {}): PoseFitOutcome {
+    const P = this.params;
+    const pose = this.poseCompensation;
+    if (!pose) return { ok: false, reason: 'no-reference' };
+    let rows: Row[];
+    try {
+      rows = prepareRows(samples as CalibrationSample[], P.featureLength, opts.maxBlink).rows;
+    } catch {
+      return { ok: false, reason: 'too-few' };
     }
-    const x = P.adjust.sx * sx + P.adjust.ox;
-    const y = P.adjust.sy * sy + P.adjust.oy;
-    return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+    const origin = currentScreenOrigin();
+    const depth = this.depthCompensation;
+    interface Obs {
+      key: string;
+      da: number;
+      db: number;
+      dr: number;
+      /** What the prediction is short of the target by, in the ridge maps' space (before the distance scaling). */
+      rx: number;
+      ry: number;
+      /** The prediction's place relative to the camera (the arm a tilt turns it on). */
+      lx: number;
+      ly: number;
+    }
+    const obs: Obs[] = [];
+    for (const row of rows) {
+      const raw = this.ridgeAt(row.x);
+      const now = poseAngles(row.x, pose.index);
+      if (!raw || !now) continue;
+      // The target, taken back through `adjust` and the distance scaling into the ridge maps' space.
+      let tx = (row.target.x + origin.x - P.adjust.ox) / P.adjust.sx;
+      let ty = (row.target.y + origin.y - P.adjust.oy) / P.adjust.sy;
+      if (depth) {
+        const k = depthRatio(depth, row.x);
+        tx = depth.camera.x + (tx - depth.camera.x) / k;
+        ty = depth.camera.y + (ty - depth.camera.y) / k;
+      }
+      obs.push({ key: row.key, da: now.a - pose.ref.a, db: now.b - pose.ref.b, dr: now.roll - pose.ref.roll, rx: tx - raw.x, ry: ty - raw.y, lx: raw.x - pose.camera.x, ly: raw.y - pose.camera.y });
+    }
+    if (obs.length < POSE_MIN_SAMPLES) return { ok: false, reason: 'too-few' };
+    const spread = (values: number[]): number => {
+      const sorted = [...values].sort((x, y) => x - y);
+      const at = (q: number): number => sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(q * (sorted.length - 1))))];
+      return (at(0.9) - at(0.1)) / 2;
+    };
+    const learnA = spread(obs.map((o) => o.da)) >= POSE_MIN_SPREAD;
+    const learnB = spread(obs.map((o) => o.db)) >= POSE_MIN_SPREAD;
+    const learnRoll = spread(obs.map((o) => o.dr)) >= POSE_MIN_SPREAD;
+    if (!learnA && !learnB && !learnRoll) return { ok: false, reason: 'still' };
+
+    // Unknowns: the four gains, the roll gain, and one constant per target and axis (where the
+    // reader's eyes really rested on that dot, and the calibration's own error there: not the
+    // head's doing, and not to be explained by it).
+    const keys = [...new Set(obs.map((o) => o.key))];
+    const n = 5 + 2 * keys.length;
+    const solve = (use: readonly Obs[]): Float64Array | null => {
+      const A = new Float64Array(n * n);
+      const y = new Float64Array(n);
+      const add = (cols: readonly number[], vals: readonly number[], target: number): void => {
+        for (let i = 0; i < cols.length; i++) {
+          y[cols[i]] += vals[i] * target;
+          for (let j = 0; j < cols.length; j++) A[cols[i] * n + cols[j]] += vals[i] * vals[j];
+        }
+      };
+      for (const o of use) {
+        const k = 5 + 2 * keys.indexOf(o.key);
+        const a = learnA ? o.da : 0;
+        const b = learnB ? o.db : 0;
+        const r = learnRoll ? o.dr : 0;
+        // x: g0·da + g1·db − rollGain·dr·ly + cx ;  y: g2·da + g3·db + rollGain·dr·lx + cy
+        add([0, 1, 4, k], [a, b, -r * o.ly, 1], o.rx);
+        add([2, 3, 4, k + 1], [a, b, r * o.lx, 1], o.ry);
+      }
+      // A whisper of shrinkage keeps the unused columns (and near-collinear ones) solvable.
+      for (let i = 0; i < 4; i++) A[i * n + i] += 1e-6 * use.length;
+      A[4 * n + 4] += 1e-3 * use.length;
+      for (let i = 5; i < n; i++) A[i * n + i] += 1e-9;
+      return solveSymmetric(A, y, n);
+    };
+    const residualOf = (w: Float64Array | null, o: Obs): Point => {
+      const k = 5 + 2 * keys.indexOf(o.key);
+      return {
+        x: o.rx - (w ? w[0] * o.da + w[1] * o.db - w[4] * o.dr * o.ly + w[k] : 0),
+        y: o.ry - (w ? w[2] * o.da + w[3] * o.db + w[4] * o.dr * o.lx + w[k + 1] : 0),
+      };
+    };
+    const residual = (w: Float64Array | null, o: Obs): number => {
+      const e = residualOf(w, o);
+      return Math.hypot(e.x, e.y);
+    };
+    // The same, over a few frames in a row at a time (the frames come in the order they were
+    // taken): the head moves slowly and the tracker's noise doesn't, so this is what the head did
+    // to the prediction, with most of the frame-to-frame noise averaged away.
+    const smoothed = (w: Float64Array | null, use: readonly Obs[]): number => {
+      const sizes: number[] = [];
+      for (let i = 0; i < use.length; ) {
+        let j = i;
+        let x = 0;
+        let y = 0;
+        while (j < use.length && j - i < POSE_ERROR_BLOCK && use[j].key === use[i].key) {
+          const e = residualOf(w, use[j++]);
+          x += e.x;
+          y += e.y;
+        }
+        sizes.push(Math.hypot(x, y) / (j - i));
+        i = j;
+      }
+      return mean(sizes);
+    };
+    let w = solve(obs);
+    if (!w) return { ok: false, reason: 'unclear' };
+    // Once more without the frames that don't fit (a glance away from the dot, a tracker glitch).
+    const first = w;
+    const errs = obs.map((o) => residual(first, o));
+    const cut = median(errs) + MAD_THRESHOLD * Math.max(robustSd(errs), PREDICTION_MAD_FLOOR_PX);
+    const kept = obs.filter((_, i) => errs[i] <= cut);
+    if (kept.length >= POSE_MIN_SAMPLES && kept.length < obs.length) w = solve(kept) ?? w;
+    if (![w[0], w[1], w[2], w[3]].every((g) => Number.isFinite(g) && Math.abs(g) <= POSE_GAIN_MAX) || !Number.isFinite(w[4])) return { ok: false, reason: 'unclear' };
+
+    // What the head's movement did to the prediction, with and without the fit: against each
+    // target's own mean, so neither is charged for where the eyes rested.
+    const used = kept.length >= POSE_MIN_SAMPLES ? kept : obs;
+    const constants = new Float64Array(n);
+    for (const key of keys) {
+      const of = used.filter((o) => o.key === key);
+      const k = 5 + 2 * keys.indexOf(key);
+      constants[k] = mean(of.map((o) => o.rx));
+      constants[k + 1] = mean(of.map((o) => o.ry));
+    }
+    const before = smoothed(constants, used);
+    const after = smoothed(w, used);
+    if (!(before > 0) || !(after <= (1 - POSE_MIN_GAIN_IN_ERROR) * before)) return { ok: false, reason: 'unclear' };
+
+    const span = (values: number[]): number => values.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+    const next: PoseCompensation = {
+      ...clonePose(pose),
+      gain: [learnA ? w[0] : 0, learnB ? w[1] : 0, learnA ? w[2] : 0, learnB ? w[3] : 0],
+      rollGain: learnRoll ? clamp(w[4], -POSE_ROLL_GAIN_MAX, POSE_ROLL_GAIN_MAX) : 0,
+      maxAngle: Math.min(POSE_MAX_ANGLE, POSE_RANGE_FACTOR * Math.max(span(used.map((o) => o.da)), span(used.map((o) => o.db)))),
+      maxRoll: Math.min(POSE_MAX_ANGLE, POSE_RANGE_FACTOR * span(used.map((o) => o.dr))),
+    };
+    return {
+      ok: true,
+      model: new RidgeGazeModel({ ...P, pose: next }),
+      fit: { samples: used.length, learned: { a: learnA, b: learnB, roll: learnRoll }, errorBeforePx: before, errorAfterPx: after },
+    };
   }
 
   /** A copy with a different screen-space correction (quick recalibration). Omitted meta fields are kept. */
@@ -522,8 +776,79 @@ export class RidgeGazeModel implements GazeModel {
       trainedAt: P.trainedAt,
       environment: this.environment ? cloneEnvironment(this.environment) : null,
       depth: this.depthCompensation ? { ...this.depthCompensation, camera: { ...this.depthCompensation.camera } } : null,
+      pose: this.poseCompensation ? clonePose(this.poseCompensation) : null,
     };
   }
+}
+
+/** What a head-movement step taught (see {@link fitPoseCompensation}). */
+export interface PoseFit {
+  /** Frames the fit rests on. */
+  samples: number;
+  /** Which movements were large enough to learn from: across (a turn), up-down (a nod), a tilt. */
+  learned: { a: boolean; b: boolean; roll: boolean };
+  /** How far the prediction strayed from each dot's mean while the head moved, before and with the fit (mean over quarter-seconds, px). */
+  errorBeforePx: number;
+  errorAfterPx: number;
+}
+
+/**
+ * Fits the model's head-pose compensation to frames of the reader looking at fixed targets while
+ * moving their head. Returns the model to use and what was learned, or why nothing was.
+ */
+export function fitPoseCompensation(model: GazeModel, samples: readonly CalibrationSample[], opts: { maxBlink?: number } = {}): PoseFitOutcome {
+  return asRidgeGazeModel(model)?.withPoseFit(samples, opts) ?? { ok: false, reason: 'no-reference' };
+}
+
+/**
+ * Why a head-movement step taught nothing: the model has no pose reference (an older calibration);
+ * too few usable frames; the head hardly moved; or the fit doesn't explain what the prediction did
+ * (the eyes left the dot, or the tracker lost the face on the way).
+ */
+export type PoseFitFailure = 'no-reference' | 'too-few' | 'still' | 'unclear';
+export type PoseFitOutcome = { ok: true; model: RidgeGazeModel; fit: PoseFit } | { ok: false; reason: PoseFitFailure };
+
+function clonePose(p: Readonly<PoseCompensation>): PoseCompensation {
+  return { ref: { ...p.ref }, gain: [...p.gain], rollGain: p.rollGain, maxAngle: p.maxAngle, maxRoll: p.maxRoll, camera: { ...p.camera }, index: [...p.index] };
+}
+
+/** The camera's direction in the head's frame and the head's roll, from a feature vector; null when the pose is unusable. */
+function poseAngles(v: ArrayLike<number>, index: readonly number[]): { a: number; b: number; roll: number } | null {
+  const pose = { yaw: v[index[0]], pitch: v[index[1]], roll: v[index[2]], tx: v[index[3]], ty: v[index[4]], tz: v[index[5]] };
+  const angles = cameraAnglesInHead(pose);
+  return angles ? { a: angles.a, b: angles.b, roll: pose.roll } : null;
+}
+
+const mean = (values: readonly number[]): number => (values.length ? values.reduce((x, y) => x + y, 0) / values.length : NaN);
+
+/** Solves A·x = y for a symmetric positive-definite A (n×n, row-major) by Cholesky; null when it isn't. */
+function solveSymmetric(A: Float64Array, y: Float64Array, n: number): Float64Array | null {
+  const L = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) {
+      let s = A[i * n + j];
+      for (let k = 0; k < j; k++) s -= L[i * n + k] * L[j * n + k];
+      if (i === j) {
+        if (!(s > 0)) return null;
+        L[i * n + i] = Math.sqrt(s);
+      } else {
+        L[i * n + j] = s / L[j * n + j];
+      }
+    }
+  }
+  const z = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = y[i];
+    for (let k = 0; k < i; k++) s -= L[i * n + k] * z[k];
+    z[i] = s / L[i * n + i];
+  }
+  const x = new Float64Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = z[i];
+    for (let k = i + 1; k < n; k++) s -= L[k * n + i] * x[k];
+    x[i] = s / L[i * n + i];
+  }
+  return x.every(Number.isFinite) ? x : null;
 }
 
 /** Distance now / distance at calibration, from the face's size in the image; 1 when it can't be read. */
@@ -676,6 +1001,7 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     adjust: { ...IDENTITY },
     trainedAt,
     depth: depthCompensationFor(rows, excluded, viewport, origin, opts),
+    pose: poseReferenceFor(rows, excluded, viewport, origin, opts),
     environment: {
       lighting: sanitizeLightingSignature(opts.environment?.lighting ?? null),
       // From the samples the model was fitted on (blinks and glances away already dropped).
@@ -1025,6 +1351,7 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
       // Unknown, missing or damaged conditions never cost the reader their calibration.
       environment: sanitizeEnvironment(json.environment),
       depth: sanitizeDepth(json.depth, featureLength),
+      pose: sanitizePose(json.pose, featureLength),
     });
   } catch {
     return null;
@@ -1151,6 +1478,65 @@ function depthCompensationFor(
   const c = opts.camera;
   const camera = c && isFinitePoint(c) ? { x: c.x + origin.x, y: c.y + origin.y } : assumedCameraPoint(viewport, origin);
   return { ref, camera, scaleIndex, yawIndex };
+}
+
+/** The pose reference a freshly trained model gets (gains 0: see {@link PoseCompensation}), or null. */
+function poseReferenceFor(
+  rows: readonly Row[],
+  excluded: Uint8Array,
+  viewport: { width: number; height: number },
+  origin: Point,
+  opts: TrainOptions,
+): PoseCompensation | null {
+  const names = opts.featureNames;
+  if (!names || opts.poseCompensation === false) return null;
+  const index = (['yaw', 'pitch', 'roll', 'tx', 'ty', 'tz'] as const).map((n) => names.indexOf(n));
+  // A regression that fits its own weights to the pose would be corrected twice.
+  if (index.some((i) => i < 0 || !excluded[i])) return null;
+  const a: number[] = [];
+  const b: number[] = [];
+  const roll: number[] = [];
+  for (const r of rows) {
+    const now = poseAngles(r.x, index);
+    if (!now) continue;
+    a.push(now.a);
+    b.push(now.b);
+    roll.push(now.roll);
+  }
+  if (a.length < MIN_SAMPLES) return null;
+  const c = opts.camera;
+  const camera = c && isFinitePoint(c) ? { x: c.x + origin.x, y: c.y + origin.y } : assumedCameraPoint(viewport, origin);
+  return {
+    ref: { a: median(a), b: median(b), roll: median(roll) },
+    gain: [0, 0, 0, 0],
+    rollGain: 0,
+    maxAngle: 0,
+    maxRoll: 0,
+    camera,
+    index: index as PoseCompensation['index'],
+  };
+}
+
+/** A validated copy of a stored pose compensation; null when absent or damaged (never a reason to drop the model). */
+function sanitizePose(v: unknown, featureLength: number): PoseCompensation | null {
+  if (!isRecord(v) || !isRecord(v.ref) || !isFinitePoint(v.camera)) return null;
+  const { a, b, roll } = v.ref;
+  if (!isFiniteNumber(a) || !isFiniteNumber(b) || !isFiniteNumber(roll)) return null;
+  const index = v.index;
+  if (!Array.isArray(index) || index.length !== 6 || !index.every((i) => typeof i === 'number' && Number.isInteger(i) && i >= 0 && i < featureLength)) return null;
+  const gain = v.gain;
+  if (!Array.isArray(gain) || gain.length !== 4 || !gain.every((g) => isFiniteNumber(g) && Math.abs(g) <= POSE_GAIN_MAX)) return null;
+  if (!isFiniteNumber(v.rollGain) || Math.abs(v.rollGain) > POSE_ROLL_GAIN_MAX) return null;
+  if (!isFiniteNumber(v.maxAngle) || v.maxAngle < 0 || !isFiniteNumber(v.maxRoll) || v.maxRoll < 0) return null;
+  return {
+    ref: { a, b, roll },
+    gain: gain as PoseCompensation['gain'],
+    rollGain: v.rollGain,
+    maxAngle: Math.min(v.maxAngle, POSE_MAX_ANGLE),
+    maxRoll: Math.min(v.maxRoll, POSE_MAX_ANGLE),
+    camera: { x: v.camera.x, y: v.camera.y },
+    index: index as PoseCompensation['index'],
+  };
 }
 
 /** A validated copy of a stored distance compensation; null when absent or damaged (never a reason to drop the model). */

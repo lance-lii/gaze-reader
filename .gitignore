@@ -7,3 +7,4 @@ public/mediapipe/
 .DS_Store
 release/
 .vexp/
+public/ocr/

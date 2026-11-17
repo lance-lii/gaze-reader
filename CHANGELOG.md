@@ -8,6 +8,48 @@ All notable changes to Gaze Reader are listed here. Versions follow
 Steadier tracking. Readers found the tracker "very buggy": the gaze dot trembled, the reading
 position sat a line or two off after shifting in the chair, and page turns came early or late.
 
+### New: the tracker allows for your head moving (web app and extension)
+
+- **A head-movement step at the end of a full calibration.** After the 13 dots, one dot stays in
+  the middle and you keep your eyes on it while you nod, turn your head a little and tilt it,
+  about five seconds each. Your gaze hasn't moved, so whatever the estimate did meanwhile is what
+  your head's movement does to it, and from then on that is taken back out as you read.
+  It is one measurement for turning the head and for moving it: what is learned from nodding also
+  corrects sliding down in the chair. **S** (or the button) skips the step; a quick 5-dot refresh
+  keeps what was learned.
+- **What it buys, in simulation.** A chin 4° lower used to read 1.0–1.4 lines low and now reads
+  0.2–0.3; the head 2 cm lower 0.6 and now 0.2; a slouch (chin down, lower, further back) 2.3–3.1
+  and now 0.4–0.5; a 4° turn or tilt 44 px sideways and now 10–20. Over 33 simulated hours of
+  reading, the typical gaze error halves (82 → 42 px), stops growing through a session (it used
+  to double in the first hour), restless readers miss 0.4 % of pages instead of 8 %, and the
+  quick refresh is offered half as often.
+- **What it rests on.** None of this has been measured on a real face yet. It depends on your eyes
+  staying on the dot while your head moves (the eyes do that by reflex, but if they travel with
+  the head the step learns the wrong correction), and it follows your head only about one and a
+  half times as far as you moved it during the step. If tracking is worse after a calibration,
+  calibrate again and skip the step. Calibrations made before this version work as before, and
+  get the correction with the next full calibration.
+
+### New: scanned PDFs (web app)
+
+- **A PDF that is pictures of pages now opens.** Its text is recognized on your device (OCR) when
+  you open it, page by page, with a progress note and a Cancel button. The text view shows the
+  recognized text; the pages view (**V**) shows the scans, with each printed line followed by the
+  eye tracker like any other. It is done once: the result is kept with the book.
+- **Nothing is uploaded.** The recognition engine (Tesseract, compiled to WebAssembly) and its
+  English language data are served with the app, about 7 MB, and only downloaded by a browser that
+  opens a scanned PDF.
+- **Crooked scans are straightened.** The tilt of a page is measured from its own lines, so a scan
+  a degree or two off still comes out as paragraphs (unstraightened, a 1.6° scan of 24 paragraphs
+  came out as 57), and the line boxes on the pages view still sit on the lines.
+- **Measured on generated scans only:** four pages of 10-point book type, at 200 dpi nearly
+  straight and at 130 dpi tilted 1.6° with blur and a shadow down one edge: 100 % and 99.7 % of
+  the printed words found, about a second a page. Real scans vary far more. English only for now;
+  handwriting, faint print and two-column scans come out poorly.
+- **Line boxes in the pages view fit the line.** For any PDF set in type narrower or wider than
+  the stand-in font (most serif books), the invisible line the tracker measures was up to a tenth
+  too long or too short. It was stretched twice.
+
 ### New: PDFs as their own pages (web app)
 
 - **A PDF can be read as it is.** Until now a PDF was shown only as its extracted text, set like a
@@ -348,6 +390,15 @@ position sat a line or two off after shifting in the chair, and page turns came 
 - **A gate for "Unsure of your line".** `tests/endToEnd.unsure.test.ts` checks, on fixed seeds,
   that the pill is up most of the time with a noisy webcam, and covers most of the pages missed
   there, and that it stays down in clean light and everyday reading.
+- **The simulated reader does the head-movement step.** `npm run eval`, the line-tracker scoreboard
+  and the end-to-end gates now calibrate as the app does, head-movement step included
+  (`GR_EVAL_HEAD_STEP=0` is a reader who skips it). The gates' limits are reset to the new counts
+  by their own rule, most of them tighter, and two gates keep the reader who skips the step at the
+  earlier limits. `npm run bench -- bench/lighting/posture` shows each posture with and without
+  the step, and adds three compound ones (slouched, head on a hand, chin 8° lower).
+- **Scanned PDFs:** the conversion from recognized lines to the loader's text items, the
+  straightening, the recognition pass (progress, cancelling, a failing engine) are unit-tested with
+  stand-ins for pdf.js and the engine; the engine itself runs only in a browser.
 
 ### Development
 

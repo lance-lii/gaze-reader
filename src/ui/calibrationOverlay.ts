@@ -59,10 +59,13 @@ import {
   asRidgeGazeModel,
   currentScreenOrigin,
   evaluateModel,
+  fitPoseCompensation,
   qualityFromError,
   refineGazeModel,
   trainGazeModel,
   type OffsetMeasurement,
+  type PoseFit,
+  type PoseFitFailure,
 } from '../gaze/calibrationModel';
 import {
   LIGHTING_STAT_KEYS,
@@ -110,11 +113,18 @@ export interface CalibrationOverlayOptions {
    * one. Default: every key press (the app's own page, and tests).
    */
   isTrustedKey?: (e: KeyboardEvent) => boolean;
+  /**
+   * Whether a full calibration includes the head-movement step (default true). The reader can
+   * always skip it there and then.
+   */
+  headStep?: boolean;
 }
 
 export interface CalibrationResult {
   model: GazeModel;
   report: CalibrationReport;
+  /** Present after a full calibration that offered the head-movement step. */
+  headStep?: HeadStepSummary;
   /** Present after a quick refresh and after an accuracy check whose correction was applied. */
   check?: AccuracyCheckResult;
 }
@@ -197,6 +207,15 @@ export interface CalibrationTiming {
    * dot, and without the wait most of the dot's samples were collected meanwhile.
    */
   noticeMs: number;
+  /** The head-movement step: how long its first instruction is up before the first movement counts. */
+  headIntroMs: number;
+  /** How long each head movement (nod, turn, tilt) is collected for. */
+  headMoveMs: number;
+  /**
+   * Discarded start of each head movement: the reader glances at the new instruction (it sits just
+   * under the dot, so the glance is short), looks back at the dot and starts to move.
+   */
+  headSettleMs: number;
 }
 
 /** How long a notice (toast) stays on screen, ms. */
@@ -216,7 +235,30 @@ export const DEFAULT_CALIBRATION_TIMING: Readonly<CalibrationTiming> = Object.fr
   startAnywayMs: 8000,
   minTrainingMs: 700,
   noticeMs: NOTICE_MS,
+  headIntroMs: 2600,
+  headMoveMs: 4800,
+  headSettleMs: 1400,
 });
+
+/**
+ * The head-movement step of a full calibration: the eyes stay on one dot in the middle while the
+ * head moves, so that what a head movement does to the gaze estimate can be measured and taken
+ * back out afterwards (PoseCompensation in gaze/calibrationModel.ts).
+ */
+const HEAD_MOVES: readonly { title: string; detail: string }[] = Object.freeze([
+  { title: 'Nod slowly', detail: 'Chin down, then up, a few times. Keep your eyes on the dot.' },
+  { title: 'Turn your head a little', detail: 'Left, then right, as if saying a slow “no”. Eyes stay on the dot.' },
+  { title: 'Tilt your head', detail: 'An ear toward one shoulder, then the other. Eyes stay on the dot.' },
+]);
+const HEAD_TARGET: Readonly<Point> = Object.freeze({ x: 0.5, y: 0.5 });
+
+/** What the head-movement step came to. */
+export interface HeadStepSummary {
+  /** Which movements taught the model something; null when none did. */
+  learned: PoseFit['learned'] | null;
+  /** Why nothing was learned: the reader skipped the step, or see PoseFitFailure. */
+  reason?: PoseFitFailure | 'skipped';
+}
 
 /** Target positions as fractions of the viewport. */
 export const STANDARD_TARGETS: readonly Point[] = Object.freeze([
@@ -522,6 +564,8 @@ interface ResultsView {
   canCorrect: boolean;
   /** Check mode: offer a full calibration (no correction possible, or it would still be poor). */
   suggestFull: boolean;
+  /** A full calibration's head-movement step, when it was offered. */
+  headStep?: HeadStepSummary | null;
 }
 
 const isTip = (c: Coach): c is LightingTip => c === 'glare' || c === 'side-lit';
@@ -607,6 +651,10 @@ interface Dom {
   hudLabel: HTMLSpanElement;
   hudCount: HTMLSpanElement;
   hudBar: HTMLSpanElement;
+  hint: HTMLParagraphElement;
+  headHint: HTMLDivElement;
+  headTitle: HTMLElement;
+  headDetail: HTMLElement;
   toast: HTMLParagraphElement;
   pause: HTMLDivElement;
   pauseTitle: HTMLHeadingElement;
@@ -683,6 +731,9 @@ export class CalibrationOverlay implements Mountable {
 
   private collector: Collector | null = null;
   private progress: { kind: TargetKind; index: number; total: number } | null = null;
+  /** The head-movement step is on (it runs as a 'targets' phase: pause, face-lost and Esc work as for the dots). */
+  private headStep = false;
+  private headSkipped = false;
   private paused: PauseReason | null = null;
   private resumeWaiters: (() => void)[] = [];
   private lastValidAt = 0;
@@ -869,6 +920,30 @@ export class CalibrationOverlay implements Mountable {
         continue;
       }
 
+      // A full calibration then learns what the head's own movement does to the estimate.
+      let headStep: HeadStepSummary | null = null;
+      if (mode === 'standard' && this.opts.headStep !== false) {
+        const moved = await this.headMovement(signal);
+        if (moved.restart) {
+          restart = true;
+          continue;
+        }
+        if (moved.skipped) headStep = { learned: null, reason: 'skipped' };
+        else {
+          const fitted = fitPoseCompensation(trained.model, moved.samples, { maxBlink });
+          if (fitted.ok) {
+            trained = { model: fitted.model, report: trained.report };
+            headStep = { learned: fitted.fit.learned };
+          } else headStep = { learned: null, reason: fitted.reason };
+          this.showToast(headStepNotice(headStep));
+          await this.sleep(this.timing.noticeMs, signal);
+          if (this.viewportChanged()) {
+            restart = true;
+            continue;
+          }
+        }
+      }
+
       let report = trained.report;
       if (mode === 'standard') {
         const val = await this.collectTargets(shuffle(VALIDATION_TARGETS, this.random), 'validating', signal);
@@ -898,9 +973,9 @@ export class CalibrationOverlay implements Mountable {
             }
           : null;
       if (check) this.lastCheck = check;
-      const decided = await this.decide({ mode, model: trained.model, report, check, canCorrect: false, suggestFull: false }, signal);
+      const decided = await this.decide({ mode, model: trained.model, report, check, canCorrect: false, suggestFull: false, headStep }, signal);
       if (decided.choice === 'use') {
-        return { result: { model: trained.model, report, ...(decided.check ? { check: decided.check } : {}) }, report };
+        return { result: { model: trained.model, report, ...(decided.check ? { check: decided.check } : {}), ...(headStep ? { headStep } : {}) }, report };
       }
       if (decided.choice === 'full') mode = 'standard';
     }
@@ -1115,8 +1190,101 @@ export class CalibrationOverlay implements Mountable {
     return { samples, succeeded };
   }
 
+  /**
+   * The head-movement step: the dot stays in the middle while the reader nods, turns and tilts
+   * their head, one movement after the other. Runs as a 'targets' phase, so pausing, losing the
+   * face, Esc and a changed window behave as they do for the dots. The frames it returns all carry
+   * the middle dot as their target.
+   */
+  private async headMovement(signal: AbortSignal): Promise<{ samples: CalibrationSample[]; restart?: true; skipped?: true }> {
+    this.setPhase('targets');
+    this.headStep = true;
+    this.headSkipped = false;
+    this.lastValidAt = performance.now();
+    this.validSince = null;
+    this.paused = null;
+    this.startWatchdog();
+    const samples: CalibrationSample[] = [];
+    const total = HEAD_MOVES.length;
+    try {
+      // The dot and the first instruction, with time to read it before anything counts.
+      this.progress = { kind: 'point', index: 0, total };
+      this.renderHeadHint(0);
+      this.placeTarget(targetPoint(HEAD_TARGET, this.measureViewport()), true);
+      this.renderHud();
+      await this.interruptibleSleep(this.timing.headIntroMs, signal);
+      for (let index = 0; index < total; index++) {
+        for (;;) {
+          await this.untilResumed(signal);
+          if (this.headSkipped) return { samples: [], skipped: true };
+          if (this.viewportChanged()) return { samples, restart: true };
+          this.progress = { kind: 'point', index, total };
+          this.renderHeadHint(index);
+          const got = await this.presentTarget(HEAD_TARGET, false, signal, { durationMs: this.timing.headMoveMs, settleMs: this.timing.headSettleMs });
+          if (this.headSkipped) return { samples: [], skipped: true };
+          if (got === null) continue; // interrupted: the same movement again
+          for (const s of got) samples.push(s);
+          break;
+        }
+      }
+    } finally {
+      this.stopWatchdog();
+      this.collector = null;
+      this.progress = null;
+      this.headStep = false;
+      this.renderHeadHint(null);
+    }
+    return { samples };
+  }
+
+  /** Waits `ms`, or less when the step is interrupted (a pause, a skip, a changed window). Rejects only when the run is aborted. */
+  private async interruptibleSleep(ms: number, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    const step = new AbortController();
+    const forward = (): void => step.abort(signal.reason);
+    signal.addEventListener('abort', forward, { once: true });
+    this.stepCtl = step;
+    try {
+      await this.sleep(ms, step.signal);
+    } catch (err) {
+      if (signal.aborted) throw err;
+    } finally {
+      signal.removeEventListener('abort', forward);
+      if (this.stepCtl === step) this.stepCtl = null;
+    }
+  }
+
+  /** Skip the head-movement step (S, or its button). */
+  private skipHeadStep(): void {
+    if (!this.headStep || this.headSkipped) return;
+    this.headSkipped = true;
+    this.stepCtl?.abort(INTERRUPT);
+    if (this.paused) this.resume();
+  }
+
+  /** Shows the instruction for head movement `index`, or puts the dots' own hint back (null). */
+  private renderHeadHint(index: number | null): void {
+    const dom = this.dom;
+    if (!dom) return;
+    const move = index === null ? null : HEAD_MOVES[index];
+    dom.headHint.hidden = !move;
+    dom.hint.hidden = !!move;
+    this.root?.toggleAttribute('data-head-step', !!move);
+    if (!move) return;
+    if (dom.headTitle.textContent !== move.title) {
+      dom.headTitle.textContent = move.title;
+      dom.headDetail.textContent = move.detail;
+      this.announce(`${move.title}. ${move.detail}`);
+    }
+  }
+
   /** One showing of one target. Null when interrupted (pause, resize). */
-  private async presentTarget(frac: Point, appear: boolean, signal: AbortSignal): Promise<CalibrationSample[] | null> {
+  private async presentTarget(
+    frac: Point,
+    appear: boolean,
+    signal: AbortSignal,
+    hold?: { durationMs: number; settleMs: number },
+  ): Promise<CalibrationSample[] | null> {
     signal.throwIfAborted();
     const step = new AbortController();
     const forward = (): void => step.abort(signal.reason);
@@ -1124,7 +1292,8 @@ export class CalibrationOverlay implements Mountable {
     this.stepCtl = step;
     try {
       const target = targetPoint(frac, this.measureViewport());
-      this.placeTarget(target, appear);
+      const durationMs = hold?.durationMs ?? this.timing.targetMs;
+      this.placeTarget(target, appear, durationMs);
       this.renderHud();
       await this.sleep(appear ? this.timing.appearMs : this.timing.glideMs, step.signal);
 
@@ -1132,12 +1301,12 @@ export class CalibrationOverlay implements Mountable {
       const t0 = performance.now();
       const collector: Collector = {
         target,
-        from: t0 + this.timing.settleMs,
-        until: t0 + this.timing.targetMs,
+        from: t0 + (hold?.settleMs ?? this.timing.settleMs),
+        until: t0 + durationMs,
         samples: [],
       };
       this.collector = collector;
-      await this.sleep(this.timing.targetMs, step.signal);
+      await this.sleep(durationMs, step.signal);
       this.collector = null;
 
       this.completeTarget();
@@ -1331,6 +1500,11 @@ export class CalibrationOverlay implements Mountable {
       else this.pause('user');
       return;
     }
+    if (this.headStep && (e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      this.skipHeadStep();
+      return;
+    }
     if (e.key === 'Enter' && this.phase === 'positioning') {
       e.preventDefault();
       this.tryStart();
@@ -1361,6 +1535,9 @@ export class CalibrationOverlay implements Mountable {
         break;
       case 'continue':
         this.resume();
+        break;
+      case 'skip-head':
+        this.skipHeadStep();
         break;
       case 'use':
         this.onChoice?.('use');
@@ -1712,14 +1889,14 @@ export class CalibrationOverlay implements Mountable {
     });
   }
 
-  private placeTarget(p: Point, appear: boolean): void {
+  private placeTarget(p: Point, appear: boolean, durationMs: number = this.timing.targetMs): void {
     const el = this.dom?.target;
     if (!el) return;
     el.classList.remove('is-shrinking', 'is-done');
     el.classList.toggle('is-instant', appear);
     el.style.setProperty('--x', `${p.x}px`);
     el.style.setProperty('--y', `${p.y}px`);
-    el.style.setProperty('--dur', `${this.timing.targetMs}ms`);
+    el.style.setProperty('--dur', `${durationMs}ms`);
     el.style.setProperty('--glide', `${this.timing.glideMs}ms`);
     el.style.setProperty('--pop', `${this.timing.popMs}ms`);
     el.dataset.x = String(p.x);
@@ -1756,7 +1933,7 @@ export class CalibrationOverlay implements Mountable {
     const dom = this.dom;
     const p = this.progress;
     if (!dom || !p) return;
-    dom.hudLabel.textContent = p.kind === 'point' ? 'Calibrating' : this.runMode === 'check' ? 'Accuracy check' : 'Checking accuracy';
+    dom.hudLabel.textContent = this.headStep ? 'Head movement' : p.kind === 'point' ? 'Calibrating' : this.runMode === 'check' ? 'Accuracy check' : 'Checking accuracy';
     dom.hudCount.textContent = `${p.index + 1} / ${p.total}`;
     dom.hudBar.style.setProperty('--p', String(p.index / p.total));
   }
@@ -1880,6 +2057,7 @@ export class CalibrationOverlay implements Mountable {
       };
       notes.unshift(`Before this refresh, tracking read ${said(check.before)}.${after ? ` Now: ${said(after)}.` : ''}`);
     }
+    if (view.headStep) notes.push(headStepNote(view.headStep));
     dom.note.textContent = notes.join(' ');
     const poor = report.quality === 'poor';
     const fullInstead = view.mode === 'quick' && poor;
@@ -2185,7 +2363,12 @@ export class CalibrationOverlay implements Mountable {
     const hud = el('div', 'hud', {}, hudLabel, hudCount, hudBar);
     const hint = el('p', 'hint', {}, 'Keep your eyes on the dot · ', kbd('Space'), ' or tap to pause · ', kbd('Esc'), ' cancel');
     const toast = el('p', 'toast', { 'aria-live': 'polite' });
-    const hudWrap = el('div', 'hudwrap', {}, hud, hint, toast);
+    // The head-movement step's instruction, in place of the dots' hint while it runs.
+    const headTitle = el('strong', 'head-title');
+    const headDetail = el('span', 'head-detail');
+    const headHint = el('div', 'headhint', {}, headTitle, headDetail, button('Skip this step', 'skip-head', false, 'S'));
+    headHint.hidden = true;
+    const hudWrap = el('div', 'hudwrap', {}, hud, hint, headHint, toast);
     const pauseTitle = el('h2', 'title', { id: id('pause-title') }, 'Paused');
     const pauseText = el('p', 'lede');
     const pause = el(
@@ -2349,6 +2532,10 @@ export class CalibrationOverlay implements Mountable {
       hudLabel,
       hudCount,
       hudBar,
+      hint,
+      headHint,
+      headTitle,
+      headDetail,
       toast,
       pause,
       pauseTitle,
@@ -2562,6 +2749,31 @@ function errorMessage(err: unknown): string {
   return err instanceof Error && err.message ? err.message : 'Something went wrong during calibration.';
 }
 
+/** The movements a head-movement step learned from, in words ("nodding and turning"). */
+function learnedMovements(learned: PoseFit['learned']): string {
+  const parts = [learned.b ? 'nodding' : null, learned.a ? 'turning' : null, learned.roll ? 'tilting' : null].filter((x): x is string => x !== null);
+  return parts.length <= 1 ? (parts[0] ?? '') : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+/** The short notice right after the head-movement step. */
+function headStepNotice(step: HeadStepSummary): string {
+  if (step.learned) return 'Got it — I’ll allow for your head moving.';
+  return step.reason === 'still' ? 'Your head hardly moved, so I’ll carry on without that.' : 'I couldn’t learn from that, so I’ll carry on without it.';
+}
+
+/** The same, for the results card. */
+function headStepNote(step: HeadStepSummary): string {
+  if (step.learned) {
+    const all = step.learned.a && step.learned.b && step.learned.roll;
+    return all
+      ? 'Head movement: learned, so shifting in your seat should move tracking much less.'
+      : `Head movement: learned from ${learnedMovements(step.learned)} only (the other movements were too small to learn from).`;
+  }
+  if (step.reason === 'skipped') return 'Head movement: skipped, so tracking will shift when your head does. A full calibration offers the step again.';
+  if (step.reason === 'still') return 'Head movement: not learned (your head hardly moved), so tracking will shift when your head does.';
+  return 'Head movement: not learned this time, so tracking will shift when your head does.';
+}
+
 function trainingFailureMessage(err: unknown): string {
   if (err instanceof RangeError) return 'The eye tracker’s data changed part-way through. Please try again.';
   return errorMessage(err);
@@ -2728,6 +2940,18 @@ function buildStyles(): string {
   transform-origin: left center; transform: scaleX(var(--p, 0)); transition: transform 300ms ease;
 }
 .${p}-hint { margin: 0; color: var(--c-muted); font-size: 14px; text-align: center; padding: 0 16px; }
+.${p}-headhint {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  max-width: min(34rem, calc(100vw - 32px)); padding: 12px 18px; border-radius: 14px;
+  background: var(--c-surface); color: var(--c-fg); text-align: center;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.18); pointer-events: auto;
+}
+.${p}-headhint[hidden] { display: none; }
+/* The instruction sits just under the dot the eyes must stay on, not at the edge of the screen:
+   reading it at the top took the eyes a third of a screen away while the frames were counted. */
+.${p}[data-head-step] .${p}-hudwrap { top: calc(50% + 56px); bottom: auto; flex-direction: column-reverse; }
+.${p}-head-title { font-size: 20px; font-weight: 700; }
+.${p}-head-detail { font-size: 15px; color: var(--c-muted); }
 .${p}-toast {
   margin: 0; padding: 7px 16px; border-radius: 999px;
   background: var(--c-fg); color: var(--c-bg); font-size: 14px; font-weight: 600;
