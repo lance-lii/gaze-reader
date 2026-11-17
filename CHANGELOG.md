@@ -367,6 +367,14 @@ position sat a line or two off after shifting in the chair, and page turns came 
 
 ### Testing
 
+- **A first measurement on real faces** (`docs/REAL_DATA.md`, `bench/realdata/`). The calibration
+  is scored on MPIIFaceGaze: 15 people, about 45,000 laptop-webcam pictures with known gaze points.
+  Nothing in the app changes. What it found: the calibration's error roughly doubles (4.3° to 9.2°)
+  once the head is more than 10° from where it was at calibration; leaving head pose out of the
+  personal fit, as 1.1 does on the simulator's advice, is worse on real faces than leaving it in;
+  and a model fitted on other people's faces holds up much better (4.1° to 5.4°). The simulator
+  disagrees with the real faces on that last point. The dataset is CC BY-NC-SA 4.0, so neither it
+  nor anything fitted to it is in the repository; the suites skip themselves when it is absent.
 - **A harder end-to-end simulation, compared scenario by scenario.** The simulated reader of
   `npm run eval` now also does what made the page-end rules look better than they are:
   - after finishing a page, now and then pauses or re-reads for 1.6–4 s before looking below it to turn it;
