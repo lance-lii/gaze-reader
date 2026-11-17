@@ -6,8 +6,8 @@ import { BASE_POSE, calibrationSession, DEG, frameFeatures, gauss, headFollow, m
 import { LINE_PX, mean } from './harness';
 
 /**
- * Scoreboard: how far a change of posture after calibration moves the predicted gaze, and what
- * using head yaw/pitch as gaze features costs. Run with `npm run bench`; the fast guard is in
+ * Scoreboard: how far a change of posture after calibration moves the predicted gaze, what using
+ * the head's pose as gaze features costs, and what the distance compensation gains. Run with `npm run bench`; the fast guard is in
  * tests/lightingRobustness.test.ts.
  *
  * The reader calibrates in BASE_POSE (60 cm, chin 4° down), then reads the 45-point reading grid
@@ -16,15 +16,22 @@ import { LINE_PX, mean } from './harness';
  * leave-one-target-out error, "val" the error on 7 off-grid dots in the calibration posture
  * (8 seeds each).
  *
- * - "1.1": head yaw and pitch are gaze features (fitted linearly to calibration's tenths of a
- *   degree of head movement).
- * - "now": yaw and pitch are in GAZE_EXCLUDED_FEATURES. The corner-referenced iris already says
- *   where the eyes point relative to the camera, head turn included.
+ * - "1.1": the whole head pose is a set of gaze features (fitted linearly to calibration's tenths
+ *   of a degree and millimetres of head movement).
+ * - "pose": head yaw and pitch are excluded, roll and head position (tx, ty, tz, faceScale) still
+ *   fitted. The corner-referenced iris already says where the eyes point relative to the camera,
+ *   head turn included.
+ * - "now": no head-pose feature is fitted (all in GAZE_EXCLUDED_FEATURES); a change of distance is
+ *   corrected geometrically instead (DepthCompensation in calibrationModel.ts). The simulated
+ *   camera sits 83 px above the middle of the viewport's top edge; the model assumes 136 px.
+ * - "now, camera 4 cm off": the same with the camera assumed 170 px higher still (a guess that is
+ *   badly off), to show what the assumption is worth.
  */
 
 const POSTURES: { label: string; delta: Partial<Pose> }[] = [
   { label: 'back 6 cm', delta: { tz: -66 } },
   { label: 'in 6 cm', delta: { tz: -54 } },
+  { label: 'in 10 cm', delta: { tz: -50 } },
   { label: 'right 3 cm', delta: { tx: 3 } },
   { label: 'down 2 cm', delta: { ty: -7 } },
   { label: 'chin −4°', delta: { pitch: 8 * DEG } },
@@ -43,15 +50,24 @@ const VALIDATION = [
   { x: 0.6, y: 0.85 },
 ];
 
-const CONFIGS = {
-  '1.1': [...GAZE_EXCLUDED_FEATURES].filter((n) => n !== 'yaw' && n !== 'pitch'),
-  now: [...GAZE_EXCLUDED_FEATURES],
-} as const;
+const POSE = ['yaw', 'pitch', 'roll', 'tx', 'ty', 'tz', 'faceScale'];
+const CONFIGS: Record<string, { excluded: string[]; camera?: { x: number; y: number } }> = {
+  '1.1': { excluded: [...GAZE_EXCLUDED_FEATURES].filter((n) => !POSE.includes(n)) },
+  pose: { excluded: [...GAZE_EXCLUDED_FEATURES].filter((n) => !POSE.includes(n) || n === 'yaw' || n === 'pitch') },
+  now: { excluded: [...GAZE_EXCLUDED_FEATURES] },
+  'now, camera 4 cm off': { excluded: [...GAZE_EXCLUDED_FEATURES], camera: { x: VIEW.width / 2, y: -306 } },
+};
 
 const SEEDS = [1, 2, 3, 4, 5, 6, 7, 8];
 
-function train(samples: CalibrationSample[], excluded: readonly string[]): { model: RidgeGazeModel; cv: number } {
-  const { model, report } = trainGazeModel(samples, { viewport: { ...VIEW }, maxBlink: 0.85, featureNames: FEATURE_NAMES, excludedFeatures: excluded });
+function train(samples: CalibrationSample[], cfg: { excluded: string[]; camera?: { x: number; y: number } }): { model: RidgeGazeModel; cv: number } {
+  const { model, report } = trainGazeModel(samples, {
+    viewport: { ...VIEW },
+    maxBlink: 0.85,
+    featureNames: FEATURE_NAMES,
+    excludedFeatures: cfg.excluded,
+    ...(cfg.camera ? { camera: cfg.camera } : {}),
+  });
   return { model, cv: report.meanErrorPx };
 }
 
@@ -73,19 +89,19 @@ function postureShift(model: RidgeGazeModel, pose: Pose, seed: number, noise: No
 }
 
 describe('posture after calibration (scoreboard)', () => {
-  it('prints the shift per posture change, 1.1 vs now', () => {
+  it('prints the shift per posture change: 1.1, pose weights, now', () => {
     const worlds: WorldName[] = ['W1', 'W2', 'W3', 'W4', 'W5'];
     const head = ['world', 'model', 'cv', 'val', ...POSTURES.map((p) => p.label)];
     const lines = [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`];
-    const worst: Record<keyof typeof CONFIGS, number> = { '1.1': 0, now: 0 };
+    const worst: Record<string, number> = Object.fromEntries(Object.keys(CONFIGS).map((k) => [k, 0]));
     for (const w of worlds) {
       const noise = WORLDS[w].noise;
-      for (const [name, excluded] of Object.entries(CONFIGS) as [keyof typeof CONFIGS, readonly string[]][]) {
+      for (const [name, cfg] of Object.entries(CONFIGS)) {
         const cv: number[] = [];
         const val: number[] = [];
         const cells = POSTURES.map(() => ({ dx: [] as number[], dy: [] as number[] }));
         for (const seed of SEEDS) {
-          const t = train(calibrationSession(seed, { noise }), excluded);
+          const t = train(calibrationSession(seed, { noise }), cfg);
           cv.push(t.cv);
           val.push(evaluateModel(t.model, calibrationSession(seed + 1000, { noise, targets: VALIDATION }), { maxBlink: 0.85 }).meanErrorPx);
           POSTURES.forEach((p, k) => {
@@ -97,13 +113,14 @@ describe('posture after calibration (scoreboard)', () => {
         // Each reader has one calibration: average the size of each calibration's shift (signed
         // shifts of noise-fitted weights would cancel across calibrations).
         const shifts = cells.map((c) => ({ dy: mean(c.dy.map(Math.abs)) / LINE_PX, dx: mean(c.dx.map(Math.abs)) }));
-        worst[name] = Math.max(worst[name], ...shifts.map((s) => s.dy));
+        worst[name] = Math.max(worst[name]!, ...shifts.map((s) => s.dy));
         lines.push(
           `| ${w} | ${name} | ${(mean(cv) / LINE_PX).toFixed(2)} | ${(mean(val) / LINE_PX).toFixed(2)} | ${shifts.map((s) => `${s.dy.toFixed(2)} / ${s.dx.toFixed(0)}`).join(' | ')} |`,
         );
       }
     }
     console.log(`\n### Posture after calibration (lines; posture cells |dy| lines / |dx| px)\n${lines.join('\n')}`);
-    expect(worst.now).toBeLessThan(worst['1.1']);
+    expect(worst.now).toBeLessThan(worst['1.1']!);
+    expect(worst.now).toBeLessThanOrEqual(worst.pose!);
   });
 });

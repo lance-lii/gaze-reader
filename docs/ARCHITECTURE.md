@@ -163,8 +163,8 @@ features are now corner-referenced iris features with a 5-point iris centre (mea
 (`rightU5, rightVc5, leftU5, leftVc5, meanU5, meanVc5`, appended to FEATURE_NAMES). The lid-driven
 or superseded features (`eyeBlinkLeft/Right, rightOpen, leftOpen, rightLidY, leftLidY, rightV,
 leftV, meanV, rightU, leftU, meanU`, `GAZE_EXCLUDED_FEATURES`) are still extracted (blink gating,
-the eyelid monitor, diagnostics) but get exactly zero weight. `eyeLook*`, head roll and head position
-(`tx, ty, tz, faceScale`) stay; head yaw and pitch are excluded too (see *Head rotation* below). A 10 %
+the eyelid monitor, diagnostics) but get exactly zero weight. `eyeLook*` stay; the head's pose (`yaw,
+pitch, roll, tx, ty, tz, faceScale`) is excluded too (see *Head pose* below). A 10 %
 squint now moves the gaze 0.2–1.1 lines with the simulator's default 60/40 lower/upper-lid split.
 When the upper lid alone drops (the typical light response above), it moves 0.5–2.8 lines (1.0:
 1.7–5.5). The residual comes from the `eyeLook*` scores' lid coupling, and the reading layer's
@@ -181,10 +181,37 @@ reader who later sat with their chin 4° lower read 1.5–2.3 lines low; a 4° t
 70–122 px. `yaw` and `pitch` are therefore in `GAZE_EXCLUDED_FEATURES`: the same chin drop now
 moves the gaze 0.9–1.4 lines, the turn ≈ 43 px, and cross-validated calibration error is equal or
 better in all five worlds (bench/lighting/posture.bench.test.ts; guards in
-tests/lightingRobustness.test.ts). Roll stays (the features are measured in a face-aligned frame,
-which rolls with the head), and so does head position: leaning in or back changes the angle to the
-screen. Posture features enter linearly and stay clamped at ±6 calibration SDs; unclamped, the
-position weights extrapolate worse.
+tests/lightingRobustness.test.ts).
+
+**Head pose is not a gaze feature at all, and distance is corrected by geometry** (revised again
+after that). The same argument holds for roll and head position (`tx, ty, tz, faceScale`): the
+reader keeps still while calibrating, so their weights were fitted to millimetres of movement and
+then applied to centimetres. Sitting 3 cm to one side moved the gaze 0.8–1.1 lines; leaning 6 cm in
+or back 0.6–1.2, 10 cm about 2. They are all in
+`GAZE_EXCLUDED_FEATURES` now, and the one posture change whose effect is known is applied after the
+regression (`DepthCompensation` in calibrationModel.ts). The eye features are normalized by the
+eye's width, so they measure an angle (between where the eyes point and the line from the eye to
+the camera) that doesn't depend on distance; with the camera in the screen's plane the point looked
+at is distance × that angle away from the camera. The ridge maps learn that product at the
+calibration distance, so
+
+    gaze = camera + (distance now / distance at calibration) × (ridge prediction − camera)
+
+with the ratio read from `faceScale / cos(yaw)` (calibration's median over the current frame's,
+clamped to 0.7–1.4) and the camera taken to be 36 px above the middle of the top edge of the screen
+the window is on (`screen.availLeft/availTop/width`, less the browser chrome, which the model's
+screen space leaves out; above the middle of the viewport when there is no usable screen). A
+sideways or vertical move needs no correction: the reference line moves with the head. In
+simulation the 6 cm lean now moves the gaze 0.14–0.28 lines, 10 cm 0.13–0.19, 3 cm sideways
+0.17–0.24, a 4° tilt 0.16–0.23 (0.5–0.7), and cross-validated calibration error fell in all five
+worlds (1.14–1.48 → 1.07–1.24 lines); with the camera assumed 4 cm from where it is, the leans
+still cost only 0.3–0.7. End to end (`npm run eval`, Balanced, 33 simulated hours) unintended
+turns fell from 4.3 to 1.6 an hour, missed pages from 16.4 % to 13.2 %, and fixations on the
+reader's line rose from 74.9 % to 83.3 %. Not corrected: head pitch and yaw (a 4° chin drop still
+moves the gaze about a line, through the small depth offset between the eye corners and the
+eyeball's centre, which differs between people and can't be learned from a still head), and a
+camera that isn't near the top of the screen being read. Models saved before this carry no `depth`
+entry and keep predicting as they did until the reader recalibrates.
 
 MediaPipe 1.0.1 facts (verified in `node_modules/@mediapipe/tasks-vision/vision.d.ts`):
 `FilesetResolver.forVisionTasks(basePath)`, `FaceLandmarker.createFromOptions(fileset,
@@ -215,8 +242,9 @@ export function qualityFromError(errorPx: number, viewportHeight: number, linePi
 ```
 Model: standardize features (z-score from training data), neutralize `GAZE_EXCLUDED_FEATURES`
 (standardized value forced to 0 in training and prediction), expand with degree-2 terms for the
-strongest gaze features (iris `u5`/`vc5`, lookUp/Down) plus linear head pose, then two independent
-ridge regressions (x, y). The model kind is `gr-ridge-poly2-iris5`; 1.0 models are rejected on
+strongest gaze features (iris `u5`/`vc5`, lookUp/Down), then two independent
+ridge regressions (x, y), then the distance compensation (scale about the camera, see *Head pose*
+above) and the quick refresh's affine adjustment, both in screen space. The model kind is `gr-ridge-poly2-iris5`; 1.0 models are rejected on
 load and `calibrationUpgradeNeeded(json)` / `savedCalibrationNeedsUpgrade()` tell the app to ask
 for one recalibration. Every model stores a `CalibrationEnvironment`: the lighting signature built
 while the dots were shown, and an eyelid `AppearanceBaseline` (openness as a Theil–Sen line in the
@@ -226,7 +254,7 @@ is the accuracy check's measurement (mean signed prediction − target over the 
 drop samples with blink > 0.5 and per-target outliers (> 2.5 MAD) before fitting. `predict`
 returns viewport px compensated for window moves since calibration (store `window.screenX/Y` at
 train time; subtract the delta). Serialize everything needed (means, stds, weights, feature-length,
-viewport, screen offset, trainedAt). Reject deserialization when the feature length changed.
+viewport, screen offset, trainedAt, `depth`: reference face scale, camera point, feature indices). Reject deserialization when the feature length changed.
 
 ```ts
 // calibrationOverlay.ts
