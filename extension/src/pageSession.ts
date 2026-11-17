@@ -276,6 +276,10 @@ export class PageSession {
   private hidden = document.visibilityState === 'hidden';
   private turning = false;
   private ignoreScrollUntil = 0;
+  /** The reader is scrolling the page by hand: the measured lines are stale until it settles. */
+  private scrollSettling = false;
+  /** The reading pipeline skipped samples (a turn, a scroll): the next one starts a fresh fixation. */
+  private pipelineWasBlocked = false;
   private endAnnounced = false;
   private viewportWarned = false;
   private lastSampleAt = 0;
@@ -551,6 +555,7 @@ export class PageSession {
   private bindScroller(scroller: Scroller): void {
     if (scroller === this.scroller && this.scroll) return;
     this.scrollerDisposer?.dispose();
+    this.scrollSettling = false; // the old scroller's settle timer went with its listeners
     this.otherTurns += this.scroll?.pagesTurned ?? 0;
     this.scroll?.destroy();
     this.scroller = scroller;
@@ -558,7 +563,13 @@ export class PageSession {
     const sd = new Disposer();
     const settled = debounce(sd, () => this.onScrollSettled(), 120);
     const onScroll = () => {
-      if (this.turning || this.scroll?.animating || performance.now() < this.ignoreScrollUntil) return;
+      if (this.turning || this.scroll?.animating) return;
+      // The trailing event of a turn that has already been measured. A scroll of the reader's own
+      // in that window moved the page past the measured position, and is not ignored.
+      if (performance.now() < this.ignoreScrollUntil && this.layoutMatchesScroll()) return;
+      // Until it settles the lines aren't where they were measured: the reading pipeline waits
+      // (see pipelineBlocked), as it does in the app.
+      this.scrollSettling = true;
       this.pageEnd.notifyScrolled(performance.now());
       settled();
     };
@@ -667,7 +678,24 @@ export class PageSession {
     return resolvePageTurn(this.ext.pageTurn, this.readingMode, this.scroller ? scrollMetrics(this.scroller) : null);
   }
 
+  /** True when the page is where the current layout was measured. */
+  private layoutMatchesScroll(): boolean {
+    const scroller = this.scroller;
+    if (!this.layout || !scroller) return false;
+    return Math.abs(scrollMetrics(scroller).scrollTop - this.layout.scrollTop) < 1;
+  }
+
+  /**
+   * The reading model only sees samples while the text is where it was measured: not during a
+   * page turn's animation or while the reader scrolls. Fixations scored against lines that have
+   * moved put the reader lines away from where they are, or teach the tracker a gaze offset.
+   */
+  private pipelineBlocked(): boolean {
+    return this.turning || this.scrollSettling || (this.scroll?.animating ?? false);
+  }
+
   private onScrollSettled(): void {
+    this.scrollSettling = false;
     this.remeasure('scroll');
     this.fixations.reset();
     if (this.scroll && !this.scroll.atEnd()) this.endAnnounced = false;
@@ -1084,6 +1112,15 @@ export class PageSession {
     // meaningless gaze offset there (±5 lines of it), which the gaze dot would then subtract. It
     // sits out page mode and keeps what it learned on real text.
     const text = this.readingMode === 'text';
+    if (this.pipelineBlocked()) {
+      this.pipelineWasBlocked = true;
+      return;
+    }
+    if (this.pipelineWasBlocked) {
+      // Don't let a fixation straddle a turn or a scroll.
+      this.pipelineWasBlocked = false;
+      this.fixations.reset();
+    }
     const { completed } = this.fixations.push(s);
     if (completed) {
       const estimate = text ? this.tracker.onFixation(completed) : null;
@@ -1096,7 +1133,7 @@ export class PageSession {
     if (text) this.tracker.onSample(s);
 
     const scroll = this.scroll;
-    if (!scroll || this.turning || scroll.animating || this.paused || !this.getSettings().autoScroll) return;
+    if (!scroll || this.paused || !this.getSettings().autoScroll) return;
     // Page mode's pseudo-lines were never read: only the geometric rules (glance-down, bottom-dwell) may fire.
     const estimate = this.readingMode === 'page' ? null : this.tracker.estimate;
     const decision = this.pageEnd.update({ t: s.t, gaze: s, estimate, layout: this.layout, pageMode: this.readingMode === 'page' });
