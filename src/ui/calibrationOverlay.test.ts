@@ -8,6 +8,7 @@ import { accuracyCheckView } from '../app/logic';
 import {
   CHECK_TARGETS,
   CalibrationOverlay,
+  DEFAULT_CALIBRATION_TIMING,
   DEFAULT_POSITION_THRESHOLDS,
   QUICK_TARGETS,
   STANDARD_TARGETS,
@@ -140,6 +141,8 @@ interface Reader {
   squint: number | undefined;
   /** Page zoom relative to the calibration: the eyes look at CSS px / zoom in calibration-time px. */
   zoom: number;
+  /** Reads a notice (toast) for as long as it is on screen, at the top of the window, instead of following the dot. */
+  readsNotices: boolean;
   pointIndex: number;
   attempt: number;
 }
@@ -157,6 +160,7 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
     lighting: null,
     squint: undefined,
     zoom: 1,
+    readsNotices: false,
     pointIndex: -1,
     attempt: 0,
   };
@@ -174,6 +178,7 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
     if ((phase === 'targets' || phase === 'validating') && target?.dataset.x && target.dataset.y) {
       gaze = { x: Number(target.dataset.x), y: Number(target.dataset.y) };
     }
+    if (reader.readsNotices && scope.querySelector('.gr-cal-toast.is-on')) gaze = { x: VW / 2, y: 30 };
     if (!reader.faceFound) {
       src.push({ t: performance.now(), faceFound: false, features: null, quality: 0 });
       return;
@@ -539,6 +544,30 @@ describe('CalibrationOverlay — standard flow', () => {
     await expect(done).resolves.toBeNull();
     expect(events.at(-1)).toEqual({ phase: 'cancelled' });
     ctx.sim.stop();
+  });
+
+  it('waits for the "once more" notice to clear before the repeated dot counts', async () => {
+    // A reader who reads the notice looks at it, not at the dot. Without the wait the repeated dot
+    // collected most of its samples meanwhile, and the calibration learned that spot wrong.
+    const run = async (noticeMs: number): Promise<number> => {
+      const ctx = setup({ timing: { noticeMs } });
+      ctx.sim.reader.readsNotices = true;
+      ctx.sim.reader.closeEyes = (index, attempt) => (index === 2 || index === 7) && attempt === 0;
+      const done = ctx.overlay.run();
+      await startCalibration(ctx);
+      await advanceUntil(() => ctx.root.dataset.phase === 'results', 120_000, 250);
+      expect(ctx.events.filter((e) => e.phase === 'point' && e.message === 'retry')).toHaveLength(2);
+      ctx.q<HTMLButtonElement>('[data-action="use"]').click();
+      const result = await done;
+      ctx.sim.stop();
+      ctx.host.remove();
+      return result!.report.meanErrorPx;
+    };
+    const waited = await run(DEFAULT_CALIBRATION_TIMING.noticeMs);
+    const rushed = await run(0);
+    expect(DEFAULT_CALIBRATION_TIMING.noticeMs).toBeGreaterThanOrEqual(1800); // as long as the notice is shown
+    expect(waited).toBeLessThan(25);
+    expect(rushed).toBeGreaterThan(waited * 1.5);
   });
 
   it('repeats a target that collected too few samples', async () => {
