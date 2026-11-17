@@ -89,7 +89,8 @@ import type { PortLike } from './ports';
 import { RemoteFeatureSource, RemoteTrackerError, type RemoteSourceStatus } from './remoteFeatureSource';
 import { isTypingContext, matchShortcut, type ShortcutAction } from './shortcuts';
 import { TouchUpAdvisor, type TouchUpOffer } from './touchUp';
-import { zoomAware, zoomAwareFromJSON, type ZoomAwareGazeModel } from './zoomModel';
+import { ZoomAwareGazeModel, currentDevicePixelRatio, zoomAwareFromJSON } from './zoomModel';
+import { currentChromeTop, modelChromeTop } from '../../src/gaze/calibrationModel';
 
 export const HOST_TAG = 'gaze-reader-root';
 /** The host must sit above everything the page draws; our components order themselves inside it with Z.*. */
@@ -258,6 +259,12 @@ export class PageSession {
   private calibrationDeclined = false;
   /** What to run once the camera is running: a (re)calibration, or the accuracy check / quick refresh. */
   private runWhenReady: CalibrationMode | null = null;
+  /** Ticks left in which to look again for the page's main text (see relocateIfBetter). */
+  private relocateTries = 0;
+  /** The browser-chrome height a "the page moved inside the window" notice was shown for; null: none showing. */
+  private chromeWarnedAt: number | null = null;
+  /** Our element on the page (the shadow root's host). */
+  private host: HTMLElement | null = null;
   private awaitingPermission = false;
 
   /** Lighting and eyelids compared with calibration (webcam only). */
@@ -273,7 +280,7 @@ export class PageSession {
   private shown: TrackingState | null = null;
   private shownDetail: string | null = null;
   private paused = false;
-  private hidden = document.visibilityState === 'hidden';
+  private hidden = tabHidden();
   private turning = false;
   private ignoreScrollUntil = 0;
   /** The reader is scrolling the page by hand: the measured lines are stale until it settles. */
@@ -291,6 +298,8 @@ export class PageSession {
   private readonly lineConfidence = new LineConfidenceWatch();
   private unsureExplained = false;
   private readingMs = 0;
+  /** Date.now() of the last tick that counted as reading (for the eye-break rest rule). */
+  private lastReadingWall: number | null = null;
   private totalReadingMs = 0;
   private lastProgressAt = 0;
   private wordCount = 0;
@@ -363,6 +372,8 @@ export class PageSession {
       if (Math.abs(window.innerWidth - lastWidth) > 0.5) this.scroll?.clearHistory();
       lastWidth = window.innerWidth;
       this.remeasure('resize');
+      // Fullscreen and toolbars change the window's size too: has the page moved inside it?
+      if (this.sourceKind === 'webcam' && this.model && !this.calibration && !this.hidden) this.checkCalibrationChrome(this.model);
     }, 150);
     d.listen(window, 'resize', onResize, { passive: true });
     d.listen(document, 'visibilitychange', () => this.onVisibilityChange());
@@ -515,6 +526,7 @@ export class PageSession {
     root.append(style);
     // On <html>, not <body>: a transformed body would break position: fixed.
     document.documentElement.append(host);
+    this.host = host;
     this.root = root;
     this.d.add(() => host.remove());
   }
@@ -537,8 +549,32 @@ export class PageSession {
   private locateContent(): void {
     this.main = findMainContent(document);
     this.href = location.href;
+    // Nothing better than the whole body yet (an article that renders a moment after the address
+    // changes, a page still loading): look again for a while, see tick().
+    this.relocateTries = this.main === document.body ? RELOCATE_TRIES : 0;
     this.observeMain();
     this.bindScroller(this.pickScroller());
+    // Offsets of page turns made in what was here before point into other text now.
+    this.scroll?.clearHistory();
+  }
+
+  /** While only the body was found: has the page's real text arrived since? */
+  private relocateIfBetter(): void {
+    if (this.relocateTries <= 0 || this.turning || this.calibration) return;
+    this.relocateTries--;
+    if (this.main !== document.body) {
+      this.relocateTries = 0;
+      return;
+    }
+    let found: Element;
+    try {
+      found = findMainContent(document);
+    } catch {
+      return;
+    }
+    if (found === document.body) return;
+    this.locateContent();
+    this.remeasure('content');
   }
 
   /**
@@ -714,6 +750,8 @@ export class PageSession {
     this.resetPipeline();
 
     if (kind === 'mouse') {
+      // A check or refresh asked for while the camera had failed belongs to the camera.
+      this.runWhenReady = null;
       this.releaseCamera(false);
       const mouse = new MouseGazeSource({ noisePx: () => this.getSettings().mouseNoisePx, target: window });
       this.attachGaze(mouse);
@@ -944,6 +982,8 @@ export class PageSession {
       featureNames: FEATURE_NAMES,
       // "≈ N lines" in the results uses this page's real line spacing.
       linePitchPx: () => this.layout?.linePitch,
+      // The page's own scripts must not be able to cancel or pause a calibration with fake key presses.
+      isTrustedKey: (e) => (this.deps.isTrustedKey ? this.deps.isTrustedKey(e) : e.isTrusted),
     });
     const gen = this.sourceGen;
     this.calibration = overlay;
@@ -951,12 +991,19 @@ export class PageSession {
     this.setBase('calibrating');
     this.pill.setHidden(true);
     let result: Awaited<ReturnType<CalibrationOverlay['run']>> = null;
+    // The zoom the model is trained at: read when the training happens, not when the reader presses
+    // "Use it" (zooming on the results screen recorded the wrong zoom for every site).
+    let trainedDpr = currentDevicePixelRatio();
+    const offPhase = this.bus.on('calibration', (e) => {
+      if (e.phase === 'training' || e.phase === 'validating') trainedDpr = currentDevicePixelRatio();
+    });
     try {
       overlay.mount(this.root);
       result = await overlay.run();
     } catch (err) {
       console.warn('[gaze-reader] calibration failed', err);
     } finally {
+      offPhase();
       overlay.destroy();
       if (this.calibration === overlay) this.calibration = null;
       if (!this.disposed) this.pill.setHidden(false);
@@ -966,7 +1013,7 @@ export class PageSession {
 
     if (result) {
       // Trained (or corrected) at this page's zoom; the wrapper records it so other sites map correctly.
-      this.adoptModel(zoomAware(result.model));
+      this.adoptModel(result.model instanceof ZoomAwareGazeModel ? result.model : new ZoomAwareGazeModel(result.model, trainedDpr));
       if (sourceChanged) return;
       // A tune-up or the check's "Correct it" re-centres the model in use and says so in `check`;
       // without it this was a full calibration (asked for, or where a tune-up couldn't help).
@@ -1088,11 +1135,39 @@ export class PageSession {
   /** A model trained for a very different window size maps gaze poorly (page zoom is already accounted for). */
   private checkCalibrationViewport(): void {
     const m = this.model;
-    if (!m || this.viewportWarned) return;
+    if (!m) return;
+    this.checkCalibrationChrome(m);
+    if (this.viewportWarned) return;
     if (m.viewportChange({ width: window.innerWidth, height: window.innerHeight }) < 0.2) return;
     this.viewportWarned = true;
     this.pill.notify({
       text: 'Your window size changed since you calibrated. Recalibrating (about a minute) keeps page turns accurate.',
+      tone: 'info',
+      actions: [{ label: 'Recalibrate', run: () => this.recalibrate() }],
+      timeoutMs: 15_000,
+    });
+  }
+
+  /**
+   * The page sits somewhere else inside the window than when the reader calibrated: fullscreen, a
+   * bookmarks bar shown or hidden, a window without toolbars. The window's own position says
+   * nothing about that, and the gaze is then off by the height that changed (35–110 px: one to
+   * four lines of text). Said once per change; the reading model also learns the offset by itself.
+   */
+  private checkCalibrationChrome(m: ZoomAwareGazeModel): void {
+    const then = modelChromeTop(m.inner);
+    const now = currentChromeTop();
+    if (then === null || now === null) return;
+    const moved = Math.abs(now - then);
+    const tolerance = Math.max(20, 0.5 * (this.layout?.linePitch ?? 0));
+    if (moved <= tolerance) {
+      this.chromeWarnedAt = null;
+      return;
+    }
+    if (this.chromeWarnedAt !== null && Math.abs(this.chromeWarnedAt - now) <= tolerance) return;
+    this.chromeWarnedAt = now;
+    this.pill.notify({
+      text: 'The page sits higher or lower in the window than when you calibrated (fullscreen, or a toolbar shown or hidden), so your gaze reads a line or more off. Recalibrating fixes it; so does going back to how the window was.',
       tone: 'info',
       actions: [{ label: 'Recalibrate', run: () => this.recalibrate() }],
       timeoutMs: 15_000,
@@ -1404,6 +1479,10 @@ export class PageSession {
       return;
     }
     if (location.href !== this.href) this.remeasure('content'); // SPA navigation
+    else this.relocateIfBetter();
+    // The page removed our element (its own scripts, a framework re-rendering <html>): put it
+    // back, or the camera would be on with no pill to say so and no way to switch it off here.
+    if (this.host && !this.host.isConnected && !this.disposed) document.documentElement.append(this.host);
     // Little or no text in view: nothing else says when page mode should start, or when text is back.
     else if (this.modeMonitor.needsPolling) this.remeasure('resize');
     // A hidden tab has released the camera on purpose: no "can't see you" for that.
@@ -1426,11 +1505,22 @@ export class PageSession {
 
     const s = this.getSettings();
     if (this.shown === 'tracking' && dt < 5_000) {
+      // Five minutes without reading (another tab, a break, the laptop asleep) is the rest the
+      // reminder asks for: the count towards the next one starts over. By the wall clock, which
+      // keeps running while this tab's timers don't.
+      const wall = Date.now();
+      if (this.lastReadingWall !== null && wall - this.lastReadingWall >= BREAK_REST_MS) this.readingMs = 0;
+      this.lastReadingWall = wall;
       this.readingMs += dt;
       this.totalReadingMs += dt;
       if (s.breakReminders && this.readingMs >= s.breakIntervalMin * 60_000) {
-        this.bus.emit('break-due', { minutesReading: Math.round(this.readingMs / 60_000) });
+        const minutesReading = Math.round(this.readingMs / 60_000);
+        this.bus.emit('break-due', { minutesReading });
         this.readingMs = 0;
+        // Dewey delivers the reminder; hidden, he says nothing, so the pill does.
+        if (!s.buddyEnabled) {
+          this.pill.notify({ text: 'Time for an eye break: look at something about 6 metres (20 feet) away for 20 seconds.', tone: 'info', timeoutMs: 15_000 });
+        }
       }
     }
     if (now - this.lastProgressAt >= PROGRESS_EVERY_MS) {
@@ -1472,7 +1562,7 @@ export class PageSession {
   }
 
   private onVisibilityChange(): void {
-    const hidden = document.visibilityState === 'hidden';
+    const hidden = tabHidden();
     if (hidden === this.hidden) return;
     this.hidden = hidden;
     if (hidden) {
@@ -1503,6 +1593,27 @@ export class PageSession {
     this.bus.emit('buddy-say', { text, priority, mood });
   }
 }
+
+/** Seconds (ticks) for which a page whose main text wasn't found is searched again. */
+const RELOCATE_TRIES = 20;
+
+/**
+ * Whether this tab is hidden. Asked of Document's own getter as well as of `document`: a page can
+ * shadow `document.visibilityState` with a named element (`<img name="visibilityState">`), and a
+ * tab that then never reads "hidden" would keep the camera on behind every other tab.
+ */
+function tabHidden(): boolean {
+  let own: unknown;
+  try {
+    own = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState')?.get?.call(document);
+  } catch {
+    own = undefined;
+  }
+  return own === 'hidden' || document.visibilityState === 'hidden';
+}
+
+/** Reading that resumes after this long without any starts the eye-break count over. */
+const BREAK_REST_MS = 5 * 60_000;
 
 /** States in which live gaze quality decides what we show. */
 function isLiveState(s: TrackingState): boolean {

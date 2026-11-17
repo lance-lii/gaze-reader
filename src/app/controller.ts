@@ -305,6 +305,8 @@ export class AppController {
   private pdfAvailable = false;
   /** Stops the "Open from URL" download in flight, if any. */
   private urlAbort: AbortController | null = null;
+  /** Date.now() of the last heartbeat with a book open (the eye-break timer's wall clock). */
+  private lastHeartbeatWall: number | null = null;
   private openSeq = 0;
   private samples: readonly SampleBookInfo[] | null = null;
   private hasRecent = false;
@@ -1098,6 +1100,7 @@ export class AppController {
   }
 
   private startHeartbeat(): void {
+    this.lastHeartbeatWall = null;
     if (this.heartbeatId === null) this.heartbeatId = setInterval(this.heartbeat, HEARTBEAT_MS);
   }
 
@@ -1123,7 +1126,11 @@ export class AppController {
     const active = this.isActivelyReading(now);
     const dt = session.clock.tick(now, active);
     session.meter.update(this.reader.progress(), session.clock.minutes);
-    if (session.breaks.tick(dt, active, s.breakIntervalMin, s.breakReminders)) this.breakDue(session);
+    // By the wall clock (Date.now keeps running while the machine sleeps; performance.now may not).
+    const wall = Date.now();
+    const elapsed = this.lastHeartbeatWall === null ? dt : wall - this.lastHeartbeatWall;
+    this.lastHeartbeatWall = wall;
+    if (session.breaks.tick(dt, active, s.breakIntervalMin, s.breakReminders, elapsed)) this.breakDue(session);
     if (now - session.lastProgressEmitAt >= PROGRESS_EVERY_MS) this.emitProgress(now);
     if (++this.heartbeatCount % 4 === 0) this.updateProgressUi();
   };
@@ -1834,12 +1841,18 @@ export class AppController {
   /** Frames stopped arriving while the camera runs and the tab is visible: it froze (often after the laptop slept). */
   private watchCamera(now: number): void {
     const camera = this.camera;
-    if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !camera?.running) {
+    if (this.sourceKind !== 'webcam' || (this.phase !== 'running' && this.phase !== 'calibrating') || !camera?.running) {
       this.slowCameraSince = null;
       return;
     }
+    // Also in the middle of a calibration: a camera that froze there (the laptop woke up) left the
+    // dots on "I lost sight of your eyes" until Esc. The restart opens the calibration again.
     if (now - this.lastCameraFrameAt >= CAMERA_STALL_MS) {
       this.recoverCamera(new Error('The camera stopped sending pictures.'));
+      return;
+    }
+    if (this.calibration || this.phase !== 'running') {
+      this.slowCameraSince = null;
       return;
     }
     // Frames still come, but too few to follow the lines (an overloaded or throttled machine).
@@ -2837,6 +2850,9 @@ export class AppController {
       this.syncSource();
     }
     if (any(OVERLAY_KEYS)) this.updateOverlays();
+    // On a narrow window Dewey's corner makes room for him by moving the reading area: the lines
+    // are then somewhere else on screen, and nothing else (no scroll, no resize) says so.
+    if (any(['buddyCorner', 'buddyEnabled'])) this.scheduleMeasure('resize', 80);
     if (changed.includes('buddyEnabled') && !s.buddyEnabled && !this.settingsPanel.isOpen) this.deweyHidden();
   }
 

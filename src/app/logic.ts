@@ -449,16 +449,23 @@ export class BreakTimer {
 
   constructor(private readonly restResetMs = 5 * 60_000) {}
 
-  /** Returns true exactly once each time a break becomes due. */
-  tick(dtMs: number, active: boolean, intervalMin: number, enabled: boolean): boolean {
+  /**
+   * Returns true exactly once each time a break becomes due. `dtMs` is the reading-clock step
+   * (capped, so a stall doesn't count as reading); `elapsedMs` the time that really passed since
+   * the last tick, by the wall clock. They differ when the ticks stopped: the laptop slept, the
+   * tab was frozen. That time is rest, however it ended: read 15 minutes, close the lid for an
+   * hour, and the next reminder is a full interval away, not 5 minutes.
+   */
+  tick(dtMs: number, active: boolean, intervalMin: number, enabled: boolean, elapsedMs: number = dtMs): boolean {
     if (!enabled || !Number.isFinite(dtMs) || dtMs <= 0) {
       if (!enabled) this.sinceBreakMs = 0;
       return false;
     }
-    if (!active) {
-      this.idleMs += dtMs;
+    const away = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs - dtMs) : 0;
+    if (!active || away > 0) {
+      this.idleMs += active ? away : Math.max(dtMs, Number.isFinite(elapsedMs) ? elapsedMs : dtMs);
       if (this.idleMs >= this.restResetMs) this.sinceBreakMs = 0;
-      return false;
+      if (!active) return false;
     }
     this.idleMs = 0;
     this.sinceBreakMs += dtMs;
