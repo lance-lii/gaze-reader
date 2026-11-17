@@ -1,5 +1,5 @@
 import type { AppSettings, EventBus } from '../types';
-import { readJSON, writeJSON } from './storage';
+import { readJSON, storageKey, writeJSON } from './storage';
 import { IS_ARTIFACT } from './target';
 
 export const DEFAULT_SETTINGS: Readonly<AppSettings> = Object.freeze({
@@ -37,9 +37,12 @@ const KEY = 'settings.v1';
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
-/** Coerces untrusted input (storage, extension messages) into valid settings. */
-export function sanitizeSettings(input: unknown): AppSettings {
-  const s: AppSettings = { ...DEFAULT_SETTINGS };
+/**
+ * Coerces untrusted input (storage, extension messages) into valid settings. A key that is missing
+ * or invalid takes its value from `base` (the defaults, or the settings a patch is applied to).
+ */
+export function sanitizeSettings(input: unknown, base: Readonly<AppSettings> = DEFAULT_SETTINGS): AppSettings {
+  const s: AppSettings = { ...base };
   if (!input || typeof input !== 'object') return s;
   const src = input as Record<string, unknown>;
   const pick = <K extends keyof AppSettings>(k: K, ok: (v: unknown) => boolean) => {
@@ -82,6 +85,8 @@ export interface SettingsStore {
   /** Applies a patch, persists it and emits `settings-changed` with the keys that actually changed. */
   update(patch: Partial<AppSettings>): void;
   reset(): void;
+  /** Stops following changes made in other tabs (the app's store; absent elsewhere). */
+  dispose?(): void;
 }
 
 /**
@@ -92,20 +97,38 @@ export function createSettingsStore(bus: EventBus, opts: { persist?: boolean; in
   const persist = opts.persist ?? true;
   let current = sanitizeSettings(opts.initial ?? (persist ? readJSON<unknown>(KEY, null) : null));
 
-  function update(patch: Partial<AppSettings>): void {
-    const next = sanitizeSettings({ ...current, ...patch });
+  /** Makes `next` the settings and tells everyone what changed. */
+  function adopt(next: AppSettings): boolean {
     const changed = (Object.keys(next) as (keyof AppSettings)[]).filter((k) => next[k] !== current[k]);
-    if (changed.length === 0) return;
+    if (changed.length === 0) return false;
     current = next;
-    if (persist) writeJSON(KEY, current);
     bus.emit('settings-changed', { settings: current, changed });
+    return true;
+  }
+
+  function update(patch: Partial<AppSettings>): void {
+    // An invalid value in a patch leaves that setting as it is (it used to reset it to its default).
+    if (adopt(sanitizeSettings({ ...current, ...patch }, current)) && persist) writeJSON(KEY, current);
   }
 
   bus.on('settings-patch', (patch) => update(patch));
+
+  // Another tab of the app changed the settings: take them over, so that this tab shows them and
+  // its next change doesn't write its own stale copy of everything else back over them.
+  let dispose: (() => void) | undefined;
+  if (persist && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    const onStorage = (e: StorageEvent): void => {
+      if (e.key !== storageKey(KEY) || e.newValue === null) return;
+      adopt(sanitizeSettings(readJSON<unknown>(KEY, null)));
+    };
+    window.addEventListener('storage', onStorage);
+    dispose = () => window.removeEventListener('storage', onStorage);
+  }
 
   return {
     get: () => current,
     update,
     reset: () => update({ ...DEFAULT_SETTINGS }),
+    ...(dispose ? { dispose } : {}),
   };
 }

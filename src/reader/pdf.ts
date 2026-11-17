@@ -93,6 +93,56 @@ function joinItems(items: PdfTextItem[], size: number): string {
   return collapseWhitespace(text);
 }
 
+/** A large initial: one or two letters at least this many times the size of the text beside it. */
+const DROP_CAP_RATIO = 1.8;
+
+/**
+ * Rows as text reads them. A row's size is that of most of its text, not of its largest run: one
+ * large initial (a drop cap) made its whole line "larger type", which reads as a heading and
+ * opened a chapter there. And the initial itself belongs to the first of the lines it spans, where
+ * the word it starts is: "T" + "he quick brown fox", not a "T" in front of the line below.
+ */
+function settleRows(rows: { y: number; size: number; items: PdfTextItem[] }[]): void {
+  for (const row of rows) {
+    const chars = new Map<number, number>();
+    for (const it of row.items) chars.set(it.height, (chars.get(it.height) ?? 0) + it.str.trim().length);
+    let body = row.size;
+    let most = -1;
+    for (const [size, n] of chars) {
+      if (n > most || (n === most && size > body)) {
+        body = size;
+        most = n;
+      }
+    }
+    if (body !== row.size) {
+      row.size = body;
+      const baselines = row.items.filter((it) => it.height === body).map((it) => it.y);
+      row.y = median(baselines);
+    }
+  }
+  for (const row of rows) {
+    for (const cap of [...row.items]) {
+      const text = cap.str.trim();
+      if (row.items.length < 2 || cap.height < DROP_CAP_RATIO * row.size || !/^\p{L}{1,2}$/u.test(text)) continue;
+      if (row.items.some((it) => it !== cap && it.x < cap.x)) continue; // not at the start of its line
+      // The lines the initial stands beside: the rows inside its height that start to its right.
+      const spanned = rows
+        .filter((r) => r.y <= row.y && r.y > cap.y - 0.95 * cap.height && r.items.every((it) => it === cap || it.x >= cap.x + 0.5 * cap.width))
+        .sort((a, b) => a.y - b.y);
+      const beside = spanned[0];
+      if (!beside || beside === row) continue;
+      row.items.splice(row.items.indexOf(cap), 1);
+      for (const r of spanned) {
+        const start = r.items.reduce((min, it) => Math.min(min, it.x), Infinity);
+        // In the first line: the letter itself, flush against the word it starts, at that line's
+        // size and baseline. In the others: nothing but its width, so that they start where the
+        // paragraph does (set in beside the initial, they read as first lines of new paragraphs).
+        r.items.push({ str: r === beside ? text : '', x: cap.x, y: r.y, width: Math.max(0, start - cap.x), height: r.size });
+      }
+    }
+  }
+}
+
 /** Groups items into baseline rows, then splits rows at gaps wide enough to be column gutters. */
 function pagePieces(page: PdfPageText): Piece[] {
   const items = cleanItems(page).sort((a, b) => a.y - b.y || a.x - b.x);
@@ -100,7 +150,12 @@ function pagePieces(page: PdfPageText): Piece[] {
   for (const it of items) {
     let row: (typeof rows)[number] | undefined;
     for (let k = rows.length - 1; k >= 0 && k >= rows.length - 4; k--) {
-      if (Math.abs(rows[k].y - it.y) <= 0.5 * Math.max(rows[k].size, it.height)) {
+      // Half the larger size, but never more than 0.8 of the smaller: a superscript sits a few
+      // units off its line's baseline, while a three-line initial would otherwise gather three
+      // lines of body text into its own row.
+      const big = Math.max(rows[k].size, it.height);
+      const small = Math.min(rows[k].size, it.height);
+      if (Math.abs(rows[k].y - it.y) <= 0.5 * Math.min(big, 1.6 * small)) {
         row = rows[k];
         break;
       }
@@ -117,6 +172,7 @@ function pagePieces(page: PdfPageText): Piece[] {
     }
   }
 
+  settleRows(rows);
   const pieces: Piece[] = [];
   for (const row of rows) {
     const sorted = row.items.sort((a, b) => a.x - b.x);
@@ -580,7 +636,9 @@ export async function parsePdf(data: ArrayBuffer, opts: ParseOptions = {}): Prom
     if (chars < 40 || blocks.length === 0) {
       throw new BookLoadError(
         'empty',
-        'This PDF has no selectable text — it’s probably scanned page images. Try a text-based version, or run it through OCR first.',
+        chars === 0
+          ? 'This PDF has no selectable text — it’s probably scanned page images. Try a text-based version, or run it through OCR first.'
+          : 'This PDF has almost no selectable text (a few words at most), so there is nothing to read as a book. If its pages are scanned images, run it through OCR first.',
       );
     }
 

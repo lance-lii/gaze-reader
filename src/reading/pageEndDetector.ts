@@ -275,6 +275,8 @@ const END_ABOVE_LINES = 0.5;
 const ZONE_BELOW_PAGE_LINES = 1;
 /** After firing, rules 1 and 2 re-arm once the gaze has come back this far above the bottom-dwell zone. */
 const LOOK_UP_LINES = 1;
+/** On a short page the resume line counts as "up", but only this far above the bottom zone. */
+const LOOK_UP_MIN_LINES = 0.1;
 /**
  * Rule 1 only counts live gaze (drift-corrected) no higher than this many pitches above the
  * last line's top. The tracker moves on completed fixations, so for a fixation's length after
@@ -370,6 +372,8 @@ export class PageEndDetector {
    * waits for the look up.
    */
   private undone = false;
+  /** Bottom (viewport px) of the line reading resumed on after the last turn, or null (see notifyScrolled). */
+  private resumeBottom: number | null = null;
 
   constructor(opts: Partial<PageEndOptions> = {}) {
     this.opts = { ...DEFAULT_PAGE_END_OPTIONS };
@@ -394,8 +398,16 @@ export class PageEndDetector {
     if (!next.glanceDownToTurn) this.glanceDwell.reset();
   }
 
-  notifyScrolled(t: number): void {
+  /**
+   * The page moved. `resumeBottom`: after a page turn, the bottom (viewport px, in the layout the
+   * turn landed on) of the line reading resumes on. On a page only a few lines tall that line is
+   * within a line of the bottom zone, and the gaze never rises the usual line above the zone:
+   * reading the resume line then counts as having been back up the page (without it, a window
+   * four lines tall turned its first page and no other).
+   */
+  notifyScrolled(t: number, resumeBottom?: number): void {
     if (!Number.isFinite(t)) return;
+    this.resumeBottom = resumeBottom !== undefined && Number.isFinite(resumeBottom) ? resumeBottom : null;
     this.lastScrollAt = this.lastScrollAt === null ? t : Math.max(this.lastScrollAt, t);
     this.disarm();
     // Which line the reader entered belongs to the view they entered it in. After a page back
@@ -423,6 +435,7 @@ export class PageEndDetector {
 
   reset(): void {
     this.undone = false;
+    this.resumeBottom = null;
     this.lineDwell.reset();
     this.zoneDwell.reset();
     this.glanceDwell.reset();
@@ -534,7 +547,13 @@ export class PageEndDetector {
 
     // After a trigger, rules 1 and 2 wait until the gaze has been back up the page (and their
     // dwells don't build up meanwhile, or they would fire the moment it leaves).
-    if (valid && yc < zones.zoneTop - LOOK_UP_LINES * pitch) this.lookedUp = true;
+    // "Up the page": a line above the bottom zone, or on a page too short for that, on the line
+    // reading resumed on (but never the last line itself).
+    const lookUpY = Math.max(
+      zones.zoneTop - LOOK_UP_LINES * pitch,
+      Math.min(this.resumeBottom ?? Number.NEGATIVE_INFINITY, zones.zoneTop - LOOK_UP_MIN_LINES * pitch),
+    );
+    if (valid && yc < lookUpY) this.lookedUp = true;
     const armed = this.lookedUp;
     /** Rule 1 after an undone turn (see notifyUndone). */
     const lineArmed = armed || this.undone;

@@ -1172,13 +1172,15 @@ export class PageSession {
     }
     if (this.disposed) return;
     const next = this.remeasure('page-turn');
+    let resumeBottom: number | undefined;
     if (next) {
       // Reading resumes at the first line below the one that anchored the turn.
       const resume = anchorDocTop === null ? 0 : next.lines.findIndex((l) => l.docTop > anchorDocTop + 1);
       this.tracker.afterPageTurn(Math.max(0, resume));
+      resumeBottom = next.lines[Math.max(0, resume)]?.bottom;
     }
     this.fixations.reset();
-    this.pageEnd.notifyScrolled(performance.now());
+    this.pageEnd.notifyScrolled(performance.now(), resumeBottom);
   }
 
   /**
