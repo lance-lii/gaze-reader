@@ -1,6 +1,7 @@
-import { describe, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { GAZE_EXCLUDED_FEATURES, fitPoseCompensation, trainGazeModel } from '../../src/gaze/calibrationModel';
 import { FEATURE_NAMES } from '../../src/gaze/features';
+import { REAL_FACE_PRIOR } from '../../src/gaze/gazePrior';
 import type { EyeFeatures, Point } from '../../src/types';
 import { BASE_POSE, calibrationSession, DEG, frameFeatures, gauss, headFollow, headMovementSession, makeFrame, neckPose, READING_POINTS, rng, VIEW, WORLDS, type Pose, type WorldName } from '../lighting/faceSim';
 import { LINE_PX, mean } from '../lighting/harness';
@@ -33,6 +34,14 @@ describe.skipIf(!realDataAvailable())('real-face model on simulated faces', () =
   it('prints', () => {
     const weights = fitShared(loadParticipants());
     fs!.writeFileSync(`${REAL_DATA_DIR}/../shared-weights.json`, JSON.stringify(weights));
+    // What ships (src/gaze/realFaceWeights.json) is this fit: the file is reproducible from the data.
+    const worst = Math.max(
+      ...weights.mean.map((m, j) => Math.abs(m - REAL_FACE_PRIOR.mean[j])),
+      ...weights.sd.map((s, j) => Math.abs(s - REAL_FACE_PRIOR.sd[j])),
+      ...weights.w.flatMap((row, j) => row.map((x, a) => Math.abs(x - REAL_FACE_PRIOR.w[j][a]))),
+    );
+    expect(weights.names).toEqual(REAL_FACE_PRIOR.names);
+    expect(worst).toBeLessThan(1e-9);
     const lines: string[] = [`| world | model | ${POSTURES.map((p) => p.label).join(' | ')} |`];
     for (const w of ['W1', 'W3', 'W5'] as WorldName[]) {
       const noise = WORLDS[w].noise;
@@ -40,6 +49,12 @@ describe.skipIf(!realDataAvailable())('real-face model on simulated faces', () =
         'app, no head step': (seed) => trainGazeModel(calibrationSession(seed, { noise }), { viewport: { ...VIEW }, maxBlink: 0.85, featureNames: FEATURE_NAMES, excludedFeatures: [...GAZE_EXCLUDED_FEATURES] }).model,
         'app now': (seed) => {
           const t = trainGazeModel(calibrationSession(seed, { noise }), { viewport: { ...VIEW }, maxBlink: 0.85, featureNames: FEATURE_NAMES, excludedFeatures: [...GAZE_EXCLUDED_FEATURES] }).model;
+          const f = fitPoseCompensation(t, headMovementSession(seed, { noise }), { maxBlink: 0.85 });
+          return f.ok ? f.model : t;
+        },
+        'real-face setting': (seed) => trainGazeModel(calibrationSession(seed, { noise }), { viewport: { ...VIEW }, maxBlink: 0.85, featureNames: FEATURE_NAMES, prior: weights }).model,
+        'real-face setting + head step': (seed) => {
+          const t = trainGazeModel(calibrationSession(seed, { noise }), { viewport: { ...VIEW }, maxBlink: 0.85, featureNames: FEATURE_NAMES, prior: weights }).model;
           const f = fitPoseCompensation(t, headMovementSession(seed, { noise }), { maxBlink: 0.85 });
           return f.ok ? f.model : t;
         },

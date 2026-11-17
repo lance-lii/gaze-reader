@@ -40,6 +40,7 @@ import { QuipPicker, type QuipKey } from '../buddy/quips';
 import { BUDDY_CLASS } from '../buddy/styles';
 import { AppearanceMonitor } from '../gaze/appearance';
 import {
+  asRidgeGazeModel,
   clearCalibration,
   currentChromeTop,
   loadCalibration,
@@ -50,6 +51,7 @@ import {
 } from '../gaze/calibrationModel';
 import { CameraFeatureSource, preloadFaceLandmarker } from '../gaze/faceTracker';
 import { FEATURE_NAMES } from '../gaze/features';
+import { REAL_FACE_PRIOR } from '../gaze/gazePrior';
 import { LightingWatch, parseLightingSignature } from '../gaze/lighting';
 import { MouseGazeSource } from '../gaze/mouseGazeSource';
 import { WebcamGazeSource } from '../gaze/webcamGazeSource';
@@ -2146,6 +2148,7 @@ export class AppController {
       // Accuracy is reported as "≈ N lines" at the reader's actual text size.
       linePitchPx: () => this.layout?.linePitch ?? null,
       featureNames: FEATURE_NAMES,
+      prior: !IS_ARTIFACT && this.store.get().realFaceModel ? REAL_FACE_PRIOR : null,
     });
     this.calibration = overlay;
     this.calibrationMode = mode;
@@ -2905,11 +2908,29 @@ export class AppController {
       if (s.gazeSource === 'webcam') this.webcamHold = null;
       this.syncSource();
     }
+    if (changed.includes('realFaceModel')) this.realFaceModelChanged(s.realFaceModel);
     if (any(OVERLAY_KEYS)) this.updateOverlays();
     // On a narrow window Dewey's corner makes room for him by moving the reading area: the lines
     // are then somewhere else on screen, and nothing else (no scroll, no resize) says so.
     if (any(['buddyCorner', 'buddyEnabled'])) this.scheduleMeasure('resize', 80);
     if (changed.includes('buddyEnabled') && !s.buddyEnabled && !this.settingsPanel.isOpen) this.deweyHidden();
+  }
+
+  /** The setting only picks what the next full calibration is built on: say so when the current one differs. */
+  private realFaceModelChanged(wanted: boolean): void {
+    if (this.store.get().gazeSource !== 'webcam') return;
+    const model = this.currentModel();
+    if (!model || (asRidgeGazeModel(model)?.prior != null) === wanted) {
+      this.toasts.dismiss('real-face-model');
+      return;
+    }
+    this.toasts.show({
+      id: 'real-face-model',
+      message: wanted
+        ? 'The real-face model is used from your next full calibration.'
+        : 'Your calibration still uses the real-face model, until your next full calibration.',
+      actions: [{ label: 'Calibrate now', primary: true, run: () => this.recalibrate() }],
+    });
   }
 
   /** Dewey hid himself from his own menu: say how to get him back, and keep keyboard paging working. */

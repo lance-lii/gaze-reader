@@ -117,7 +117,7 @@ export class SettingsPanel implements Mountable {
       section.appendChild(h);
       for (const control of group.controls) {
         // No camera in the Artifact build, so no camera preview either.
-        if (IS_ARTIFACT && control.key === 'showCameraPreview') continue;
+        if (IS_ARTIFACT && (control.key === 'showCameraPreview' || control.key === 'realFaceModel')) continue;
         section.appendChild(this.renderControl(control, uid));
       }
       if (group.id === 'tracking') section.appendChild(IS_ARTIFACT ? artifactTrackingNote() : this.renderCalibrationActions());

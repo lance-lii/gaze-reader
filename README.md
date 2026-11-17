@@ -49,6 +49,9 @@ What's new in each release is in [CHANGELOG.md](CHANGELOG.md).
 - **PDFs as they are.** A PDF opens as plain text set like a book, which the eye tracker follows
   best. Press **V** and it shows its original pages instead, with figures, equations and layout,
   and the tracker follows the lines on those pages. See [PDFs](#pdfs).
+- **Real-face model (experimental, opt-in).** Builds your calibration on a model fitted on
+  photographs of real people, to hold up better when your head moves. Off by default; see
+  [Real-face model](#real-face-model-experimental).
 - **Head gestures.** With the webcam on, a quick turn of your head pages forward or back and
   raised eyebrows pause, for when you want to steer without reaching for a key. Off until you
   switch it on. See [Head gestures](#head-gestures).
@@ -222,6 +225,26 @@ Gestures have been tested on simulated head movement only (no false gesture in 4
 of reading, fidgeting and looking around), not yet on recordings of real people: if one fires when
 you didn't mean it, or doesn't when you did, switch them off and please say so. The Chrome
 extension doesn't have them yet.
+
+## Real-face model (experimental)
+
+Settings → Eye tracking → **Real-face model (experimental)**. Off by default, web app only.
+
+Normally your calibration learns everything from your own 13 dots. With this on, the next full
+calibration stands on a small model fitted on photographs of 15 other people: it turns the eye and
+head measurements into a direction of gaze, and your dots only fit that direction to your eyes and
+your screen. A model that has seen many head positions knows what a turned or moved head does to
+the measurements; thirteen dots with the head still cannot teach that.
+
+On those photographs it is level with the normal calibration while the head stays where it was
+(4.1° against 4.3°), and clearly better once the head has moved: 4.4° against 6.5° with the head
+6–10° away, 5.4° against 9.2° beyond 10°. See [docs/REAL_DATA.md](docs/REAL_DATA.md).
+
+It is opt-in because it has not been measured with this app and a live camera, and because this
+project's simulator disagrees with the photographs about it. If tracking is worse with it, switch
+it off and calibrate again (**C**). The setting changes nothing until your next full calibration;
+a quick 5-dot refresh keeps whichever kind you have. The weights are licensed for non-commercial
+use only (see [License](#license)).
 
 ## Lighting
 
@@ -502,6 +525,14 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 ## License
 
 [MIT](LICENSE) © 2026 Lance Li
+
+One file is not MIT: `src/gaze/realFaceWeights.json`, the weights behind the opt-in
+[real-face model](#real-face-model-experimental). They are fitted on the
+[MPIIFaceGaze](https://doi.org/10.18419/darus-3240) dataset (Zhang, Sugano, Fritz and Bulling,
+2017) and published under its licence,
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/): **non-commercial use only**,
+and adaptations carry the same terms. For commercial use, delete the file and the `realFaceModel`
+setting; nothing else depends on them.
 
 The built web app also serves, unmodified, the components it needs at run time, under their own
 licenses: MediaPipe Tasks Vision and its face model (Apache-2.0), pdf.js (Apache-2.0), JSZip (MIT),
