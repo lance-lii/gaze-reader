@@ -37,6 +37,9 @@ What's new in each release is in [CHANGELOG.md](CHANGELOG.md).
   follows the structure of reading instead of trusting raw coordinates. It groups gaze into
   fixations, tracks which line you're on with a hidden Markov model, spots return sweeps to the
   next line, and learns your vertical drift as you read.
+- **Copes with leaning in and sitting back.** The tracker measures how far you are from the screen
+  from the size of your face in the camera image and rescales your gaze to match, so moving nearer
+  or further after calibrating no longer shifts the reading position.
 - **Copes with changing light.** Turning on a lamp or reading as the sun goes down no longer throws
   the page turns off: the tracker reads your gaze from the iris rather than your eyelids, the reading
   model re-learns the offset by itself, and **A** checks the accuracy in about 10 seconds. See
@@ -212,13 +215,17 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
 
 1. **Eye features.** For each video frame, the app measures where the centre of each iris (the
    mean of MediaPipe's five iris points) sits relative to the eye corners. It adds head tilt and
-   position and the model's "look up/down/in/out" blendshape scores. Head turns need no extra
-   input: the iris-to-corner measure already includes them. Lid aperture and blink scores are still
+   position and the model's "look up/down/in/out" blendshape scores. Head pose is measured too but
+   isn't a gaze input: the iris-to-corner measure already includes where the head points, and the
+   distance from the screen is applied in step 2. Lid aperture and blink scores are still
    measured, for blink detection and to notice squinting, but the gaze model ignores them: light
    moves the lids. Blinks, and frames where the eyes are closed, are dropped.
 2. **Calibration** fits a ridge regression from those features to screen coordinates, with a few
    quadratic terms for the strongest features. The regularisation strength is chosen by
-   leave-one-target-out cross-validation. Gaze is then smoothed with a One Euro filter.
+   leave-one-target-out cross-validation. The prediction is then scaled about the camera by how
+   much nearer or further you sit than when you calibrated (the eye features measure an angle, and
+   the same angle reaches further across the screen from further away), and smoothed with a One
+   Euro filter.
 3. **Fixations.** A dispersion-based detector groups the smoothed gaze into fixations (pauses of
    roughly 80–600 ms).
 4. **Which line?** The reader view measures every visible line of text. A hidden Markov model
@@ -384,9 +391,13 @@ docs/ARCHITECTURE.md        Module contracts and design notes
   the iris moves the iris-based gaze more than it moved 1.0's lid-based gaze. The lighting and
   eyelid thresholds were tuned on simulations and a synthetic face, not yet on many real webcams:
   diagnostics recordings (see [Lighting](#lighting)) are the way to check them.
-- **Posture drift.** Calibration assumes you sit roughly as you did while calibrating. Turning or
-  tilting your head moves the gaze about a line per 4° (in simulation), and leaning 6 cm in or
-  back about a line; the reading model learns that kind of offset as you read. The model also
+- **Posture drift.** Calibration assumes you sit roughly as you did while calibrating. Lowering or
+  raising your chin moves the gaze about a line per 4° (in simulation); the reading model learns
+  that kind of offset as you read. Leaning in or back is corrected (0.1–0.3 lines for 6–10 cm in
+  simulation, down from 1–2), but the correction assumes the camera sits just above the middle of
+  the screen you're reading on, as a laptop's or a monitor-top webcam does. With the camera
+  somewhere else (a laptop's camera while you read on a second monitor), leaning still shifts the
+  gaze, and it's best to calibrate where you'll sit. The model also
   compensates for window moves, but after a big change in posture it's best to recalibrate. The web app doesn't compensate for page zoom, fullscreen or toolbar
   changes; it notices them and offers a quick 5-dot refresh instead (the extension compensates for
   zoom).

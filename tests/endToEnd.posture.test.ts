@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { SLOW_MS, gateReport, gateSession, gateTitle, type Gate } from './endToEndGates';
 
 const GATES: Gate[] = [
-  { scenario: 'fidgety', minutes: 10, seeds: [1, 2, 3], maxFalse: 10, maxMissed: 6 },
-  { scenario: 'fidgety', minutes: 10, seeds: [1, 2, 3], sensitivity: 'relaxed', maxFalse: 5, maxMissed: 21 },
+  { scenario: 'fidgety', minutes: 10, seeds: [1, 2, 3], maxFalse: 2, maxMissed: 2 },
+  { scenario: 'fidgety', minutes: 10, seeds: [1, 2, 3], sensitivity: 'relaxed', maxFalse: 3, maxMissed: 3 },
   { scenario: 'glasses', minutes: 10, seeds: [1, 2, 3], maxFalse: 5, maxMissed: 11 },
 ];
 

@@ -10,6 +10,26 @@ position sat a line or two off after shifting in the chair, and page turns came 
 
 ### Web app and extension
 
+- **Leaning in or sitting back no longer shifts your reading position.** The calibration used to
+  treat the head's position as a few more gaze cues, with weights fitted while you sat still, so
+  they were mostly noise: leaning 6 cm nearer or further moved the gaze about a line, 10 cm two
+  lines, and sitting 3 cm to one side almost a line. What moving nearer or further does is known
+  from geometry, so the tracker now applies it directly: it reads your distance from the size of
+  your face in the camera image and scales your gaze about the camera to match. In simulation
+  those leans now move the gaze 0.1–0.3 lines and the sideways move 0.2; calibration itself fits
+  better (1.07–1.24 lines cross-validated, from 1.14–1.48). Over 33 simulated hours of reading
+  with ordinary fidgeting, pages that turned when you didn't mean them to fell from 4.3 to 1.6 an
+  hour on Balanced (restless posture: 11.3 to 0.7), missed turns from 16.4 % to 13.2 %, and the
+  tracker was on your line 83 % of the time, up from 75 %. It assumes the camera is just above the
+  middle of the screen you read on (a laptop's, or a webcam on top of the monitor); being 4 cm out
+  still gives most of the benefit. Raising or lowering your chin still moves the gaze about a line
+  per 4°. Recalibrate once to get it (older calibrations keep working as before).
+- **A repeated calibration dot waits until you've read why.** When a dot didn't get enough samples,
+  "Once more — keep your eyes on the dot." appeared and the dot started counting again at once,
+  with the notice still on screen at the other end of the window. Anyone who read it was looking
+  away from the dot for most of its samples, and the calibration learned that spot wrong. The dot
+  now waits the 1.8 seconds the notice is shown; the same after "The window changed, so the dots
+  start over."
 - **Head turns no longer throw the gaze off.** The calibration used to read head turn and tilt as
   extra gaze cues, but during calibration the head barely moves, so what it learned was mostly
   noise. Sitting with your chin 4° lower then moved the gaze 1.5–2.3 lines in simulation, and a 4°
@@ -151,6 +171,14 @@ position sat a line or two off after shifting in the chair, and page turns came 
 
 ### Chrome extension
 
+- **Scrolling the page yourself no longer confuses the reading position.** While you scrolled an
+  article, and during a page turn's animation, the extension kept scoring your gaze against the
+  lines where they had been measured before the page moved. A scroll of 100 px put you three or
+  four lines from where you were, or taught the tracker a gaze offset that wasn't there, and the
+  next page turned late or early. The reading model now waits until the page is still and has
+  been measured again, as the web app's does. A scroll of your own right at the end of a page
+  turn is no longer mistaken for the turn's last scroll event either, which left the lines stale
+  for the whole page.
 - **Web pages can no longer press Gaze Reader's shortcuts.** A page's own scripts could send fake
   Alt+Shift key presses to turn Gaze Reader off, change your settings in every tab, start a
   calibration or, with the camera blocked, keep bringing the setup tab to the front. The shortcuts
