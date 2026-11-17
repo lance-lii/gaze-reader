@@ -8,3 +8,5 @@ public/mediapipe/
 release/
 .vexp/
 public/ocr/
+.data/
+.venv-research/
