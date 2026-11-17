@@ -497,6 +497,7 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { keys: ['P'], action: 'toggle-autoscroll', label: 'Pause or resume auto-scroll', readerOnly: true },
   { keys: ['C'], action: 'recalibrate', label: 'Recalibrate the camera', readerOnly: true },
   { keys: ['A'], action: 'check-accuracy', label: 'Check tracking accuracy (a few dots)', readerOnly: true },
+  { keys: ['V'], action: 'toggle-pdf-view', label: 'PDFs: switch between the original pages and plain text', readerOnly: true },
   { keys: ['D'], action: 'toggle-debug', label: 'Show or hide the debug overlay', readerOnly: false },
   { keys: ['G'], action: 'toggle-gaze-dot', label: 'Show or hide the gaze dot', readerOnly: false },
   { keys: ['S'], action: 'open-settings', label: 'Settings', readerOnly: false },
@@ -523,6 +524,7 @@ const LETTER_ACTIONS: Readonly<Record<string, ShortcutAction>> = {
   g: 'toggle-gaze-dot',
   s: 'open-settings',
   l: 'open-library',
+  v: 'toggle-pdf-view',
 };
 
 /** Maps a key press to an action. Modified chords belong to the browser; auto-repeat is ignored. */

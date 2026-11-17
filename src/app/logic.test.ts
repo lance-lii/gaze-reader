@@ -507,7 +507,7 @@ describe('keyboard mapping', () => {
 
   it('every shortcut in the help table is reachable', () => {
     const reachable = new Set(
-      [' ', 'PageDown', 'PageUp', 'u', 'p', 'c', 'a', 'd', 'g', 's', 'l', '?', 'Escape']
+      [' ', 'PageDown', 'PageUp', 'u', 'p', 'c', 'a', 'v', 'd', 'g', 's', 'l', '?', 'Escape']
         .flatMap((key) => [shortcutFor({ key }), shortcutFor({ key, shiftKey: true })]),
     );
     for (const s of SHORTCUTS) expect(reachable.has(s.action)).toBe(true);

@@ -1,6 +1,7 @@
 import { CSS_PREFIX, IGNORE_ATTR } from '../core/constants';
 import type { AppSettings, Book, EventBus, LineLayout, ReadingPosition, Unsubscribe } from '../types';
 import { measureLines } from './lineGeometry';
+import type { PdfPageLayout } from './pdf';
 import { FONT_STACKS, READER_CSS, READER_STYLE_ATTR } from './reader.css';
 import { sanitizeToFragment } from './sanitize';
 
@@ -17,6 +18,78 @@ import { sanitizeToFragment } from './sanitize';
 export interface ReaderViewOptions {
   mount: HTMLElement;
   bus: EventBus;
+}
+
+/**
+ * A PDF's own pages for the pages view: where the lines are on each page, and something that
+ * draws a page's picture (pdf.ts's PdfDocumentHandle; a stub in tests).
+ */
+export interface PagesSource {
+  pages: readonly PdfPageLayout[];
+  render(index: number, canvas: HTMLCanvasElement, cssWidth: number, pixelRatio: number): Promise<boolean>;
+  cancel(canvas: HTMLCanvasElement): void;
+}
+
+/** What the reader is looking at in the pages view. */
+export interface PagesStatus {
+  /** 0-based page under the middle of the view, and how many there are. */
+  page: number;
+  count: number;
+  /** Whether that page has lines the eye tracker can follow (false: two columns, or no text). */
+  trackable: boolean;
+}
+
+/** A line box reaches this far above and below its baseline, in font sizes. */
+const LINE_ASCENT = 0.8;
+const LINE_DESCENT = 0.25;
+/** Pictures are drawn for pages within this many view heights of the view, and dropped beyond it. */
+const RENDER_MARGIN = '150% 0px';
+/** At most this many page pictures are kept (a page at 2× is tens of megabytes). */
+const MAX_RENDERED_PAGES = 6;
+/** Pictures are redrawn this long after the width last changed. */
+const RERENDER_DELAY_MS = 180;
+/** How far a line's text may be stretched or squeezed to fit its box. */
+const MIN_STRETCH = 0.4;
+const MAX_STRETCH = 2.5;
+
+interface PageState {
+  section: HTMLElement;
+  canvas: HTMLCanvasElement;
+  /** CSS width the picture was last drawn for (0: not drawn). */
+  drawnWidth: number;
+  near: boolean;
+  /** Order in which pictures were drawn (the oldest are dropped first). */
+  stamp: number;
+}
+
+interface PagesState {
+  source: PagesSource;
+  pages: PageState[];
+  observer: IntersectionObserver | null;
+  chain: Promise<void>;
+  timer: ReturnType<typeof setTimeout> | null;
+  stamp: number;
+  warned: boolean;
+}
+
+let measureContext: CanvasRenderingContext2D | null | undefined;
+
+/** Width of `text` in the line layer's face, in font sizes (0 when it can't be measured: no canvas). */
+function textWidthEm(doc: Document, text: string): number {
+  if (measureContext === undefined) {
+    try {
+      measureContext = doc.createElement('canvas').getContext('2d');
+      if (measureContext) measureContext.font = '100px Arial, Helvetica, sans-serif';
+    } catch {
+      measureContext = null;
+    }
+  }
+  if (!measureContext) return 0;
+  try {
+    return measureContext.measureText(text).width / 100;
+  } catch {
+    return 0;
+  }
 }
 
 /** Block elements that can carry a reading-position anchor (leaf-most ones win). */
@@ -92,6 +165,8 @@ export class ReaderView {
   private resizeObserver: ResizeObserver | null = null;
   private readonly scrollListeners = new Set<() => void>();
   private destroyed = false;
+  /** Set while a PDF's pages are shown (the pages view). */
+  private pages: PagesState | null = null;
 
   constructor(opts: ReaderViewOptions) {
     this.bus = opts.bus;
@@ -121,6 +196,106 @@ export class ReaderView {
 
   get book(): Book | null {
     return this.currentBook;
+  }
+
+  /** 'pages' while a PDF's own pages are shown, 'text' otherwise. */
+  get view(): 'text' | 'pages' {
+    return this.pages ? 'pages' : 'text';
+  }
+
+  /**
+   * Shows a PDF as its own pages, one below the other: each page is a picture (drawn when it comes
+   * near the view) with one element per line of text laid over it, where the line is on the page.
+   * Those elements are what measureLayout measures, so the eye tracker follows the lines of the
+   * page as it follows any text; they also make the text selectable and readable aloud. Pages set
+   * in two columns, and pages with no text (scans), get no line elements: nothing on them can be
+   * followed top to bottom, and they are left to the keyboard and to gestures.
+   */
+  openPages(book: Book, source: PagesSource, position?: ReadingPosition | null): void {
+    if (this.destroyed) return;
+    this.close();
+    this.currentBook = book;
+    const doc = this.content.ownerDocument;
+    this.content.setAttribute('aria-label', book.title);
+    this.scroller.dataset.view = 'pages';
+
+    const state: PagesState = { source, pages: [], observer: null, chain: Promise.resolve(), timer: null, stamp: 0, warned: false };
+    const fragment = doc.createDocumentFragment();
+    source.pages.forEach((page, index) => {
+      const section = doc.createElement('section');
+      section.className = `${CSS_PREFIX}pdf-page`;
+      section.id = `pg${index}`;
+      section.dataset.grPage = String(index);
+      section.setAttribute('aria-label', `Page ${index + 1} of ${source.pages.length}`);
+      section.style.aspectRatio = `${page.width} / ${page.height}`;
+      const canvas = doc.createElement('canvas');
+      canvas.className = `${CSS_PREFIX}pdf-canvas`;
+      canvas.setAttribute('aria-hidden', 'true');
+      canvas.width = 0;
+      canvas.height = 0;
+      section.appendChild(canvas);
+      this.anchors.push(section);
+      this.anchorById.set(section.id, section);
+
+      const trackable = !page.columns && page.lines.length > 0;
+      if (trackable) {
+        const layer = doc.createElement('div');
+        layer.className = `${CSS_PREFIX}pdf-text`;
+        // Top to bottom, as the line measurement (and the position anchors) expect.
+        const lines = [...page.lines].sort((a, b) => a.y - b.y || a.x0 - b.x0);
+        lines.forEach((line, k) => {
+          const el = doc.createElement('div');
+          el.className = `${CSS_PREFIX}pdf-line`;
+          el.id = `pg${index}-l${k}`;
+          el.textContent = line.text;
+          const pct = (v: number): string => `${(100 * v).toFixed(4)}%`;
+          el.style.left = pct(line.x0 / page.width);
+          el.style.top = pct((line.y - LINE_ASCENT * line.size) / page.height);
+          el.style.width = pct((line.x1 - line.x0) / page.width);
+          el.style.height = pct(((LINE_ASCENT + LINE_DESCENT) * line.size) / page.height);
+          el.style.setProperty('--gr-pdf-size', (line.size / page.width).toFixed(5));
+          const natural = textWidthEm(doc, line.text);
+          if (natural > 0) {
+            const stretch = (line.x1 - line.x0) / line.size / natural;
+            el.style.setProperty('--gr-pdf-stretch', clamp(stretch, MIN_STRETCH, MAX_STRETCH).toFixed(4));
+          }
+          layer.appendChild(el);
+          this.anchors.push(el);
+          this.anchorById.set(el.id, el);
+        });
+        section.appendChild(layer);
+      } else {
+        section.dataset.grUntracked = page.columns ? 'Two columns: turn with a key or a gesture' : 'No text to follow: turn with a key or a gesture';
+      }
+      fragment.appendChild(section);
+      state.pages.push({ section, canvas, drawnWidth: 0, near: false, stamp: 0 });
+    });
+    this.endMarker = this.buildEndMarker(book);
+    fragment.appendChild(this.endMarker);
+    this.content.appendChild(fragment);
+    this.pages = state;
+
+    if (position && position.bookId === book.id) this.restore(position);
+    else this.scroller.scrollTop = 0;
+    this.lastAnchor = this.captureAnchor();
+    this.watchPages(state);
+  }
+
+  /** The page under the middle of the view (pages view only). */
+  pagesStatus(): PagesStatus | null {
+    const state = this.pages;
+    if (!state || state.pages.length === 0) return null;
+    const s = this.scroller;
+    const middle = s.getBoundingClientRect().top + s.clientTop + s.clientHeight / 2;
+    let lo = 0;
+    let hi = state.pages.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (state.pages[mid]!.section.getBoundingClientRect().bottom < middle) lo = mid + 1;
+      else hi = mid;
+    }
+    const page = state.source.pages[lo]!;
+    return { page: lo, count: state.pages.length, trackable: !page.columns && page.lines.length > 0 };
   }
 
   /** Renders every chapter (sanitized again at this sink) and restores `position` when it belongs to `book`. */
@@ -172,6 +347,7 @@ export class ReaderView {
 
   close(): void {
     this.openToken++;
+    this.closePages();
     this.currentBook = null;
     this.anchors = [];
     this.anchorById.clear();
@@ -274,6 +450,102 @@ export class ReaderView {
     for (const l of this.scrollListeners) this.scroller.removeEventListener('scroll', l);
     this.scrollListeners.clear();
     this.scroller.remove();
+  }
+
+  // ───────────────────────────── the pages view ─────────────────────────────
+
+  private closePages(): void {
+    const state = this.pages;
+    this.pages = null;
+    delete this.scroller.dataset.view;
+    if (!state) return;
+    state.observer?.disconnect();
+    if (state.timer !== null) clearTimeout(state.timer);
+    for (const p of state.pages) {
+      try {
+        state.source.cancel(p.canvas);
+      } catch {
+        /* the source is gone */
+      }
+    }
+  }
+
+  /** Draws the pictures of pages as they come near the view, and lets go of them when they leave. */
+  private watchPages(state: PagesState): void {
+    if (typeof IntersectionObserver === 'undefined') return; // nothing is laid out (tests): no pictures
+    const byElement = new Map<Element, PageState>(state.pages.map((p) => [p.section, p]));
+    state.observer = new IntersectionObserver(
+      (entries) => {
+        if (this.pages !== state) return;
+        for (const e of entries) {
+          const page = byElement.get(e.target);
+          if (!page) continue;
+          page.near = e.isIntersecting;
+          if (page.near) this.drawPage(state, page);
+          else this.dropPage(state, page);
+        }
+      },
+      { root: this.scroller, rootMargin: RENDER_MARGIN },
+    );
+    for (const p of state.pages) state.observer.observe(p.section);
+  }
+
+  private drawPage(state: PagesState, page: PageState): void {
+    // One at a time: several pages rasterizing at once starve the camera frames of the main thread.
+    state.chain = state.chain.then(async () => {
+      if (this.pages !== state || !page.near) return;
+      const width = page.section.clientWidth;
+      if (!(width > 0) || Math.abs(width - page.drawnWidth) < 1) return;
+      const ratio = Math.min(this.scroller.ownerDocument.defaultView?.devicePixelRatio || 1, 3);
+      try {
+        const index = state.pages.indexOf(page);
+        if (await state.source.render(index, page.canvas, width, ratio)) {
+          page.drawnWidth = width;
+          page.stamp = ++state.stamp;
+          this.trimPages(state);
+        }
+      } catch (err) {
+        if (!state.warned) {
+          state.warned = true;
+          this.bus.emit('error', { code: 'reader-render', message: `A page of this PDF couldn’t be drawn: ${err instanceof Error ? err.message : String(err)}` });
+        }
+      }
+    });
+  }
+
+  private dropPage(state: PagesState, page: PageState): void {
+    try {
+      state.source.cancel(page.canvas);
+    } catch {
+      /* nothing was running */
+    }
+    if (page.drawnWidth === 0) return;
+    page.drawnWidth = 0;
+    page.canvas.width = 0;
+    page.canvas.height = 0;
+  }
+
+  /** Keeps at most MAX_RENDERED_PAGES pictures: the ones drawn longest ago go first, never one near the view's middle. */
+  private trimPages(state: PagesState): void {
+    const drawn = state.pages.filter((p) => p.drawnWidth > 0).sort((a, b) => a.stamp - b.stamp);
+    const current = this.pagesStatus()?.page ?? -1;
+    for (const p of drawn) {
+      if (drawn.filter((d) => d.drawnWidth > 0).length <= MAX_RENDERED_PAGES) break;
+      if (Math.abs(state.pages.indexOf(p) - current) <= 1) continue;
+      this.dropPage(state, p);
+    }
+  }
+
+  /** The pages' width changed: their pictures are drawn again at the new size, once it has stopped changing. */
+  private redrawPages(): void {
+    const state = this.pages;
+    if (!state) return;
+    if (state.timer !== null) clearTimeout(state.timer);
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      if (this.pages !== state) return;
+      for (const p of state.pages) if (p.near) this.drawPage(state, p);
+    }, RERENDER_DELAY_MS);
   }
 
   // ───────────────────────────── rendering ─────────────────────────────
@@ -436,6 +708,7 @@ export class ReaderView {
     } else if (width !== this.lastWidth && this.lastWidth >= 0 && this.lastAnchor) {
       this.applyAnchor(this.lastAnchor); // text reflowed: keep the same paragraph at the top
     }
+    if (width !== this.lastWidth) this.redrawPages();
     this.lastWidth = width;
   }
 

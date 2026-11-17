@@ -433,7 +433,9 @@ export type CommandName =
   | 'toggle-gaze-dot'
   | 'open-library'
   | 'show-help'
-  | 'check-accuracy';
+  | 'check-accuracy'
+  /** A PDF: switch between its own pages and its text set as a book. */
+  | 'toggle-pdf-view';
 
 export type BuddyMood =
   | 'idle'

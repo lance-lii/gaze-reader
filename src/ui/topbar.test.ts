@@ -23,6 +23,38 @@ describe('Topbar', () => {
     vi.useRealTimers();
   });
 
+  it('a click with the pointer doesn’t leave the keyboard on the button; a key press does (regression: Space pressed it again)', () => {
+    const { bar, bus } = setup();
+    const commands: string[] = [];
+    bus.on('command', (c) => commands.push(c.name));
+    const pause = bar.el.querySelector<HTMLButtonElement>('[data-cmd="toggle-autoscroll"]')!;
+    pause.focus();
+    pause.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 })); // a pointer click
+    expect(commands).toEqual(['toggle-autoscroll']);
+    expect(document.activeElement).not.toBe(pause);
+    pause.focus();
+    pause.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 0 })); // Enter or Space on the focused button
+    expect(commands).toEqual(['toggle-autoscroll', 'toggle-autoscroll']);
+    expect(document.activeElement).toBe(pause);
+    bar.destroy();
+  });
+
+  it('shows the pages / text switch only for a PDF that has pages, named for what it will do', () => {
+    const { bar } = setup();
+    const btn = bar.el.querySelector<HTMLButtonElement>('.gr-topbar__pdf')!;
+    expect(btn.hidden).toBe(true);
+    expect(btn.dataset.cmd).toBe('toggle-pdf-view');
+    bar.setPdfView('text');
+    expect(btn.hidden).toBe(false);
+    expect(btn.getAttribute('aria-label')).toBe('Show this PDF’s original pages');
+    expect(btn.title).toContain('(V)');
+    bar.setPdfView('pages');
+    expect(btn.getAttribute('aria-label')).toBe('Show this PDF as plain text');
+    bar.setPdfView(null);
+    expect(btn.hidden).toBe(true);
+    bar.destroy();
+  });
+
   it('re-picking the selected source still reaches the controller, so a failed webcam can be retried', () => {
     const { bar, picked } = setup({ gazeSource: 'webcam' });
     expect(radio(bar, 'webcam').checked).toBe(true);
