@@ -40,6 +40,7 @@ import {
   frameFeatures,
   gauss,
   headFollow,
+  headMovementSession,
   makeFrame,
   type Frame,
   type NoiseSpec,
@@ -463,6 +464,11 @@ export class World {
   /** The calibration at the start: 13 dots in the base posture, today's light. */
   calibrationSamples(seed: number): CalibrationSample[] {
     return calibrationSession(seed, { noise: this.scenario.noise, light: { jitter: this.scenario.jitter } });
+  }
+
+  /** The calibration's head-movement step: eyes on the middle dot while the head nods, turns and tilts. */
+  headMovementSamples(seed: number): CalibrationSample[] {
+    return headMovementSession(seed, { noise: this.scenario.noise, light: { jitter: this.scenario.jitter } });
   }
 
   /** The next camera frame, or null at the end of the session. */

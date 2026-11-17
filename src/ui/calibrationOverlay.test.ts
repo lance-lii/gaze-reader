@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppEvents, EyeFeatures, FeatureFrame, FeatureSource, GazeModel, LightingSignature, LightingStats, Point, Unsubscribe } from '../types';
 import { createEventBus } from '../core/events';
-import { evaluateModel, measureOffset, refineGazeModel, trainGazeModel } from '../gaze/calibrationModel';
+import { asRidgeGazeModel, deserializeGazeModel, evaluateModel, measureOffset, refineGazeModel, trainGazeModel } from '../gaze/calibrationModel';
 import { buildLightingSignature } from '../gaze/lighting';
 import { accuracyCheckView } from '../app/logic';
 import {
@@ -143,9 +143,20 @@ interface Reader {
   zoom: number;
   /** Reads a notice (toast) for as long as it is on screen, at the top of the window, instead of following the dot. */
   readsNotices: boolean;
+  /**
+   * A head that the tracker reports the pose of (yaw, pitch, roll, tx, ty, tz appended to the
+   * feature vector, see POSE_NAMES), and how far it moves each way when the head-movement step
+   * asks for a movement, degrees (0: sits still). Its movement shifts the eye features, as on a
+   * real face: the eyes stay on the dot.
+   */
+  head: { nodDeg: number; turnDeg: number; tiltDeg: number } | null;
   pointIndex: number;
   attempt: number;
 }
+
+/** Feature names for a reader with a `head`: the synthetic eye's eight numbers, then the pose. */
+const POSE_NAMES = ['e0', 'e1', 'e2', 'e3', 'e4', 'n0', 'n1', 'n2', 'yaw', 'pitch', 'roll', 'tx', 'ty', 'tz'];
+const DEG = Math.PI / 180;
 
 /** A simulated reader who dutifully looks at whatever dot is on screen. */
 function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<typeof createEventBus>, periodMs = 33, seed = 7) {
@@ -161,6 +172,7 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
     squint: undefined,
     zoom: 1,
     readsNotices: false,
+    head: null,
     pointIndex: -1,
     attempt: 0,
   };
@@ -184,6 +196,27 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
       return;
     }
     const features = eyeFeatures({ x: gaze.x / reader.zoom, y: gaze.y / reader.zoom }, r, reader.shift);
+    if (reader.head) {
+      // Which movement the step is asking for, by its instruction; a slow swing while it is up.
+      const asked = scope.querySelector<HTMLElement>('.gr-cal-headhint:not([hidden]) .gr-cal-head-title')?.textContent ?? '';
+      const swing = Math.sin((2 * Math.PI * performance.now()) / 2600);
+      const pose = {
+        yaw: 0.02 + (/Turn/.test(asked) ? reader.head.turnDeg * DEG * swing : 0),
+        pitch: 0.07 + (/Nod/.test(asked) ? reader.head.nodDeg * DEG * swing : 0),
+        roll: /Tilt/.test(asked) ? reader.head.tiltDeg * DEG * swing : 0,
+        tx: 0,
+        ty: -5,
+        tz: -60,
+      };
+      // What the turn does to the eye features with the eyes still on the dot (the corners move
+      // against the eyeball): about a line per 4° of nod, and 15 px per degree of turn.
+      features.vector[2] += 0.0033 * ((pose.pitch - 0.07) / DEG);
+      features.vector[4] -= 0.004 * ((pose.pitch - 0.07) / DEG);
+      features.vector[0] += 0.003 * ((pose.yaw - 0.02) / DEG);
+      features.vector[1] -= 0.0027 * ((pose.yaw - 0.02) / DEG);
+      features.headPose = pose;
+      features.vector.push(pose.yaw + 0.002 * gaussian(r), pose.pitch + 0.002 * gaussian(r), pose.roll + 0.002 * gaussian(r), pose.tx, pose.ty, pose.tz);
+    }
     features.faceScale = reader.faceScale;
     features.faceCenter = { ...reader.faceCenter };
     if (reader.squint !== undefined) features.squint = reader.squint;
@@ -1594,5 +1627,132 @@ describe('describeLightingChange', () => {
     expect(window).toMatchObject({ changed: true, dominant: 'backlight', text: 'there’s more light behind you now' });
     expect(describeLightingChange(ref, signatureOf(light({ side: 1.3 }))).text).toBe('more of the light comes from one side now');
     expect(describeLightingChange(ref, signatureOf(light({ glareR: 0.06 }))).text).toBe('there are more reflections on your glasses or eyes now');
+  });
+});
+
+describe('the head-movement step', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    document.body.replaceChildren();
+  });
+
+  /** A full calibration by a reader whose head the tracker reports, up to the results card. */
+  async function calibrate(head: NonNullable<Reader['head']>, during?: (ctx: ReturnType<typeof setup>) => Promise<void>, opts: Partial<CalibrationOverlayOptions> = {}) {
+    const ctx = setup({ featureNames: POSE_NAMES, linePitchPx: 20, ...opts });
+    ctx.sim.reader.head = head;
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    const seen: string[] = [];
+    const labels = new Set<string>();
+    const watch = setInterval(() => {
+      const hint = ctx.shadow.querySelector<HTMLElement>('.gr-cal-headhint:not([hidden]) .gr-cal-head-title')?.textContent;
+      if (hint && seen[seen.length - 1] !== hint) seen.push(hint);
+      if (hint) labels.add(ctx.q('.gr-cal-hud-label').textContent ?? '');
+    }, 50);
+    if (during) await during(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 180_000, 250);
+    clearInterval(watch);
+    const note = ctx.q('.gr-cal-note').textContent ?? '';
+    ctx.q<HTMLButtonElement>('[data-action="use"]').click();
+    const result = await done;
+    ctx.sim.stop();
+    return { ctx, result, seen, labels, note };
+  }
+
+  it('asks for a nod, a turn and a tilt with the eyes on one dot, and learns what the head does to the gaze', async () => {
+    const { ctx, result, seen, labels, note } = await calibrate({ nodDeg: 6, turnDeg: 7, tiltDeg: 5 });
+    expect(seen).toEqual(['Nod slowly', 'Turn your head a little', 'Tilt your head']);
+    expect([...labels]).toEqual(['Head movement']);
+    // After the dots and before the accuracy dots.
+    const phases = ctx.events.map((e) => e.phase);
+    expect(phases.indexOf('validating')).toBeGreaterThan(phases.indexOf('training'));
+    expect(result?.headStep?.learned).toMatchObject({ a: true, b: true });
+    expect(result?.headStep?.reason).toBeUndefined();
+    expect(note).toMatch(/Head movement: learned/);
+    const pose = asRidgeGazeModel(result!.model)!.poseCompensation!;
+    expect(Math.abs(pose.gain[3])).toBeGreaterThan(200); // px per radian up-down for a nod
+    expect(Math.abs(pose.gain[0])).toBeGreaterThan(200); // and across for a turn
+    // With it, a chin 4° lower reads where the eyes are; without it, about a line off.
+    const r = rng(11);
+    const lowered = (model: GazeModel): number => {
+      const errs: number[] = [];
+      for (let i = 0; i < 40; i++) {
+        const f = eyeFeatures({ x: VW / 2, y: VH / 2 }, r);
+        f.vector[2] += 0.0033 * 4;
+        f.vector[4] -= 0.004 * 4;
+        f.vector.push(0.02, 0.07 + 4 * DEG, 0, 0, -5, -60);
+        errs.push(model.predict(f)!.y - VH / 2);
+      }
+      return errs.reduce((a, b) => a + b, 0) / errs.length;
+    };
+    const plain = trainGazeModel(recalibrationSamples(), { viewport: { width: VW, height: VH }, featureNames: POSE_NAMES }).model;
+    expect(Math.abs(lowered(plain))).toBeGreaterThan(12);
+    expect(Math.abs(lowered(result!.model))).toBeLessThan(0.4 * Math.abs(lowered(plain)));
+    // It survives being saved.
+    const back = deserializeGazeModel(JSON.parse(JSON.stringify(asRidgeGazeModel(result!.model)!.toJSON())), { featureLength: POSE_NAMES.length });
+    expect(back?.poseCompensation?.gain).toEqual(pose.gain);
+
+    /** A calibration of the same synthetic eye without the step: the 13 dots, the head at rest. */
+    function recalibrationSamples() {
+      const rr = rng(5);
+      return STANDARD_TARGETS.flatMap((t) =>
+        Array.from({ length: 30 }, (_, i) => {
+          const target = { x: t.x * VW, y: t.y * VH };
+          const f = eyeFeatures(target, rr);
+          f.vector.push(0.02 + 0.002 * gaussian(rr), 0.07 + 0.002 * gaussian(rr), 0.002 * gaussian(rr), 0, -5, -60);
+          return { target, features: f, t: i };
+        }),
+      );
+    }
+  });
+
+  it('says so and carries on when the head hardly moved, and the calibration is as good as without the step', async () => {
+    const { result, note } = await calibrate({ nodDeg: 0.2, turnDeg: 0.2, tiltDeg: 0.1 });
+    expect(result?.headStep).toEqual({ learned: null, reason: 'still' });
+    expect(note).toMatch(/Head movement: not learned \(your head hardly moved\)/);
+    expect(asRidgeGazeModel(result!.model)!.poseCompensation!.gain).toEqual([0, 0, 0, 0]);
+    expect(result!.report.quality).not.toBe('poor');
+  });
+
+  it('can be skipped with S or its button, at once', async () => {
+    for (const how of ['key', 'button'] as const) {
+      const started = { at: 0, ended: 0 };
+      const { result, note, seen } = await calibrate({ nodDeg: 6, turnDeg: 7, tiltDeg: 5 }, async (ctx) => {
+        await advanceUntil(() => !ctx.q('.gr-cal-headhint').hidden, 120_000, 100);
+        started.at = performance.now();
+        if (how === 'key') key('s');
+        else ctx.q<HTMLButtonElement>('[data-action="skip-head"]').click();
+        await advanceUntil(() => ctx.q('.gr-cal-headhint').hidden === true, 5000, 20);
+        started.ended = performance.now();
+      });
+      expect(started.ended - started.at, how).toBeLessThan(600);
+      expect(seen, how).toEqual(['Nod slowly']);
+      expect(result?.headStep, how).toEqual({ learned: null, reason: 'skipped' });
+      expect(note, how).toMatch(/Head movement: skipped/);
+      document.body.replaceChildren();
+    }
+  });
+
+  it('is left out when the host turns it off, and of a quick refresh', async () => {
+    const { result, seen } = await calibrate({ nodDeg: 6, turnDeg: 7, tiltDeg: 5 }, undefined, { headStep: false });
+    expect(seen).toEqual([]);
+    expect(result?.headStep).toBeUndefined();
+  });
+
+  it('starts the same movement again after a pause, and waits while paused', async () => {
+    const { result, seen } = await calibrate({ nodDeg: 6, turnDeg: 7, tiltDeg: 5 }, async (ctx) => {
+      await advanceUntil(() => ctx.q('.gr-cal-head-title').textContent === 'Turn your head a little' && ctx.q('.gr-cal-headhint').hidden === false, 120_000, 100);
+      await vi.advanceTimersByTimeAsync(1500);
+      key(' ');
+      await vi.advanceTimersByTimeAsync(20_000); // a long pause: nothing moves on
+      expect(ctx.q('.gr-cal-head-title').textContent).toBe('Turn your head a little');
+      expect(ctx.root.dataset.paused).toBe('user');
+      key(' ');
+    });
+    expect(seen).toEqual(['Nod slowly', 'Turn your head a little', 'Tilt your head']);
+    expect(result?.headStep?.learned).toMatchObject({ a: true, b: true });
   });
 });

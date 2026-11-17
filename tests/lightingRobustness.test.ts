@@ -14,6 +14,7 @@ import {
   GAZE_MODEL_KIND,
   calibrationUpgradeNeeded,
   deserializeGazeModel,
+  fitPoseCompensation,
   measureOffset,
   refineGazeModel,
   trainGazeModel,
@@ -32,9 +33,12 @@ import {
   frameFeatures,
   gauss,
   headFollow,
+  headMovementSession,
   makeFrame,
+  neckPose,
   pairedReadingFrames,
   rng,
+  type MovementOptions,
   type Pose,
   type WorldName,
 } from '../bench/lighting/faceSim';
@@ -174,7 +178,7 @@ describe('calibration environment', () => {
  * drop into 1.6–2.3 lines of offset and 3 cm to one side into 0.9. A change of distance is
  * corrected geometrically instead (DepthCompensation in calibrationModel.ts).
  */
-describe('posture robustness of the gaze model', { timeout: 20_000 }, () => {
+describe('posture robustness of the gaze model', { timeout: 60_000 }, () => {
   // Calibrations vary a lot here (with yaw/pitch, 4 of 24 W1 calibrations happen to compensate a
   // chin drop better), so the guard averages over 8.
   const POSTURE_SEEDS = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -253,6 +257,152 @@ describe('posture robustness of the gaze model', { timeout: 20_000 }, () => {
       expect(now.dy, world).toBeLessThanOrEqual(1.35);
       expect(before.dy, `${world} with yaw/pitch`).toBeGreaterThan(now.dy + 0.3);
     }
+  });
+
+  // ── with the calibration's head-movement step (PoseCompensation) ──
+  const stepped = new Map<string, RidgeGazeModel>();
+  /** The same calibrations after a head-movement step of the given size (default: nod 6°, turn 7°, tilt 5°). */
+  const withStep = (world: WorldName, seed: number, step: MovementOptions = {}, label = 'full'): RidgeGazeModel => {
+    const key = `${label}|${world}|${seed}`;
+    let model = stepped.get(key);
+    if (!model) {
+      const base = calibrated([...GAZE_EXCLUDED_FEATURES], world, seed);
+      const fitted = fitPoseCompensation(base, headMovementSession(seed, { noise: WORLDS[world].noise, ...step }), { maxBlink: 0.85 });
+      model = fitted.ok ? fitted.model : base;
+      stepped.set(key, model);
+    }
+    return model;
+  };
+  /** As `shift`, for any model per (world, seed). */
+  const shiftOf = (modelOf: (seed: number) => RidgeGazeModel, world: WorldName, pose: Pose): { dx: number; dy: number } => {
+    const noise = WORLDS[world].noise;
+    const dx: number[] = [];
+    const dy: number[] = [];
+    for (const seed of POSTURE_SEEDS) {
+      const model = modelOf(seed);
+      const r = rng(seed * 101);
+      const sx: number[] = [];
+      const sy: number[] = [];
+      for (const target of READING_POINTS) {
+        for (let i = 0; i < 2; i++) {
+          const f = frameFeatures(makeFrame(target, headFollow(target, pose), { h: 0.1 * DEG * gauss(r), v: 0.1 * DEG * gauss(r) }, {}, r, noise));
+          const p = f && model.predictScreenFromVector(f.vector);
+          if (!p) continue;
+          sx.push(p.x - target.x);
+          sy.push(p.y - target.y);
+        }
+      }
+      dx.push(Math.abs(mean(sx)));
+      dy.push(Math.abs(mean(sy)) / LINE_PX);
+    }
+    return { dx: mean(dx), dy: mean(dy) };
+  };
+  const plain = (world: WorldName) => (seed: number) => calibrated([...GAZE_EXCLUDED_FEATURES], world, seed);
+  const SLOUCHED: Pose = { ...neckPose(BASE_POSE, 0, 6 * DEG, 0), ty: BASE_POSE.ty - 3, tz: BASE_POSE.tz - 3 };
+  const HEAD_ON_HAND: Pose = neckPose(BASE_POSE, 3 * DEG, 2 * DEG, 8 * DEG);
+
+  it('with the head-movement step, a chin 4° or 8° lower, a head 2 cm lower and a slouch move the gaze at most 0.6 lines (1–3 without)', () => {
+    for (const world of ['W1', 'W3'] as const) {
+      const cases: [string, Pose, number][] = [
+        ['chin −4°', { ...BASE_POSE, pitch: 8 * DEG }, 0.9],
+        ['chin +4°', { ...BASE_POSE, pitch: 0 }, 0.9],
+        ['chin −8°', { ...BASE_POSE, pitch: 12 * DEG }, 1.7],
+        ['down 2 cm', { ...BASE_POSE, ty: -7 }, 0.45],
+        ['slouched', SLOUCHED, 2],
+      ];
+      for (const [label, pose, without] of cases) {
+        const now = shiftOf((seed) => withStep(world, seed), world, pose);
+        const before = shiftOf(plain(world), world, pose);
+        expect(now.dy, `${world} ${label}`).toBeLessThanOrEqual(0.6);
+        expect(before.dy, `${world} ${label} without the step`).toBeGreaterThan(without);
+      }
+    }
+  });
+
+  it('with the step, a 4° turn or tilt and a head resting on a hand move the gaze at most 30 px sideways (35–70 without)', () => {
+    for (const world of ['W1', 'W3'] as const) {
+      for (const [label, pose] of [['turn', { ...BASE_POSE, yaw: 4 * DEG }], ['tilt', { ...BASE_POSE, roll: 4 * DEG }], ['head on hand', HEAD_ON_HAND]] as [string, Pose][]) {
+        const now = shiftOf((seed) => withStep(world, seed), world, pose);
+        const before = shiftOf(plain(world), world, pose);
+        expect(now.dx, `${world} ${label}`).toBeLessThanOrEqual(30);
+        expect(before.dx, `${world} ${label} without the step`).toBeGreaterThan(34);
+        expect(now.dy, `${world} ${label} vertical`).toBeLessThanOrEqual(0.45);
+      }
+    }
+  });
+
+  it('the step costs nothing in the calibration posture, and leaning in or back is corrected as before', () => {
+    for (const world of ['W1', 'W3'] as const) {
+      const still = shiftOf((seed) => withStep(world, seed), world, { ...BASE_POSE });
+      const stillBefore = shiftOf(plain(world), world, { ...BASE_POSE });
+      expect(still.dy, world).toBeLessThanOrEqual(stillBefore.dy + 0.08);
+      for (const tz of [-66, -54]) expect(shiftOf((seed) => withStep(world, seed), world, { ...BASE_POSE, tz }).dy, `${world} tz ${tz}`).toBeLessThanOrEqual(0.5);
+    }
+  });
+
+  it('a step of nods only teaches nodding: a chin drop is corrected, a turn is left as it was', () => {
+    const nods = { turnDeg: 0, tiltDeg: 0 };
+    const fitted = fitPoseCompensation(calibrated([...GAZE_EXCLUDED_FEATURES], 'W1', 1), headMovementSession(1, { noise: WORLDS.W1.noise, ...nods }), { maxBlink: 0.85 });
+    expect(fitted.ok && fitted.fit.learned).toEqual({ a: false, b: true, roll: false });
+    const chin = shiftOf((seed) => withStep('W1', seed, nods, 'nods'), 'W1', { ...BASE_POSE, pitch: 8 * DEG });
+    expect(chin.dy).toBeLessThanOrEqual(0.5);
+    const turn = shiftOf((seed) => withStep('W1', seed, nods, 'nods'), 'W1', { ...BASE_POSE, yaw: 4 * DEG });
+    const turnBefore = shiftOf(plain('W1'), 'W1', { ...BASE_POSE, yaw: 4 * DEG });
+    expect(Math.abs(turn.dx - turnBefore.dx)).toBeLessThan(8);
+  });
+
+  it('a head that hardly moves teaches nothing, and small nods (3°) still do', () => {
+    const base = calibrated([...GAZE_EXCLUDED_FEATURES], 'W1', 2);
+    const still = fitPoseCompensation(base, headMovementSession(2, { noise: WORLDS.W1.noise, nodDeg: 0.5, turnDeg: 0.5, tiltDeg: 0.3 }), { maxBlink: 0.85 });
+    expect(still).toEqual({ ok: false, reason: 'still' });
+    expect(fitPoseCompensation(base, headMovementSession(2, { noise: WORLDS.W1.noise }).slice(0, 12), { maxBlink: 0.85 })).toEqual({ ok: false, reason: 'too-few' });
+    const small = shiftOf((seed) => withStep('W1', seed, { nodDeg: 3, turnDeg: 3.5, tiltDeg: 3 }, 'small'), 'W1', { ...BASE_POSE, pitch: 8 * DEG });
+    expect(small.dy).toBeLessThanOrEqual(0.7);
+  });
+
+  it('holds the correction beyond the movement it was fitted on instead of extrapolating', () => {
+    const model = withStep('W1', 1);
+    const pose = model.poseCompensation!;
+    expect(pose.maxAngle).toBeGreaterThan(5 * DEG);
+    expect(pose.maxAngle).toBeLessThanOrEqual(20 * DEG);
+    const at = (pitchDeg: number): number => {
+      const r = rng(77);
+      const ys: number[] = [];
+      for (let i = 0; i < 30; i++) {
+        const f = frameFeatures(makeFrame({ x: VIEW.width / 2, y: VIEW.height / 2 }, { ...BASE_POSE, pitch: BASE_POSE.pitch + pitchDeg * DEG }, { h: 0, v: 0 }, {}, r, WORLDS.W1.noise));
+        const withPose = f && model.predictScreenFromVector(f.vector);
+        const without = f && calibrated([...GAZE_EXCLUDED_FEATURES], 'W1', 1).predictScreenFromVector(f.vector);
+        if (withPose && without) ys.push(withPose.y - without.y);
+      }
+      return mean(ys);
+    };
+    // The correction applied at 25° and at 30° of pitch is the same: it stopped growing at the limit.
+    expect(Math.abs(at(30) - at(25))).toBeLessThan(6);
+    expect(Math.abs(at(25))).toBeGreaterThan(Math.abs(at(4)) * 1.5);
+  });
+
+  it('a model saved before this, or with the step skipped, predicts exactly as it did', () => {
+    const base = calibrated([...GAZE_EXCLUDED_FEATURES], 'W1', 3);
+    expect(base.poseCompensation?.gain).toEqual([0, 0, 0, 0]);
+    const json = JSON.parse(JSON.stringify(base.toJSON())) as Record<string, unknown>;
+    delete json.pose;
+    const old = deserializeGazeModel(json, { featureLength: FEATURE_NAMES.length })!;
+    expect(old.poseCompensation).toBeNull();
+    const r = rng(5);
+    for (const pitch of [0, 8 * DEG]) {
+      const f = frameFeatures(makeFrame({ x: 400, y: 300 }, { ...BASE_POSE, pitch }, { h: 0, v: 0 }, {}, r, WORLDS.W1.noise))!;
+      expect(old.predictScreenFromVector(f.vector)).toEqual(base.predictScreenFromVector(f.vector));
+    }
+    // A stored correction comes back as it was; a damaged one is dropped, not the model.
+    const fitted = withStep('W1', 3);
+    const back = deserializeGazeModel(JSON.parse(JSON.stringify(fitted.toJSON())), { featureLength: FEATURE_NAMES.length })!;
+    expect(back.poseCompensation).toEqual(fitted.poseCompensation);
+    const damaged = JSON.parse(JSON.stringify(fitted.toJSON())) as { pose: { gain: unknown } };
+    damaged.pose.gain = [1e9, 0, 0, 0];
+    expect(deserializeGazeModel(damaged, { featureLength: FEATURE_NAMES.length })?.poseCompensation).toBeNull();
+    // And a quick refresh keeps it.
+    const refreshed = refineGazeModel(fitted, calibrationSession(9, { noise: WORLDS.W1.noise, targets: [{ x: 0.5, y: 0.5 }, { x: 0.15, y: 0.15 }, { x: 0.85, y: 0.15 }, { x: 0.15, y: 0.85 }, { x: 0.85, y: 0.85 }] }), { viewport: { ...VIEW }, maxBlink: 0.85 }).model;
+    expect(refreshed.poseCompensation?.gain).toEqual(fitted.poseCompensation?.gain);
   });
 
   it('a 4° head turn moves the gaze at most 60 px sideways (70+ with yaw/pitch as features)', () => {

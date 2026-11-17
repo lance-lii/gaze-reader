@@ -27,7 +27,7 @@
  */
 import type { FeatureFrame, FeatureSource, Fixation, GazeModel, GazeSample, LineEstimate, LineLayout, PageEndDecision, Sensitivity, Unsubscribe } from '../../src/types';
 import { FEATURE_NAMES, frameQuality } from '../../src/gaze/features';
-import { refineGazeModel, trainGazeModel } from '../../src/gaze/calibrationModel';
+import { fitPoseCompensation, refineGazeModel, trainGazeModel } from '../../src/gaze/calibrationModel';
 import { WebcamGazeSource } from '../../src/gaze/webcamGazeSource';
 import { AppearanceMonitor } from '../../src/gaze/appearance';
 import { FixationDetector } from '../../src/signal/fixations';
@@ -179,7 +179,11 @@ export interface RigOptions {
   onFixation?: (fix: RigFixation) => void;
   /** The reading layer started over (a reopened book, a calibration refresh), as the app's resetPipeline does it. */
   onReset?: (t: number) => void;
+  /** The reader does the calibration's head-movement step (default true, or GR_EVAL_HEAD_STEP). */
+  headStep?: boolean;
 }
+
+const HEAD_STEP_DEFAULT = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.GR_EVAL_HEAD_STEP !== '0';
 
 export function runSession(scenario: Scenario, seed: number, opts: { minutes?: number } & RigOptions = {}): SessionMetrics {
   const sensitivity = opts.sensitivity ?? 'balanced';
@@ -190,6 +194,11 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
   // Calibration: 13 dots in today's light (the overlay's grid), trained like the overlay does.
   const trained = trainGazeModel(world.calibrationSamples(seed * 31 + 3), { viewport, maxBlink: CAL_MAX_BLINK, featureNames: FEATURE_NAMES });
   let model: GazeModel = trained.model;
+  // The head-movement step at the end of a calibration (GR_EVAL_HEAD_STEP=0: a reader who skips it).
+  if (opts.headStep ?? HEAD_STEP_DEFAULT) {
+    const fitted = fitPoseCompensation(trained.model, world.headMovementSamples(seed * 31 + 5), { maxBlink: CAL_MAX_BLINK });
+    if (fitted.ok) model = fitted.model;
+  }
 
   const camera = new PushSource();
   let clock = 0;
