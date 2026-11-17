@@ -1224,6 +1224,60 @@ describe('AppController', () => {
     expect(changes[0]!.detail).toMatch(/narrower/);
   });
 
+  it('webcam: head gestures page forward and back and pause, when switched on (and say what they understood)', async () => {
+    const turn = vi.spyOn(ScrollController.prototype, 'turnPage').mockResolvedValue(undefined);
+    const back = vi.spyOn(ScrollController.prototype, 'pageBack').mockResolvedValue(undefined);
+    vi.spyOn(ScrollController.prototype, 'atEnd').mockReturnValue(false);
+    const { camera } = await readWithWebcam(calibratedModel(), { settings: { headGestures: true } });
+    const settings = record(app, 'settings-changed');
+    let t = performance.now();
+    /** The reader's head over `ms`: yaw (radians; > 0 is the reader's left) and eyebrows as functions of the time since the start. */
+    const watch = (ms: number, yaw: (at: number) => number = () => 0, brows: (at: number) => number = () => 0.08): void => {
+      for (let at = 0; at < ms; at += 33) {
+        const f = webcamFrame();
+        camera.emit({ ...f, t: t + at, features: { ...f.features!, headPose: { ...f.features!.headPose, yaw: yaw(at) }, browRaise: brows(at) } });
+      }
+      t += ms;
+    };
+    const flick = (amp: number) => (at: number): number => (at < 400 || at > 850 ? 0 : amp * Math.sin((Math.PI * (at - 400)) / 450) ** 2);
+
+    watch(1500, flick(-0.35)); // a quick turn to the reader's right, and back
+    expect(turn).toHaveBeenCalledTimes(1);
+    expect(toastText()).toContain('Head turn: next page');
+    await new Promise((resolve) => setTimeout(resolve, 0)); // the (mocked) turn lands
+    watch(1500, flick(0.35));
+    expect(back).toHaveBeenCalledTimes(1);
+    expect(toastText()).toContain('Head turn: previous page');
+
+    watch(1500, undefined, (at) => (at > 300 && at < 1200 ? 0.6 : 0.08)); // eyebrows up for a moment
+    expect(settings.at(-1)?.settings.autoScroll).toBe(false);
+    expect(toastText()).toContain('Eyebrows: page turning paused');
+    watch(1500, undefined, (at) => (at > 300 && at < 1200 ? 0.6 : 0.08)); // and again: gestures keep working while paused
+    expect(settings.at(-1)?.settings.autoScroll).toBe(true);
+    expect(toastText()).toContain('Eyebrows: page turning resumed');
+
+    // Under a dialog nothing happens behind it.
+    pressKey('s');
+    watch(1500, flick(-0.35));
+    expect(turn).toHaveBeenCalledTimes(1);
+  });
+
+  it('webcam: head gestures are off unless the reader switches them on', async () => {
+    const turn = vi.spyOn(ScrollController.prototype, 'turnPage').mockResolvedValue(undefined);
+    vi.spyOn(ScrollController.prototype, 'atEnd').mockReturnValue(false);
+    const { camera } = await readWithWebcam(calibratedModel());
+    const settings = record(app, 'settings-changed');
+    const t = performance.now();
+    for (let at = 0; at < 1500; at += 33) {
+      const f = webcamFrame();
+      const yaw = at < 400 || at > 850 ? 0 : -0.35 * Math.sin((Math.PI * (at - 400)) / 450) ** 2;
+      camera.emit({ ...f, t: t + at, features: { ...f.features!, headPose: { ...f.features!.headPose, yaw }, browRaise: at > 900 ? 0.7 : 0.08 } });
+    }
+    expect(turn).not.toHaveBeenCalled();
+    expect(settings).toEqual([]);
+    expect(toastText()).not.toContain('Head turn');
+  });
+
   it('keeps the learned drift when a book is reopened with the same source, and re-learns it for another', async () => {
     const reset = vi.spyOn(LineTracker.prototype, 'reset');
     const relearn = vi.spyOn(LineTracker.prototype, 'appearanceChangedAt');

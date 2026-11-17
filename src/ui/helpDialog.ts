@@ -205,6 +205,13 @@ const TIPS: readonly string[] = [
   'If Dewey seems to look in the wrong place, recalibrate with C.',
 ];
 
+const GESTURES: readonly string[] = [
+  'Off until you switch them on: Settings, “Head gestures”. They need the webcam.',
+  'Turn your head quickly to the right and back, eyes on the page: next page. To the left and back: previous page.',
+  'Raise your eyebrows and hold them up for a moment: pause, or resume, automatic page turning.',
+  'Looking away, nodding or settling into a new posture doesn’t count: a gesture is quick, sideways, and comes straight back.',
+];
+
 export class HelpDialog implements Mountable {
   private readonly layer: ModalLayer;
 
@@ -235,6 +242,10 @@ export class HelpDialog implements Mountable {
             (p) => `<li><span class="gr-pill gr-pill--static" data-tone="${p.tone}"><span class="gr-pill__dot" aria-hidden="true"></span><span class="gr-pill__label">${p.label}</span></span><span>${p.text}</span></li>`,
           ).join('')}
         </ul>
+      </section>
+      <section class="gr-help__section">
+        <h3 class="gr-help__heading">${icon('glasses')} Head gestures</h3>
+        <ul class="gr-help__tips">${GESTURES.map((t) => `<li>${t}</li>`).join('')}</ul>
       </section>
       <section class="gr-help__section">
         <h3 class="gr-help__heading">${icon('eye')} Tips for good tracking</h3>
