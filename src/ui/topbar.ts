@@ -56,6 +56,12 @@ export interface TopbarOptions {
   getSettings: () => AppSettings;
   /** The source switch goes through the controller (it also clears "don't retry the camera" latches). */
   onSelectSource: (kind: GazeSourceKind) => void;
+  /**
+   * The reader tapped or clicked the status pill: say what it means. On a narrow screen the pill
+   * is only a coloured dot (its label doesn't fit), and its explanation sits in a tooltip that a
+   * touch screen never shows: "no face", "poor" and "unsure" were the same amber dot.
+   */
+  onExplainStatus?: (text: string) => void;
 }
 
 export interface TopbarStatus {
@@ -312,6 +318,14 @@ export class Topbar implements Mountable {
         // (detail 0) keeps its focus, as it must.
         if (e.detail > 0) btn.blur();
         this.opts.bus.emit('command', { name: btn.dataset.cmd as CommandName });
+      },
+      { signal },
+    );
+    this.ui.pill.addEventListener(
+      'click',
+      () => {
+        const text = this.ui.pill.getAttribute('aria-label');
+        if (text) this.opts.onExplainStatus?.(text);
       },
       { signal },
     );

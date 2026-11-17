@@ -334,6 +334,27 @@ describe('ScrollController — undo, back and teardown', () => {
     expect(await controller.undo()).toBe(false);
   });
 
+  it('undo is for the turn just seen: once the reader has scrolled more than a screen away by hand, there is nothing to undo', async () => {
+    const h = setup({ scrollDurationMs: 0 });
+    await h.controller.turnPage(makeLayout(0), 11, { auto: true, reason: 'line-tracker' });
+    const landed = h.scroller.scrollTop;
+    expect(landed).toBeGreaterThan(0);
+    // A little further down by hand: still the same place, U takes the turn back.
+    h.scroller.setScroll(landed + 200);
+    h.controller.noteManualScroll(h.scroller.scrollTop);
+    expect(await h.controller.undo()).toBe(true);
+    expect(h.scroller.scrollTop).toBe(0);
+
+    await h.controller.turnPage(makeLayout(0), 11, { auto: true, reason: 'line-tracker' });
+    // Three screens further on, by hand: U would jump back to a place left long ago.
+    h.scroller.setScroll(h.scroller.scrollTop + 1800);
+    h.controller.noteManualScroll(h.scroller.scrollTop);
+    const before = h.scroller.scrollTop;
+    expect(await h.controller.undo()).toBe(false);
+    expect(h.scroller.scrollTop).toBe(before);
+    h.controller.noteManualScroll(Number.NaN); // nothing to go by: nothing happens
+  });
+
   it('forgets undo records after a reflow but keeps the session statistics', async () => {
     const { scroller, controller } = setup({ scrollDurationMs: 0 });
     scroller.setScroll(1000);
