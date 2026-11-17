@@ -303,6 +303,8 @@ export class AppController {
   private pdfDoc: PdfDocumentHandle | null = null;
   /** The open book is a PDF whose original file is kept: it can be shown as pages or as text. */
   private pdfAvailable = false;
+  /** Stops the "Open from URL" download in flight, if any. */
+  private urlAbort: AbortController | null = null;
   private openSeq = 0;
   private samples: readonly SampleBookInfo[] | null = null;
   private hasRecent = false;
@@ -433,6 +435,7 @@ export class AppController {
       onOpenFile: (file) => void this.openFromFile(file),
       onOpenText: (text, title) => void this.openFromText(text, title),
       onOpenUrl: (url) => void this.openFromUrl(url),
+      onCancelOpen: () => this.cancelOpen(),
       onOpenSample: (id) => void this.openSample(id),
       onOpenBook: (id) => void this.openSaved(id),
       onDeleteBook: (id, title) => void this.removeBook(id, title),
@@ -537,6 +540,9 @@ export class AppController {
     if (this.destroyed) return;
     this.savePositionNow();
     this.destroyed = true;
+    this.store.dispose?.();
+    this.urlAbort?.abort();
+    this.urlAbort = null;
     this.sourceGen++;
     this.teardownSource();
     this.recorder.discard();
@@ -717,7 +723,22 @@ export class AppController {
     } catch {
       /* keep the raw text */
     }
-    return this.openWith(`Fetching from ${host}…`, () => loadBookFromUrl(url), 'url');
+    this.urlAbort?.abort();
+    const abort = new AbortController();
+    this.urlAbort = abort;
+    return this.openWith(`Fetching from ${host}…`, () => loadBookFromUrl(url, { signal: abort.signal }), 'url').finally(() => {
+      if (this.urlAbort === abort) this.urlAbort = null;
+    });
+  }
+
+  /** Cancel in the library's URL form: stop the download and give the library back. */
+  private cancelOpen(): void {
+    const abort = this.urlAbort;
+    if (!abort) return;
+    this.urlAbort = null;
+    this.openSeq++; // whatever that request still returns is no longer wanted
+    abort.abort();
+    this.library.setBusy(null);
   }
 
   private openSample(id: string): Promise<boolean> {
@@ -1337,11 +1358,11 @@ export class AppController {
    * Starts the page-end detector's cooldown (every scroll, automatic or not). `undone`: the scroll
    * took back a page turn, and the reader may now finish the page without looking up it first.
    */
-  private notifyScrolled(undone = false): void {
+  private notifyScrolled(undone = false, resumeBottom?: number): void {
     const t = performance.now();
     if (undone) this.pageEnd.notifyUndone(t);
-    else this.pageEnd.notifyScrolled(t);
-    this.recordInput(undone ? { k: 'scrolled', t, undone: true } : { k: 'scrolled', t });
+    else this.pageEnd.notifyScrolled(t, resumeBottom);
+    this.recordInput(undone ? { k: 'scrolled', t, undone: true } : resumeBottom !== undefined ? { k: 'scrolled', t, resumeBottom } : { k: 'scrolled', t });
   }
 
   private recordInput(entry: PipelineControl): void {
@@ -1499,14 +1520,16 @@ export class AppController {
     this.timers.clear('scroll-settle');
     this.scrollSettling = false;
     const layout = this.measure(kind === 'undo' ? 'scroll' : 'page-turn');
+    let resumeBottom: number | undefined;
     if (layout && kind !== 'undo') {
       const resume = kind === 'turn' ? resumeLineIndex(layout.lines, oldDocTop, layout.linePitch) : firstFullyVisibleIndex(layout.lines);
       if (resume >= 0) {
         this.lineTracker.afterPageTurn(resume);
         this.recordInput({ k: 'resume', t: performance.now(), line: resume });
+        if (kind === 'turn') resumeBottom = layout.lines[resume]?.bottom;
       }
     }
-    this.notifyScrolled(kind === 'undo');
+    this.notifyScrolled(kind === 'undo', resumeBottom);
     this.resetFixations(false);
     this.updateProgressUi();
     this.scheduleSavePosition();

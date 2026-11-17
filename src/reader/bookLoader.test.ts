@@ -510,6 +510,46 @@ describe('Markdown → Book', () => {
   });
 });
 
+describe('plain text: lines that only look like headings', () => {
+  const para = (n: number): string => `Paragraph ${n} of the story runs on for a while, long enough to be wrapped\nover two lines of the file, as novels in plain text usually are.`;
+  const story = [
+    'CHAPTER I', '', para(1), '', 'NO TRESPASSING', '', para(2), '',
+    'CHAPTER II', '', 'THE ARRIVAL', '', para(3), '', '', '', 'Who goes there?', '', para(4), '', 'ARRIVING TUESDAY STOP', '', para(5),
+  ].join('\n');
+
+  it('in a book with numbered chapters, a sign in capitals or a short line after a break stays in the story (regression: five chapters)', () => {
+    const b = loadBookFromText(story, { format: 'txt' });
+    expect(b.chapters).toHaveLength(2);
+    expect(b.chapters[0]!.title).toMatch(/^chapter i$/i);
+    expect(b.chapters[1]!.title).toMatch(/^chapter ii\b/i);
+    const all = b.chapters.map((c) => c.html).join('\n');
+    for (const line of ['NO TRESPASSING', 'Who goes there?', 'ARRIVING TUESDAY STOP']) expect(all, line).toContain(line);
+    // A chapter's own title, right under its number, is still part of the heading.
+    expect(fragment(b.chapters[1]!.html).querySelectorAll('h2, h3').length).toBeGreaterThanOrEqual(1);
+    expect(fragment(b.chapters[0]!.html).querySelectorAll('h2, h3')).toHaveLength(1);
+  });
+
+  it('without numbered chapters, capitals still open a chapter', () => {
+    const b = loadBookFromText(['THE LAMP', '', para(1), '', 'THE KEEPER', '', para(2), '', 'THE STORM', '', para(3)].join('\n'), { format: 'txt' });
+    expect(b.chapters.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('decodeText', () => {
+  it('reads UTF-8 with a damaged byte as UTF-8, and windows-1252 as windows-1252', () => {
+    const utf8 = new TextEncoder().encode('Café “naïve” — déjà vu, façade, crème brûlée. '.repeat(20));
+    const damaged = new Uint8Array(utf8.length + 1);
+    damaged.set(utf8);
+    damaged[utf8.length] = 0xc3; // cut in the middle of a character
+    const text = decodeText(damaged);
+    expect(text).toContain('Café “naïve” — déjà vu');
+    expect(text).not.toContain('Ã');
+    // Latin-1 / windows-1252 text: é is the single byte 0xE9.
+    const latin = Uint8Array.from('Caf\u00e9 d\u00e9j\u00e0 vu, fa\u00e7ade. '.repeat(20), (c) => c.charCodeAt(0));
+    expect(decodeText(latin)).toContain('Café déjà vu, façade.');
+  });
+});
+
 // ────────────────────────────────── HTML ──────────────────────────────────
 
 const ARTICLE_PAGE = `<!doctype html><html><head><title>The Quiet Library | Example Magazine</title>

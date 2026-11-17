@@ -164,6 +164,36 @@ describe('reconstructBlocks', () => {
     expect(blocks[0].text).toMatch(/reading\.1 Next sentence\.$/);
   });
 
+  it('reads a drop cap as the first letter of its paragraph, not as a heading (regression: "he quick…", then a chapter titled "T while…")', () => {
+    const body = (cap: { lines: number; size: number }): PdfPageText => {
+      const items: PdfTextItem[] = [];
+      const capWidth = cap.size * 0.7;
+      const texts = [
+        'he quick brown fox jumps over the lazy dog every single afternoon',
+        'while the farmer watches from the porch with a cup of strong tea,',
+        'because the afternoon is long and there is nothing else to do,',
+        'and then the evening comes and the fox goes home to its den to',
+        'sleep until the morning light returns to the quiet valley again.',
+      ];
+      texts.forEach((text, i) => items.push(...lineItems(text, i < cap.lines ? LEFT + capWidth + 4 : LEFT, 100 + i * PITCH)));
+      // The initial's baseline is the baseline of the last line it spans.
+      items.push({ str: 'T', x: LEFT, y: 100 + (cap.lines - 1) * PITCH, width: capWidth, height: cap.size });
+      // An ordinary paragraph after it, so "larger type" has something to be larger than.
+      ['A second paragraph follows the first one here, set in the same', 'size, and ends on a short line.'].forEach((text, i) =>
+        items.push(...lineItems(text, i === 0 ? LEFT + 15 : LEFT, 100 + 6 * PITCH + i * PITCH)),
+      );
+      return { width: 600, height: 800, items };
+    };
+    for (const cap of [{ lines: 2, size: 26 }, { lines: 3, size: 38 }]) {
+      const blocks = reconstructBlocks([body(cap)]);
+      expect(blocks.map((b) => b.kind), `${cap.lines}-line cap`).toEqual(['paragraph', 'paragraph']);
+      expect(blocks[0]!.text, `${cap.lines}-line cap`).toBe(
+        'The quick brown fox jumps over the lazy dog every single afternoon while the farmer watches from the porch with a cup of strong tea, ' +
+          'because the afternoon is long and there is nothing else to do, and then the evening comes and the fox goes home to its den to sleep until the morning light returns to the quiet valley again.',
+      );
+    }
+  });
+
   it('separates blocks on extra spacing, bullets and short final lines', () => {
     const pages = [
       page([

@@ -121,7 +121,7 @@ export type PipelineInput =
   | { k: 'layout'; t: number; reason: LayoutChangeReason; layout: RecordedLayout }
   | { k: 'resume'; t: number; line: number }
   /** PageEndDetector.notifyScrolled(t); with `undone`, notifyUndone(t) (the scroll was an undone page turn). */
-  | { k: 'scrolled'; t: number; undone?: true }
+  | { k: 'scrolled'; t: number; undone?: true; resumeBottom?: number }
   | { k: 'page-end-reset'; t: number }
   | { k: 'configure'; t: number; sensitivity: Sensitivity; glanceDownToTurn: boolean }
   /** LineTracker.appearanceChangedAt(at). */

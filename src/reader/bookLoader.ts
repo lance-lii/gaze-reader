@@ -835,6 +835,19 @@ function parsePlainText(raw: string): ParsedText {
     }
   }
 
+  // A book that numbers its chapters ("CHAPTER I", "Chapter 2", "III") marks them that way: a line
+  // in the running text that merely looks like a heading (a sign in capitals, "NO TRESPASSING"; a
+  // telegram; a short line after a scene break) is part of the story, not a chapter of its own.
+  // Titles that follow a heading directly stay ("CHAPTER I" / "THE ARRIVAL").
+  const numbered = units.filter((u) => u.kind === 'heading' && (u.keyword === 'chapter' || u.keyword === 'numeral')).length;
+  if (numbered >= 2) {
+    units = units.map((u, i) => {
+      const prev = units[i - 1];
+      if (u.kind !== 'heading' || u.keyword || i === 0 || prev?.kind === 'heading' || prev?.kind === 'title' || prev?.kind === 'byline') return u;
+      return { kind: 'para', text: u.lines.map((l) => l.trim()).join(' ') };
+    });
+  }
+
   const headings = units.filter((u): u is HeadingUnit => u.kind === 'heading');
   const hasChapters = headings.some((h) => h.keyword === 'chapter' || h.keyword === 'numeral');
   const partsExist = hasChapters && headings.some((h) => /^(book|part|volume|vol)$/.test(h.keyword ?? ''));
@@ -1447,7 +1460,18 @@ export function decodeText(bytes: Uint8Array, charsetHint?: string | null): stri
   try {
     return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
   } catch {
-    /* not UTF-8 */
+    /* not strictly UTF-8 */
+  }
+  // UTF-8 with a damaged byte or two (a file cut mid-character, one bad paste) is still UTF-8:
+  // read as windows-1252, every accented letter and curly quote in it turned into "Ã©" and "â€™".
+  // In real windows-1252 text nearly every high byte is an invalid sequence; in damaged UTF-8 few are.
+  let high = 0;
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] >= 0x80) high++;
+  if (high > 0) {
+    const lenient = new TextDecoder('utf-8').decode(bytes);
+    let replaced = 0;
+    for (let i = lenient.indexOf('\ufffd'); i >= 0; i = lenient.indexOf('\ufffd', i + 1)) replaced++;
+    if (replaced * 10 < high) return lenient;
   }
   const hint = charsetHint?.trim().toLowerCase();
   if (hint && !/^utf-?8$/.test(hint)) {

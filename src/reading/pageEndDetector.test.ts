@@ -410,6 +410,41 @@ describe('PageEndDetector', () => {
     for (let fix = 2; fix <= 8; fix++) expect(spent.run(600, parked, estimate(L, { fix }))).toBeNull();
   });
 
+  it('on a page only four lines tall, reading the line it resumed on counts as back up the page (regression: one turn, then never again)', () => {
+    const small = doc.layoutAt(0, { viewport: { left: 0, top: 0, right: 1024, bottom: 4.5 * 42 } });
+    const SL = lastFullyVisibleLine(small);
+    expect(SL).toBe(3);
+    const sLine = (i: number) => small.lines[i]!;
+    const at = (i: number, frac: number) => ({ x: sLine(i).left + frac * (sLine(i).right - sLine(i).left), y: sLine(i).centerY });
+    const est = (i: number, o: Parameters<typeof estimate>[1] = {}) => estimate(i, { ...o, lay: small });
+    const readToEnd = (rig: Rig): ReturnType<Rig['run']> => {
+      // The reader resumes on the line above the last (two lines of context are kept), reads it…
+      expect(rig.run(1500, at(SL - 1, 0.5), est(SL - 1, { fix: 3 }), small)).toBeNull();
+      // …sweeps onto the last line and finishes it.
+      expect(rig.run(200, at(SL, 0.1), est(SL, { sac: 'return-sweep', fix: 10 }), small)).toBeNull();
+      expect(rig.run(200, at(SL, 0.1), est(SL, { sac: 'regression', fix: 11 }), small)).toBeNull();
+      return rig.run(4000, at(SL, 0.95), est(SL, { fix: 12 }), small);
+    };
+    const firstTurn = (): Rig => {
+      const rig = new Rig();
+      expect(readToEnd(rig)?.d.reason).toBe('line-tracker');
+      rig.t += 700;
+      return rig;
+    };
+    // Told where reading resumes, the next page turns too.
+    const told = firstTurn();
+    told.det.notifyScrolled(told.t, sLine(SL - 1).bottom);
+    expect(readToEnd(told)?.d.reason).toBe('line-tracker');
+    // Not told (as before): the gaze never gets a line above the bottom zone, and nothing turns.
+    const untold = firstTurn();
+    untold.det.notifyScrolled(untold.t);
+    expect(readToEnd(untold)).toBeNull();
+    // A gaze resting on the last line doesn't count as "up", whatever the resume line.
+    const resting = firstTurn();
+    resting.det.notifyScrolled(resting.t, sLine(SL).bottom);
+    for (let fix = 2; fix <= 10; fix++) expect(resting.run(600, at(SL, 0.95), est(SL, { fix }), small)).toBeNull();
+  });
+
   it('vetoes bottom-dwell when the tracker is sure the reader is well above', () => {
     const rig = new Rig();
     expect(rig.run(4000, { x: xAt(L, 0.8), y: line(L).centerY }, estimate(L - 5, { p: 0.9 }))).toBeNull();

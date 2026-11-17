@@ -561,6 +561,45 @@ describe('AppController', () => {
     expect(toastText()).not.toMatch(/Couldn’t open that book/);
   });
 
+  it('Cancel stops an "Open from URL" download and gives the library back (regression: it carried on and opened the book)', async () => {
+    let aborted = false;
+    let respond: ((r: Response) => void) | null = null;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init?: RequestInit) => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true;
+        });
+        return new Promise<Response>((resolve, reject) => {
+          respond = resolve;
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+        });
+      }),
+    );
+    const toggle = document.querySelector<HTMLButtonElement>('.gr-lib-url-toggle')!;
+    toggle.click();
+    const form = document.querySelector<HTMLFormElement>('.gr-inline-form:not([hidden])')!;
+    form.querySelector('input')!.value = 'https://example.org/slow-book.txt';
+    form.requestSubmit();
+    await until(() => respond !== null, 'the request to start');
+    const libraryEl = toggle.closest<HTMLElement>('[aria-busy]')!;
+    expect(libraryEl).not.toBeNull(); // busy: its controls are disabled meanwhile
+
+    form.querySelector<HTMLButtonElement>('[data-cancel]')!.click();
+    expect(aborted).toBe(true);
+    await sleep(30);
+    expect(libraryEl.hasAttribute('aria-busy')).toBe(false);
+    expect(toggle.disabled).toBe(false);
+    expect(document.documentElement.dataset.screen).toBe('library');
+    expect(document.activeElement).toBe(toggle);
+    // Even a response that still arrives opens nothing.
+    respond!(new Response('A late book. '.repeat(200), { headers: { 'content-type': 'text/plain' } }));
+    await sleep(60);
+    expect(document.documentElement.dataset.screen).toBe('library');
+    expect(toastText()).not.toMatch(/Couldn’t open/);
+    vi.unstubAllGlobals();
+  });
+
   it('queues U pressed while a forward turn is still sliding, and undoes it when it lands (regression)', async () => {
     let land: (() => void) | null = null;
     let animating = false;
