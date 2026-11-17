@@ -423,6 +423,22 @@ describe('AppController', () => {
     expect(JSON.parse(localStorage.getItem('gazeReader.settings.v1')!)).toMatchObject({ buddyEnabled: true });
   });
 
+  it('measures the lines again when Dewey changes corner, appears or is hidden (regression: the reading area moved, the lines didn’t)', async () => {
+    await openPastedText();
+    const layouts = record(app, 'layout');
+    await until(() => layouts.length > 0, 'the first layout');
+    await sleep(250);
+    const before = layouts.length;
+    app.bus.emit('settings-patch', { buddyCorner: 'top-left' });
+    await until(() => layouts.length > before, 'a new measurement after Dewey moved');
+    const after = layouts.length;
+    await sleep(250);
+    // Whichever way he was: one of these two is a change.
+    app.bus.emit('settings-patch', { buddyEnabled: true });
+    app.bus.emit('settings-patch', { buddyEnabled: false });
+    await until(() => layouts.length > after, 'a new measurement after Dewey was shown or hidden');
+  });
+
   it('keyboard: P pauses (pill says so), shortcuts wait while typing, and nothing reacts after destroy', async () => {
     const states = record(app, 'tracking-state');
     // In the library, typing an "s" into the paste box is just typing (S would open Settings).
@@ -1035,6 +1051,27 @@ describe('AppController', () => {
     await until(() => overlays.modes.length === 2, 'the calibration to open again after the restart');
     expect(overlays.modes).toEqual(['standard', 'standard']);
     expect(toastText()).toMatch(/calibration starts over/);
+  });
+
+  it('webcam: a camera that freezes in the middle of a calibration is restarted, and the calibration opens again (regression: stuck on the dots until Esc)', async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    const { camera } = await readWithWebcam(calibratedModel());
+    let cancelled: (() => void) | null = null;
+    overlays.run = () =>
+      new Promise((resolve) => {
+        cancelled = () => resolve(null);
+      });
+    vi.spyOn(CalibrationOverlay.prototype, 'cancel').mockImplementation(() => cancelled?.());
+    app.bus.emit('command', { name: 'recalibrate' });
+    await until(() => overlays.modes.length === 1, 'the recalibration');
+    camera.emit(webcamFrame());
+    const before = camera.starts();
+    skew += 6000; // six seconds without a frame: no 'ended' event, the camera just froze
+    await until(() => camera.starts() === before + 1, 'the camera to be restarted', 4000);
+    await until(() => overlays.modes.length === 2, 'the calibration to open again', 4000);
+    expect(overlays.modes).toEqual(['standard', 'standard']);
   });
 
   it('webcam: a camera that keeps stopping a little over a minute apart is reported on the third stop (regression: restarted silently forever)', async () => {
