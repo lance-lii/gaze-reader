@@ -852,8 +852,19 @@ export class DriftWatch {
     return this.sustained(t);
   }
 
+  /**
+   * The offset has lasted, and the last pinned estimate isn't a gap ago: a long stretch of
+   * unpinned ones is a gap like any other. Without that, one second of a pinned 2-line drift
+   * followed by twenty of an unsure tracker asked for a touch-up.
+   */
   sustained(t: number): boolean {
-    return this.since !== null && t - this.since >= this.o.holdMs && this.total > 0 && this.over / this.total >= this.o.minShare;
+    return (
+      this.since !== null &&
+      t - this.lastT <= this.o.gapMs &&
+      t - this.since >= this.o.holdMs &&
+      this.total > 0 &&
+      this.over / this.total >= this.o.minShare
+    );
   }
 
   /** +1: the gaze reads low (below the text); −1: high; 0: no run. */

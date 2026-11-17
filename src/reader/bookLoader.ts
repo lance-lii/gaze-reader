@@ -1246,6 +1246,30 @@ function hintOf(el: Element): string {
   return `${el.getAttribute('class') ?? ''} ${el.getAttribute('id') ?? ''}`;
 }
 
+const textLength = (el: Element): number => collapseWhitespace(el.textContent ?? '').length;
+
+/**
+ * A `form` or an `aria-hidden` block is page furniture (a search box, a closed dialog) unless it
+ * holds most of the text: ASP.NET pages wrap their whole body in one form, and a page saved with a
+ * dialog open has `aria-hidden` on everything behind it. Those are the page, not furniture.
+ */
+const WRAPPER_SHARE = 0.5;
+const isFormOrHidden = (el: Element): boolean => el.localName === 'form' || el.getAttribute('aria-hidden') === 'true';
+
+/**
+ * Running text: a few real paragraphs and few links. A block like that whose *id* happens to
+ * contain "related", "social", "sharing" or "comments" is a section of the document ("Related
+ * work", "Social impact": generated ids are slugs of headings), not a widget.
+ */
+function looksLikeProse(el: Element): boolean {
+  if (textLength(el) < 400 || linkDensity(el) > 0.25) return false;
+  let paragraphs = 0;
+  for (const p of Array.from(el.querySelectorAll('p'))) {
+    if (textLength(p) >= 80 && ++paragraphs >= 2) return true;
+  }
+  return false;
+}
+
 function linkDensity(el: Element): number {
   const total = collapseWhitespace(el.textContent ?? '').length;
   if (!total) return 0;
@@ -1263,8 +1287,19 @@ function linkDensity(el: Element): number {
 export function extractMainContent(doc: Document): Element {
   const body = doc.body ?? doc.documentElement;
   const scores = new Map<Element, number>();
+  const bodyText = textLength(body);
+  const wrappers = new Map<Element, boolean>();
+  const wrapsThePage = (el: Element): boolean => {
+    let known = wrappers.get(el);
+    if (known === undefined) {
+      known = isFormOrHidden(el) && textLength(el) > bodyText * WRAPPER_SHARE;
+      wrappers.set(el, known);
+    }
+    return known;
+  };
   for (const p of Array.from(body.querySelectorAll(PARAGRAPH_SELECTOR))) {
-    if (p.closest('nav, aside, footer, form, [role="navigation"], [role="complementary"], [aria-hidden="true"]')) continue;
+    const furniture = p.closest('nav, aside, footer, form, [role="navigation"], [role="complementary"], [aria-hidden="true"]');
+    if (furniture && !wrapsThePage(furniture)) continue;
     const text = collapseWhitespace(p.textContent ?? '');
     if (text.length < 25) continue;
     const score = 1 + (text.match(/[,，、]/g)?.length ?? 0) + Math.min(3, Math.floor(text.length / 100));
@@ -1308,12 +1343,21 @@ function stripBoilerplate(root: Element): void {
     'nav, aside, form, [role="navigation"], [role="complementary"], [role="search"], [aria-hidden="true"], [hidden], ' +
       '#pg-header, #pg-footer, .pg-boilerplate',
   );
-  for (const el of Array.from(junk)) el.remove();
+  const wholeText = textLength(root);
+  for (const el of Array.from(junk)) {
+    if (!root.contains(el)) continue; // already removed with an ancestor
+    if (isFormOrHidden(el) && textLength(el) > wholeText * WRAPPER_SHARE) continue; // the page itself, wrapped
+    el.remove();
+  }
   const rootText = collapseWhitespace(root.textContent ?? '').length;
   for (const el of Array.from(root.querySelectorAll('[class], [id]'))) {
     if (!root.contains(el)) continue; // already removed with an ancestor
     const hint = hintOf(el);
     if (!NEGATIVE_HINT.test(hint) || POSITIVE_HINT.test(hint)) continue;
+    // A heading's id is a slug of its words ("#comments", "#modal-verbs"): never a widget.
+    if (/^h[1-6]$/.test(el.localName)) continue;
+    // Named by its id alone, and it reads as a section of the text: "Related work", not "related posts".
+    if (!NEGATIVE_HINT.test(el.getAttribute('class') ?? '') && looksLikeProse(el)) continue;
     // A class name is only a hint: never throw away a large share of the text because of it.
     if (collapseWhitespace(el.textContent ?? '').length > rootText * 0.3) continue;
     el.remove();

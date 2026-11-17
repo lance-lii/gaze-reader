@@ -369,6 +369,47 @@ describe('PageEndDetector', () => {
     expect(rig.run(3000, parked, estimate(L, { fix: 14 }))?.d.reason).toBe('line-tracker');
   });
 
+  it('after an undone turn, the page turns again when the reader finishes it, without a look up the page first (regression: never again)', () => {
+    const parked = { x: xAt(L, 0.95), y: line(L).centerY };
+    const turnEarly = (): Rig => {
+      const rig = new Rig();
+      rig.enter(L);
+      expect(rig.run(2000, parked, estimate(L, { fix: 12 }))?.d.reason).toBe('line-tracker');
+      rig.det.notifyScrolled(rig.t); // the page turned…
+      rig.t += 700;
+      return rig;
+    };
+    // …a line early: the reader presses U and is back on the line above the last, reading on.
+    const rig = turnEarly();
+    rig.det.notifyUndone(rig.t);
+    const above = { x: xAt(L - 1, 0.6), y: line(L - 1).centerY };
+    expect(rig.run(2500, above, estimate(L - 1, { fix: 3 }))).toBeNull();
+    rig.enter(L); // the return sweep onto the last line
+    const hit = rig.run(4000, parked, estimate(L, { fix: 12 }));
+    expect(hit?.d.reason).toBe('line-tracker');
+
+    // Without the undo (any other scroll), the same reading still waits for the look up.
+    const other = turnEarly();
+    other.det.notifyScrolled(other.t);
+    expect(other.run(2500, above, estimate(L - 1, { fix: 3 }))).toBeNull();
+    other.enter(L);
+    expect(other.run(4000, parked, estimate(L, { fix: 12 }))).toBeNull();
+    expect(other.last!.detail).toMatch(/gaze has not left the bottom/);
+
+    // The undo re-arms the line rule only: gaze or a pointer merely resting in the bottom-right
+    // zone, with a tracker that isn't sure, still doesn't turn the page a second time.
+    const resting = turnEarly();
+    resting.det.notifyUndone(resting.t);
+    expect(resting.run(8000, { x: xAt(L, 0.8), y: line(L).centerY }, estimate(L, { p: 0.45, above: 0.4, fix: 9 }))).toBeNull();
+    // And it is spent by the next turn: the page after that waits for the look up again.
+    const spent = turnEarly();
+    spent.det.notifyUndone(spent.t);
+    spent.enter(L);
+    expect(spent.run(4000, parked, estimate(L, { fix: 12 }))?.d.reason).toBe('line-tracker');
+    spent.det.notifyScrolled(spent.t);
+    for (let fix = 2; fix <= 8; fix++) expect(spent.run(600, parked, estimate(L, { fix }))).toBeNull();
+  });
+
   it('vetoes bottom-dwell when the tracker is sure the reader is well above', () => {
     const rig = new Rig();
     expect(rig.run(4000, { x: xAt(L, 0.8), y: line(L).centerY }, estimate(L - 5, { p: 0.9 }))).toBeNull();

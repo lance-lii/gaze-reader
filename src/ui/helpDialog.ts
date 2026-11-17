@@ -223,6 +223,11 @@ export class HelpDialog implements Mountable {
 
     const body = document.createElement('div');
     body.className = 'gr-modal__body';
+    // Longer than the window on most screens, and nothing inside it takes focus: focusable itself,
+    // so the arrow keys, Page Down and End scroll it (they scrolled the page behind the dialog).
+    body.tabIndex = 0;
+    body.setAttribute('role', 'region');
+    body.setAttribute('aria-labelledby', titleId);
     body.innerHTML = `
       <section class="gr-help__section">
         <h3 class="gr-help__heading">${icon('keyboard')} Keyboard shortcuts</h3>
@@ -234,6 +239,10 @@ export class HelpDialog implements Mountable {
           </tbody>
         </table>
         <p class="gr-help__note">Shortcuts pause while you type in a text field.</p>
+      </section>
+      <section class="gr-help__section">
+        <h3 class="gr-help__heading">${icon('glasses')} Head gestures</h3>
+        <ul class="gr-help__tips">${GESTURES.map((t) => `<li>${t}</li>`).join('')}</ul>
       </section>
       <section class="gr-help__section">
         <h3 class="gr-help__heading">${icon('camera')} The status pill</h3>

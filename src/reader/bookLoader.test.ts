@@ -549,6 +549,48 @@ describe('HTML → Book', () => {
     expect(all).toContain('<a href="#gr-src-faq">FAQ</a>');
   });
 
+  it('keeps sections whose ids merely contain a widget word (regression: "Related work", "Social impact" and headings vanished)', () => {
+    const para = (topic: string): string =>
+      `<p>${topic} is discussed here at some length, with commas, clauses, and enough words to be a real paragraph of the document.</p>`;
+    const page = `<!doctype html><html><head><title>A Paper</title></head><body><article>
+      <h1>A Paper</h1>
+      <section id="introduction"><h2 id="introduction-heading">Introduction</h2>${para('The introduction').repeat(4)}</section>
+      <section id="related-work"><h2>Related work</h2>${para('Earlier work on lamps').repeat(4)}</section>
+      <section id="social-impact"><h2>Social impact</h2>${para('The effect on readers').repeat(4)}</section>
+      <h2 id="sharing-state-between-threads">Sharing state between threads</h2>${para('Shared state').repeat(4)}
+      <h2 id="modal-verbs">Modal verbs</h2>${para('Could, should and would').repeat(4)}
+      <h2 id="comments">Comments</h2>${para('A comment is a note in code').repeat(4)}
+      <div id="related-posts"><ul><li><a href="/a">Ten lamps you will love</a></li><li><a href="/b">More about glasses</a></li></ul></div>
+      <div class="share-buttons" id="share"><a href="https://social.example/share">Share this paper</a></div>
+      <div id="comments-area" class="comments-area"><p>First! Great paper, I enjoyed every word of it and will read it again, thank you so much.</p><p>Second comment here, which is also long enough to look like a paragraph of running text to a parser.</p></div>
+    </article></body></html>`;
+    const all = loadBookFromText(page, { format: 'html' }).chapters.map((c) => c.html).join('\n');
+    for (const kept of ['Related work', 'Earlier work on lamps', 'Social impact', 'The effect on readers', 'Sharing state between threads', 'Modal verbs', 'Comments', 'A comment is a note in code']) {
+      expect(all, kept).toContain(kept);
+    }
+    // Real widgets still go: a list of links, a share button, a comment thread (named by its class).
+    for (const junk of ['Ten lamps you will love', 'Share this paper', 'First! Great paper']) expect(all, junk).not.toContain(junk);
+  });
+
+  it('reads a page whose whole body is one form, or sits behind an open dialog (regression: "no readable text")', () => {
+    const text = '<p>Libraries are quiet places, full of books, readers, and the soft rustle of turning pages in the afternoon.</p>'.repeat(6);
+    const webForms = `<!doctype html><html><head><title>Council minutes</title></head><body><form id="aspnetForm" method="post">
+      <input type="hidden" name="__VIEWSTATE" value="x"><div id="main"><h1>Council minutes</h1>${text}</div>
+      <form class="search"><input name="q"><p>Search the whole site for minutes, agendas and reports of the council.</p></form></form></body></html>`;
+    const a = loadBookFromText(webForms, { format: 'html' });
+    expect(a.wordCount).toBeGreaterThan(80);
+    expect(a.chapters.map((c) => c.html).join('')).toContain('soft rustle');
+
+    const behindDialog = `<!doctype html><html><head><title>An Article</title></head><body>
+      <div id="app" aria-hidden="true"><article><h1>An Article</h1>${text}</article></div>
+      <div role="dialog" aria-hidden="false"><p>Subscribe to our newsletter!</p></div></body></html>`;
+    const b = loadBookFromText(behindDialog, { format: 'html' });
+    expect(b.wordCount).toBeGreaterThan(80);
+    // A small hidden block inside an ordinary page is still dropped.
+    const hidden = `<!doctype html><html><head><title>T</title></head><body><article>${text}<div aria-hidden="true"><p>Hidden duplicate of the navigation menu for decoration only, do not read.</p></div></article></body></html>`;
+    expect(loadBookFromText(hidden, { format: 'html' }).chapters.map((c) => c.html).join('')).not.toContain('Hidden duplicate');
+  });
+
   it('keeps a right-to-left base direction declared on <html> or <body> (regression: rendered left to right)', () => {
     const page = (htmlAttrs: string, bodyAttrs: string): string =>
       `<!doctype html><html lang="he"${htmlAttrs}><head><title>ספר</title></head><body${bodyAttrs}><p>שלום עולם, זהו ספר ארוך מספיק כדי להיות תוכן של ממש.</p></body></html>`;

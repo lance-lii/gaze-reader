@@ -1116,7 +1116,7 @@ export class AppController {
     const session = this.session;
     if (!session) return;
     session.lastProgressEmitAt = now;
-    const fraction = Math.min(1, Math.max(0, this.reader.progress() || 0));
+    const fraction = Math.min(1, Math.max(0, this.progressNow() || 0));
     const minutes = session.clock.minutes;
     this.bus.emit('book-progress', {
       fraction,
@@ -1138,10 +1138,22 @@ export class AppController {
   private updateProgressUi(): void {
     const session = this.session;
     if (!session) return;
-    const fraction = this.reader.progress();
+    const fraction = this.progressNow();
     const wpm = computeWpm(session.meter.wordsAdvanced, session.meter.minutesAtLastAdvance) ?? TYPICAL_WPM;
     const left = formatMinutes(minutesLeft(fraction, session.book.wordCount, wpm));
     this.topbar.setProgress(fraction, formatPercent(fraction), fraction >= 0.995 || !left ? '' : `${left} left`);
+  }
+
+  /**
+   * How far through the book the reader is. A book that has been read to its end is at 100 % while
+   * its end is on screen, wherever the scroller happens to be: the last page of a book can't
+   * scroll to the bottom (the text ends, the page doesn't), and a book that fits on one screen
+   * can't scroll at all, so by scroll position alone a finished book read "0 %" or "94 %" and came
+   * back in the library as one to continue.
+   */
+  private progressNow(): number {
+    const fraction = this.reader.progress();
+    return this.session?.finished && this.onLastPage(this.layout) ? 1 : fraction;
   }
 
   private breakDue(session: ReadingSession): void {
@@ -1168,6 +1180,7 @@ export class AppController {
     });
     this.savePositionNow();
     this.emitProgress(performance.now());
+    this.updateProgressUi();
     this.toasts.show({
       id: 'finished',
       tone: 'success',
@@ -1187,6 +1200,7 @@ export class AppController {
     let pos: ReadingPosition | null = null;
     try {
       pos = this.reader.getPosition();
+      if (pos) pos = { ...pos, fraction: Math.max(pos.fraction, this.progressNow()) };
     } catch {
       pos = null;
     }
@@ -1319,11 +1333,15 @@ export class AppController {
     this.recordInput({ k: 'fixations-reset', t: performance.now(), unblock });
   }
 
-  /** Starts the page-end detector's cooldown (every scroll, automatic or not). */
-  private notifyScrolled(): void {
+  /**
+   * Starts the page-end detector's cooldown (every scroll, automatic or not). `undone`: the scroll
+   * took back a page turn, and the reader may now finish the page without looking up it first.
+   */
+  private notifyScrolled(undone = false): void {
     const t = performance.now();
-    this.pageEnd.notifyScrolled(t);
-    this.recordInput({ k: 'scrolled', t });
+    if (undone) this.pageEnd.notifyUndone(t);
+    else this.pageEnd.notifyScrolled(t);
+    this.recordInput(undone ? { k: 'scrolled', t, undone: true } : { k: 'scrolled', t });
   }
 
   private recordInput(entry: PipelineControl): void {
@@ -1488,7 +1506,7 @@ export class AppController {
         this.recordInput({ k: 'resume', t: performance.now(), line: resume });
       }
     }
-    this.notifyScrolled();
+    this.notifyScrolled(kind === 'undo');
     this.resetFixations(false);
     this.updateProgressUi();
     this.scheduleSavePosition();
