@@ -14,6 +14,11 @@ export function readJSON<T>(key: string, fallback: T): T {
   }
 }
 
+/** The localStorage key a helper key is stored under (what a `storage` event reports). */
+export function storageKey(key: string): string {
+  return STORAGE_PREFIX + key;
+}
+
 export function writeJSON(key: string, value: unknown): boolean {
   try {
     globalThis.localStorage?.setItem(STORAGE_PREFIX + key, JSON.stringify(value));

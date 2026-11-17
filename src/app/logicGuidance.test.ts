@@ -67,6 +67,14 @@ describe('DriftWatch', () => {
     expect(run(w, 13_250, 21_000, 2)).toBe(true);
     const u = new DriftWatch();
     expect(run(u, 0, 60_000, 3, 250, false)).toBe(false);
+    // A second of a pinned 2-line drift, then only an unsure tracker: that second is not twenty
+    // (regression: the offer came at 20 s on 1 s of evidence).
+    const brief = new DriftWatch();
+    run(brief, 0, 1000, 2);
+    expect(run(brief, 1250, 40_000, 0, 250, false)).toBe(false);
+    // And when the tracker is sure again, the long unsure stretch was a gap: the clock starts over.
+    expect(run(brief, 40_250, 55_000, 2)).toBe(false);
+    expect(run(brief, 55_250, 61_000, 2)).toBe(true);
   });
 
   it('needs most of the stretch over the threshold', () => {

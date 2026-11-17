@@ -198,9 +198,11 @@ class FakeIDB {
               (req.onsuccess as (() => void) | undefined)?.();
             } catch (err) {
               req.error = err;
-              tx.error = err;
               finished = true;
-              (tx.onerror as (() => void) | undefined)?.();
+              // As browsers do: the request's error bubbles to the transaction first (its own
+              // `error` is still null then); the abort that follows carries it.
+              (tx.onerror as ((e: { target: unknown }) => void) | undefined)?.({ target: req });
+              tx.error = err;
               (tx.onabort as (() => void) | undefined)?.();
             }
             pending--;

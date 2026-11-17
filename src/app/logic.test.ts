@@ -452,6 +452,24 @@ describe('reading time, progress and WPM', () => {
     expect(fired).toBe(2);
   });
 
+  it('BreakTimer counts time the ticks stopped (the laptop asleep) as rest (regression: a reminder 5 minutes after an hour away)', () => {
+    const b = new BreakTimer(5 * 60_000);
+    for (let i = 0; i < 15 * 60; i++) expect(b.tick(1000, true, 20, true, 1000)).toBe(false);
+    // One tick an hour later: the reading clock's step is capped at 2 s, the wall clock says 60 min.
+    expect(b.tick(2000, true, 20, true, 60 * 60_000)).toBe(false);
+    let fired = 0;
+    for (let i = 0; i < 6 * 60; i++) if (b.tick(1000, true, 20, true, 1000)) fired++;
+    expect(fired).toBe(0); // not 5 minutes after waking…
+    for (let i = 0; i < 14 * 60; i++) if (b.tick(1000, true, 20, true, 1000)) fired++;
+    expect(fired).toBe(1); // …but a full interval of reading later
+    // A short stall (a second or two late) is not a rest.
+    const c = new BreakTimer(5 * 60_000);
+    for (let i = 0; i < 19 * 60; i++) c.tick(1000, true, 20, true, 1500);
+    let due = false;
+    for (let i = 0; i < 70; i++) due ||= c.tick(1000, true, 20, true, 1500);
+    expect(due).toBe(true);
+  });
+
   it('BreakTimer treats a long idle stretch as a break, and pauses while idle', () => {
     const b = new BreakTimer(5 * 60_000);
     for (let i = 0; i < 15 * 60; i++) b.tick(1000, true, 20, true);
@@ -507,7 +525,7 @@ describe('keyboard mapping', () => {
 
   it('every shortcut in the help table is reachable', () => {
     const reachable = new Set(
-      [' ', 'PageDown', 'PageUp', 'u', 'p', 'c', 'a', 'd', 'g', 's', 'l', '?', 'Escape']
+      [' ', 'PageDown', 'PageUp', 'u', 'p', 'c', 'a', 'v', 'd', 'g', 's', 'l', '?', 'Escape']
         .flatMap((key) => [shortcutFor({ key }), shortcutFor({ key, shiftKey: true })]),
     );
     for (const s of SHORTCUTS) expect(reachable.has(s.action)).toBe(true);

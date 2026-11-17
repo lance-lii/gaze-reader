@@ -449,16 +449,23 @@ export class BreakTimer {
 
   constructor(private readonly restResetMs = 5 * 60_000) {}
 
-  /** Returns true exactly once each time a break becomes due. */
-  tick(dtMs: number, active: boolean, intervalMin: number, enabled: boolean): boolean {
+  /**
+   * Returns true exactly once each time a break becomes due. `dtMs` is the reading-clock step
+   * (capped, so a stall doesn't count as reading); `elapsedMs` the time that really passed since
+   * the last tick, by the wall clock. They differ when the ticks stopped: the laptop slept, the
+   * tab was frozen. That time is rest, however it ended: read 15 minutes, close the lid for an
+   * hour, and the next reminder is a full interval away, not 5 minutes.
+   */
+  tick(dtMs: number, active: boolean, intervalMin: number, enabled: boolean, elapsedMs: number = dtMs): boolean {
     if (!enabled || !Number.isFinite(dtMs) || dtMs <= 0) {
       if (!enabled) this.sinceBreakMs = 0;
       return false;
     }
-    if (!active) {
-      this.idleMs += dtMs;
+    const away = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs - dtMs) : 0;
+    if (!active || away > 0) {
+      this.idleMs += active ? away : Math.max(dtMs, Number.isFinite(elapsedMs) ? elapsedMs : dtMs);
       if (this.idleMs >= this.restResetMs) this.sinceBreakMs = 0;
-      return false;
+      if (!active) return false;
     }
     this.idleMs = 0;
     this.sinceBreakMs += dtMs;
@@ -497,6 +504,7 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { keys: ['P'], action: 'toggle-autoscroll', label: 'Pause or resume auto-scroll', readerOnly: true },
   { keys: ['C'], action: 'recalibrate', label: 'Recalibrate the camera', readerOnly: true },
   { keys: ['A'], action: 'check-accuracy', label: 'Check tracking accuracy (a few dots)', readerOnly: true },
+  { keys: ['V'], action: 'toggle-pdf-view', label: 'PDFs: switch between the original pages and plain text', readerOnly: true },
   { keys: ['D'], action: 'toggle-debug', label: 'Show or hide the debug overlay', readerOnly: false },
   { keys: ['G'], action: 'toggle-gaze-dot', label: 'Show or hide the gaze dot', readerOnly: false },
   { keys: ['S'], action: 'open-settings', label: 'Settings', readerOnly: false },
@@ -523,6 +531,7 @@ const LETTER_ACTIONS: Readonly<Record<string, ShortcutAction>> = {
   g: 'toggle-gaze-dot',
   s: 'open-settings',
   l: 'open-library',
+  v: 'toggle-pdf-view',
 };
 
 /** Maps a key press to an action. Modified chords belong to the browser; auto-repeat is ignored. */
@@ -850,8 +859,19 @@ export class DriftWatch {
     return this.sustained(t);
   }
 
+  /**
+   * The offset has lasted, and the last pinned estimate isn't a gap ago: a long stretch of
+   * unpinned ones is a gap like any other. Without that, one second of a pinned 2-line drift
+   * followed by twenty of an unsure tracker asked for a touch-up.
+   */
   sustained(t: number): boolean {
-    return this.since !== null && t - this.since >= this.o.holdMs && this.total > 0 && this.over / this.total >= this.o.minShare;
+    return (
+      this.since !== null &&
+      t - this.lastT <= this.o.gapMs &&
+      t - this.since >= this.o.holdMs &&
+      this.total > 0 &&
+      this.over / this.total >= this.o.minShare
+    );
   }
 
   /** +1: the gaze reads low (below the text); −1: high; 0: no run. */
@@ -1363,6 +1383,12 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
         ],
       },
       { kind: 'toggle', key: 'glanceDownToTurn', label: 'Glance down to turn', hint: 'Look below the page for a moment to turn it.' },
+      {
+        kind: 'toggle',
+        key: 'headGestures',
+        label: 'Head gestures',
+        hint: 'With the webcam: turn your head quickly right and back for the next page, left and back for the previous one. Raise your eyebrows for a moment to pause or resume.',
+      },
       {
         kind: 'range',
         key: 'overlapLines',

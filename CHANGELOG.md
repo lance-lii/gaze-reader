@@ -8,6 +8,42 @@ All notable changes to Gaze Reader are listed here. Versions follow
 Steadier tracking. Readers found the tracker "very buggy": the gaze dot trembled, the reading
 position sat a line or two off after shifting in the chair, and page turns came early or late.
 
+### New: PDFs as their own pages (web app)
+
+- **A PDF can be read as it is.** Until now a PDF was shown only as its extracted text, set like a
+  book: figures, equations, tables and the page's layout were gone. Press **V** (or the new button
+  in the top bar) and the PDF shows its original pages instead, one below the other; press it again
+  for the text. You keep your place between the two, and the choice is remembered per book. The
+  first time a PDF opens, a message points the pages out.
+- **Page turns work on the pages.** Each line of a page is laid over its picture where it is drawn,
+  so the reading model measures and follows the page's own lines: finish the last one on screen and
+  the page scrolls on, with your last lines kept at the top. The text is selectable and read aloud
+  by screen readers. Pages are drawn as they come near the view and let go of when they leave; a
+  dark or sepia theme tones the white page down.
+- **What it can't follow.** Lines on a fitted page are about half as tall as the text view's, so
+  the tracker is less sure of its line there; the bottom-right rest and the glance below the page
+  still turn it, and a wider window helps. Pages set in two columns, and pages with no text, are
+  marked in their corner and turned with Space or a head gesture. A PDF that is only scans still
+  can't be opened.
+- **The file is kept on your device** for this (the browser's storage, up to 64 MB per PDF) and
+  removed with the book; Undo brings it back. PDFs added before this version need opening from the
+  file once more. Not in the Artifact build.
+
+### New: head gestures (web app, off by default)
+
+- **Turn your head to turn the page.** Settings → Page turning → Head gestures. A quick turn of
+  the head to the right and back is the next page, to the left and back the previous one, and
+  eyebrows raised and held for a moment pause or resume automatic page turning. A short message
+  says what was understood. It uses the head angle and eyebrow score the face tracker already
+  reports: no second model, nothing more measured or kept.
+- **What isn't a gesture.** Looking away and back, a nod, a tilt, a shake of the head, leaning,
+  settling into a new posture, a tracker glitch, or another face crossing the picture. A gesture is
+  quick, mostly sideways, at least about 12°, and back within a second; the page turns a sixth of a
+  second after your head is back. Nothing happens while Settings or Help is open.
+- **How it was tested.** On synthetic gestures at 10 to 30 frames a second, and on the simulated
+  readers of the end-to-end harness, who make no gestures: none was reported in 4.5 simulated
+  hours of reading, fidgeting, looking around and being walked past. Not yet on real people.
+
 ### Web app and extension
 
 - **Leaning in or sitting back no longer shifts your reading position.** The calibration used to
@@ -30,6 +66,16 @@ position sat a line or two off after shifting in the chair, and page turns came 
   away from the dot for most of its samples, and the calibration learned that spot wrong. The dot
   now waits the 1.8 seconds the notice is shown; the same after "The window changed, so the dots
   start over."
+- **A page whose turn you undid turns again when you finish it.** After any page turn the app
+  waits for your eyes to go back up the page before it will turn again, so that a gaze or a mouse
+  left resting at the bottom can't page through the book. After **U** you are back at the bottom
+  of the page you left, reading on, and never look up: the page then never turned again by itself.
+  An undone turn now lets the last line turn the page once you have come onto it again; resting
+  at the bottom still doesn't.
+- **A touch-up is no longer offered on a second of evidence.** The offer for a quick 5-dot refresh
+  comes when the reading model has corrected more than 1.5 lines for 20 seconds. It counted the
+  seconds from the first such estimate even when every later one came from a tracker that wasn't
+  sure of anything. A long unsure stretch now starts the count over.
 - **Head turns no longer throw the gaze off.** The calibration used to read head turn and tilt as
   extra gaze cues, but during calibration the head barely moves, so what it learned was mostly
   noise. Sitting with your chin 4° lower then moved the gaze 1.5–2.3 lines in simulation, and a 4°
@@ -116,9 +162,46 @@ position sat a line or two off after shifting in the chair, and page turns came 
   to another screen, in the middle of the dots mixed dots from before and after the change into one
   calibration, which then read your gaze in the wrong place. The dots now start over from the first
   one, with a short note saying why.
+- **A pinch-zoomed page waits, and says why.** After a trackpad or touch-screen pinch the screen
+  shows a magnified part of the page while every measured line is still where it was before the
+  pinch, so the gaze was scored against lines that weren't under it. Nothing noticed. Page turning
+  now waits until you pinch back out, with one note saying so.
+- **Camera frames are timed by when they were taken.** A frame's time was when the page got round
+  to processing it, so a busy moment (a page turn, a book being opened) bunched frames together
+  and the gaze filter read that as movement. Where the browser reports the capture time, that is
+  used.
+- **A calibration pauses when you switch tabs**, instead of using up each dot's attempts on the one
+  frame a second a hidden tab gets and training on what was left.
+- **Small windows keep turning pages.** On a window only a few lines tall, the rule "you must have
+  been back up the page before the bottom counts" was never met after the first turn. Reading the
+  line a turn resumes on now counts.
+- **A look-away that is undone is undone completely**: the sideways offset and the noise estimate
+  it may have taught are restored with the line. The tracker also no longer loses a third of its
+  confidence in a short last line when a long look back leaves it.
+- **The eye-break reminder counts real rest.** Time with the laptop asleep counts as rest, and the
+  extension's count now rests the way the app's does (and is shown by the pill when Dewey is hidden).
 
 ### Web app
 
+- **Web pages keep their sections.** Opening a saved page or a URL removed anything whose name
+  contained words like "related", "social", "sharing", "comments" or "modal", to drop sharing
+  buttons and comment threads. Documentation and papers name their sections after their headings,
+  so "Related work", "Social impact" and headings such as "Modal verbs" vanished without a word.
+  Headings are now never removed for their name, and a block named by its id alone stays when it
+  reads as running text. Pages whose whole body sits in one form (many council and university
+  sites) or behind a dialog that was open when the page was saved used to come out as "no readable
+  text"; they open now.
+- **A finished book is finished.** A book read to its end by eye showed "The end!" while the top
+  bar said 0 % (a short text) or ninety-something, and the library offered to continue it: the
+  last page of a book can't scroll to the bottom. Finished now counts as 100 %.
+- **Clicking a top-bar button doesn't capture the Space bar.** After a click on Pause, Settings or
+  Help, the button kept the keyboard: Space pressed it again instead of turning the page, and the
+  bar never hid. A pointer click now gives the keyboard back to the page.
+- **Help can be scrolled from the keyboard.** The Help dialog is taller than most windows and
+  nothing in it took focus, so the arrow keys scrolled the page behind it. It also lists the head
+  gestures now.
+- **A book that can't be saved says so.** When the browser's storage is full, a book opened and was
+  simply missing from the library next time. A message now says it couldn't be saved.
 - **A camera that stops comes back on its own.** After a laptop wakes from sleep the camera often
   freezes or stops: a frozen camera left the reader at "looking for you" for good, and a stopped
   one got a toast blaming another app, even when the camera had been unplugged. Gaze Reader now
@@ -168,6 +251,29 @@ position sat a line or two off after shifting in the chair, and page turns came 
 - **Odd files can't freeze the tab.** A Project Gutenberg text with a very long run of blank lines,
   or a Markdown paragraph full of `**` or `_` that never close, took several seconds to open; both
   now open at once.
+- **PDF text:** a drop cap is the first letter of its paragraph, not a heading that opens a chapter.
+- **Plain text:** in a book with numbered chapters, a line that only looks like a heading (a sign
+  in capitals) stays in the story. A UTF-8 file with one damaged byte is read as UTF-8 instead of
+  turning every accent into two wrong characters.
+- **Files too large to parse are refused with the reason**, instead of freezing the tab: text,
+  Markdown and web pages over 32 MB (a long novel is about 5), and a single EPUB chapter over 16 MB.
+- **"Storage is full" is reported as that.** A library save that failed for lack of space was
+  reported as "couldn't be read or saved right now".
+- **Cancel stops an Open-from-URL download** instead of only hiding it.
+- **Two tabs no longer undo each other's settings.** A tab now takes over what another tab changed
+  instead of writing its stale copy back.
+- **A camera that freezes during calibration is restarted** and the calibration opens again (it
+  used to sit on "I lost sight of your eyes" until Esc). A tracker that is still warming up is not
+  mistaken for a frozen camera.
+- **The lines are measured again when Dewey moves** to another corner or is shown or hidden (on a
+  narrow window the text moves to make room for him).
+- **Easier to see and use:** text fields, menus and switches that are off have an edge that keeps
+  3:1 contrast in all three themes, and placeholders 4.5:1; buttons in the settings drawer wrap on
+  a 320 px screen; tapping the status pill says what it means (on a phone it is only a coloured
+  dot); after you click a top-bar button, Space pages again; the Help window scrolls from the
+  keyboard; a fourth notice pushes out the oldest one that isn't waiting for you.
+- **Undo forgets a page you have left.** After scrolling more than a screen away by hand, Undo no
+  longer jumps back to a turn from long before.
 
 ### Chrome extension
 
@@ -185,12 +291,37 @@ position sat a line or two off after shifting in the chair, and page turns came 
   now answer only real key presses. On a site that forwards your keys out of an embedded frame as
   fake key presses, the Alt+Shift shortcuts stop working; the toolbar button and Alt+Shift+G still
   work there.
+- **The extension makes no network requests at all.** The face model now ships in the package (it
+  was downloaded from Google's model storage the first time the camera started), and the
+  extension's own pages are restricted to their own files. The package is also 12 MB smaller: a
+  copy of the MediaPipe runtime that was never loaded is left out.
+- **A page can't keep the camera on behind other tabs** by lying about being visible, or cancel a
+  calibration with fake key presses.
+- **Articles that render late are found.** On a page that fills in its text after loading, the
+  extension looks again for a while instead of treating the whole page as the text.
+- **Moving the page inside the window is noticed.** Going fullscreen or showing a toolbar after
+  calibrating shifts everything under the gaze; the extension now says so once.
+- **Smaller fixes:** the calibration's zoom is read when it is trained, not when "Use it" is
+  pressed; Undo history doesn't survive a navigation; a calibration refresh asked for while the
+  camera had failed doesn't open after switching to the mouse; the extension's panel is put back
+  if a page removes it; the popup's status is announced only when it changes.
 
 ### Privacy
 
 - **The camera promises are tested.** Automated tests now check that the camera stays off in the
   library and stops when you go back to it, and that it stops after a tab has been hidden for a
   minute and comes back with the tab, as [PRIVACY.md](PRIVACY.md) says.
+- **Using the webcam no longer contacts Google.** The face model (3.8 MB) is served with the app,
+  from its own address, instead of being downloaded from Google's model storage. The build
+  downloads it once and refuses a file whose SHA-256 isn't the pinned one.
+- **The hosted app has a content security policy.** Only the app's own scripts run, so a book or
+  web page you open can't bring code of its own even if a sanitizer missed something.
+- **MediaPipe's usage logging stays blocked across upgrades.** The library version is pinned
+  exactly, and a test reads the installed library and fails if it names any network address other
+  than the one that is blocked, or any way to reach the network that the block doesn't cover.
+- **[PRIVACY.md](PRIVACY.md) corrected** where it was imprecise: when the model loads, the small
+  markers kept beside your settings, that the lighting summary holds one brightness level besides
+  ratios, and that a diagnostics recording includes the length of each line of text on screen.
 
 ### Testing
 
@@ -227,6 +358,11 @@ position sat a line or two off after shifting in the chair, and page turns came 
   early), apart from what the page-end detector then does with it. It also scores the pill's
   "Unsure of your line": how often it is up, how often the tracker is on the line with it up and
   without, and how many of the missed pages were missed while it was up.
+- **Supply chain.** CI's actions are pinned to exact commits and CI fails on a known vulnerability
+  in a shipped dependency (`npm audit --omit=dev`); the open advisories in the build tools are
+  cleared (Vite 8.3.8, Vitest 5.1.0). `npm run build` and `npm run build:ext` now need the network
+  once, to fetch the face model (`scripts/fetch-face-model.mjs`, hash-checked, cached in
+  `public/mediapipe/models/`); `npm run dev` works without it.
 
 ## 1.1.0 (unreleased, 2026-09-25)
 

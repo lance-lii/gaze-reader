@@ -106,6 +106,17 @@ describe('TouchUpAdvisor: learned offset', () => {
     expect(high[0]!.text).toMatch(/about 2 lines too high/);
   });
 
+  it('a break in the reading starts the 20 s over (regression: one estimate after a long break raised the offer)', () => {
+    const c = clock();
+    const a = new TouchUpAdvisor({ wallNow: c.now });
+    expect(read(a, 0, 5000, (t) => est(t, 2.6))).toEqual([]); // 5 s of a large offset…
+    // …then the reader is away for a minute, and comes back to the same offset.
+    expect(read(a, 65_000, 15_000, (t) => est(t, 2.6))).toEqual([]);
+    const offers = read(a, 80_000, 10_000, (t) => est(t, 2.6));
+    expect(offers).toHaveLength(1);
+    expect(offers[0]!.t - 65_000).toBeGreaterThanOrEqual(20_000);
+  });
+
   it('needs the offset pinned down, and starts over when it shrinks or flips', () => {
     const c = clock();
     const a = new TouchUpAdvisor({ wallNow: c.now });

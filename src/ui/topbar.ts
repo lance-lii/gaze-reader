@@ -35,6 +35,8 @@ const ICON_PATHS = {
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/>',
   record: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3.5" fill="currentColor"/>',
   download: '<path d="M12 4v11M7.5 10.5L12 15l4.5-4.5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
+  pages: '<path d="M7 3.5h7l4 4V20a.5.5 0 0 1-.5.5h-10A.5.5 0 0 1 7 20z"/><path d="M14 3.5v4h4M10 12h5M10 15.5h5"/>',
+  text: '<path d="M5 6.5h14M5 10.5h14M5 14.5h14M5 18.5h9"/>',
 } as const;
 
 export type IconName = keyof typeof ICON_PATHS;
@@ -54,6 +56,12 @@ export interface TopbarOptions {
   getSettings: () => AppSettings;
   /** The source switch goes through the controller (it also clears "don't retry the camera" latches). */
   onSelectSource: (kind: GazeSourceKind) => void;
+  /**
+   * The reader tapped or clicked the status pill: say what it means. On a narrow screen the pill
+   * is only a coloured dot (its label doesn't fit), and its explanation sits in a tooltip that a
+   * touch screen never shows: "no face", "poor" and "unsure" were the same amber dot.
+   */
+  onExplainStatus?: (text: string) => void;
 }
 
 export interface TopbarStatus {
@@ -99,6 +107,7 @@ export class Topbar implements Mountable {
     progress: HTMLElement;
     progressFill: HTMLElement;
     pause: HTMLButtonElement;
+    pdfView: HTMLButtonElement;
     recalibrate: HTMLButtonElement;
     radios: HTMLInputElement[];
   };
@@ -157,6 +166,7 @@ export class Topbar implements Mountable {
               </label>`,
             ).join('')}
           </fieldset>
+          <button type="button" class="gr-btn gr-btn--ghost gr-btn--icon gr-topbar__pdf" data-cmd="toggle-pdf-view" hidden></button>
           <button type="button" class="gr-btn gr-btn--ghost gr-btn--icon" data-cmd="toggle-autoscroll" aria-pressed="false"></button>
           <button type="button" class="gr-btn gr-btn--ghost gr-btn--icon gr-topbar__recal" data-cmd="recalibrate" aria-label="Recalibrate" title="Recalibrate (C)">${icon('target')}</button>
           <button type="button" class="gr-btn gr-btn--ghost gr-btn--icon gr-topbar__help" data-cmd="show-help" aria-label="Help and shortcuts" title="Help (?)">${icon('help')}</button>
@@ -182,6 +192,7 @@ export class Topbar implements Mountable {
       progress: q('.gr-topbar__progress'),
       progressFill: q('.gr-topbar__progress-fill'),
       pause: q('[data-cmd="toggle-autoscroll"]'),
+      pdfView: q('.gr-topbar__pdf'),
       recalibrate: q('.gr-topbar__recal'),
       radios: [...el.querySelectorAll<HTMLInputElement>('input[type="radio"]')],
     };
@@ -189,6 +200,7 @@ export class Topbar implements Mountable {
     this.hoverQuery = typeof matchMedia === 'function' ? matchMedia('(hover: hover)') : null;
     this.bindEvents();
     this.syncSettings(opts.getSettings());
+    this.setPdfView(null);
   }
 
   mount(parent: HTMLElement | ShadowRoot): void {
@@ -227,6 +239,20 @@ export class Topbar implements Mountable {
     // Privacy: whenever the camera is on, its indicator never hides.
     this.persistBase = pillAlwaysVisible(s.state, s.kind, s.cameraOn);
     this.el.dataset.persist = String(this.persistBase || this.recording);
+  }
+
+  /**
+   * The pages / text switch of a PDF: `view` is what is shown now ('pages': its own pages, 'text':
+   * its text set as a book), null when the open book has no pages to show (the button is hidden).
+   */
+  setPdfView(view: 'pages' | 'text' | null): void {
+    const btn = this.ui.pdfView;
+    btn.hidden = view === null;
+    // Named even while hidden: a control without a name is a trap the moment it is shown.
+    const label = view === 'pages' ? 'Show this PDF as plain text' : 'Show this PDF’s original pages';
+    btn.setAttribute('aria-label', label);
+    btn.title = `${label} (V)`;
+    btn.innerHTML = icon(view === 'pages' ? 'text' : 'pages');
   }
 
   /** Shows the "Recording diagnostics" chip (kept on screen, like the camera pill, while recording). */
@@ -286,7 +312,20 @@ export class Topbar implements Mountable {
       (e) => {
         const btn = (e.target as Element | null)?.closest<HTMLElement>('[data-cmd]');
         if (!btn || !this.el.contains(btn)) return;
+        // A click with the pointer shouldn't leave the keyboard on the button: Space would then
+        // press it again instead of turning the page, a dialog it opened would hand focus back to
+        // it, and the bar would never hide (focus inside keeps it up). Keyboard activation
+        // (detail 0) keeps its focus, as it must.
+        if (e.detail > 0) btn.blur();
         this.opts.bus.emit('command', { name: btn.dataset.cmd as CommandName });
+      },
+      { signal },
+    );
+    this.ui.pill.addEventListener(
+      'click',
+      () => {
+        const text = this.ui.pill.getAttribute('aria-label');
+        if (text) this.opts.onExplainStatus?.(text);
       },
       { signal },
     );

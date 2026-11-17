@@ -4,9 +4,13 @@ Gaze Reader is a browser app (plus a Chrome extension) that watches your eyes th
 the webcam while you read and **turns the page — scrolls — when you reach the bottom**.
 **Dewey**, a tiny nerd avatar, sits in the corner reading along with you.
 
-Everything runs locally. Video never leaves the device. The only network fetch is the
-MediaPipe face-landmarker model file (data, ~3.6 MB, cached by the browser; the web app has no
-offline mode, so the webcam needs a connection the first time it starts in a tab).
+Everything runs locally. Video never leaves the device. The MediaPipe face-landmarker model file
+(data, ~3.8 MB) ships with the app and the extension: `scripts/fetch-face-model.mjs` downloads it
+at build time into `public/mediapipe/models/` and refuses a file whose SHA-256 isn't the pinned
+one, and `faceTracker.ts` loads it from the app's own origin (`FACE_LANDMARKER_MODEL_PATH`),
+falling back to Google's storage only when that copy is missing. The built web app carries a
+Content-Security-Policy meta tag (vite.config.ts): scripts from the app's own files, WebAssembly
+and the hashed inline theme script only.
 
 ```
  camera ─► FaceLandmarker ─► EyeFeatures ─► GazeModel (ridge regression, calibrated)
@@ -224,6 +228,22 @@ The WASM loader is injected with a `<script>` tag on the main thread (so it cann
 extension content script — the extension uses an offscreen document). Drive the loop with
 `video.requestVideoFrameCallback` when available, else `requestAnimationFrame`; skip frames when
 the video time hasn't advanced.
+
+**Head gestures** (`src/gaze/headGestures.ts`, setting `headGestures`, off by default). A pure
+`HeadGestureDetector.update({ t, features })` is fed every camera frame by the controller
+(`watchHeadGestures`, only while reading: not during calibration, under a dialog or in a hidden
+tab) and returns `'turn-right' | 'turn-left' | 'brows-up' | null`, which the controller runs as
+`page-forward`, `page-back` and `toggle-autoscroll`, with a toast naming what it understood. It
+reads `EyeFeatures.headPose` and the optional `EyeFeatures.browRaise` (mean of MediaPipe's
+browInnerUp / browOuterUp scores, never a gaze-model input). A turn is yaw leaving a running
+resting pose by ≥ 12° within 450 ms and returning (to 5°, or 35 % of its peak) within 1 s, with
+pitch and roll under 70 % of the yaw peak, the face's centre and size steady (a tracker hopping to
+another face moves both), at least two frames well out, 300 ms of rest before and 700 ms since the
+last gesture; it is reported 150 ms after the return, unless the head swings on to the other side
+(a shake). Eyebrows: 0.3 above their running resting level for 600 ms. Negative yaw is the
+reader's right (headPose.ts). Thresholds come from synthetic gestures and from the simulated
+readers of bench/endtoend (tests/headGestures.test.ts: no gesture in any scenario); they have not
+been tuned on recordings of people. The extension doesn't feed it yet.
 
 ### B · Calibration — `src/gaze/{ridge,calibrationModel}.ts`, `src/ui/calibrationOverlay.ts`
 
@@ -606,6 +626,32 @@ Rendering: a centered column (`max-width: <columnWidthCh>ch`), chapter headings,
 `c{chapter}-p{n}`, generous bottom padding (≈ 60 % of the viewport) so the last lines of the book can
 still be scrolled to the top, and an "End of book" marker. Reading typography CSS lives in
 `src/reader/reader.css.ts` (exported string, injected once).
+
+**The pages view of a PDF** (`pdf.ts`, `pdfStore.ts`, `ReaderView.openPages`). A PDF's text is
+still extracted into a Book (the text view, and what the library stores). Beside it, `parsePdf`
+keeps a `PdfSource`: the file's bytes and, per page, `PdfPageLayout { width, height, columns,
+lines: PdfLineBox[] }` from the same row and column grouping the text reconstruction uses
+(`layoutPdfPages`, pure). The loader hands it out once by the parsed book's id (`takePdfSource`);
+the controller stores it under the library's id in a database of its own (`pdfStore.ts`,
+`gazeReaderPdf`: megabytes per book, and no schema upgrade of the library's data; validated on
+read; kept in memory for the session when IndexedDB is missing or full; at most 64 MB per file).
+
+`ReaderView.openPages(book, source, position)` renders one `section.gr-pdf-page` per page (its
+aspect ratio from the page size): a `<canvas>` that `PdfDocumentHandle.render` draws when an
+IntersectionObserver sees the page within 1.5 view heights (one page at a time, at most 6 kept,
+redrawn 180 ms after the width changes, annotations and scripts off), and over it one absolutely
+positioned `div.gr-pdf-line` per line, in page-relative percentages, its font size in container
+query units and its text stretched to the line's width. The text is transparent, never
+`opacity: 0` or `visibility: hidden`, because **the line elements are what `measureLines`
+measures**: the reading pipeline is unchanged and follows a PDF page's lines as it follows any
+DOM text, and positions are anchored to them (`pg3-l12`) like paragraphs. Pages with
+`columns: true` or no lines get no line elements (lines of two columns share heights, which the
+line model's top-to-bottom order can't represent): nothing fires there by itself, and a badge in
+the page's corner says to use a key or a gesture. The controller chooses the view per book
+(`localStorage` `pdfView.<id>`, default text), switches with the `toggle-pdf-view` command (V, a
+top-bar button shown only when a source is kept) by rendering the other view at the same fraction
+and starting the session over, and closes the pdf.js document with the session. Not in the
+Artifact build (its content policy blocks a document's embedded fonts).
 
 ### E · Dewey the buddy — `src/buddy/{buddy,avatar,quips,styles}.ts`
 

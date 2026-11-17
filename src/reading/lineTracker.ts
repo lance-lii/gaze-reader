@@ -162,7 +162,12 @@ export interface LineTrackerOptions {
    * 0.06 lines at the default), more while the vertical gain is still unknown.
    */
   driftRate: number;
-  /** Drift range modeled, ± lines (0–10; the grid has at most 81 bins, 0.125 lines apart at the default). */
+  /**
+   * Drift range modeled, ± lines (0–6; the grid has at most 81 bins, 0.125 lines apart at the
+   * default of 5). Not wider: the bins grow with the range, and past about 6 lines they are several
+   * times the slow drift walk's step, which then all but stops (at 10 it moved 0.005 lines per
+   * fixation where 0.06 was meant).
+   */
   maxDriftLines: number;
 }
 
@@ -296,6 +301,8 @@ const GLANCE_BACK_FIXATIONS = 2;
 /** Drift grid resolution, lines; the grid never exceeds MAX_DRIFT_BINS (coarser steps for wider ranges). */
 const DRIFT_STEP_LINES = 0.125;
 const MAX_DRIFT_BINS = 81;
+/** The widest drift range the grid can carry with a working slow walk (see LineTrackerOptions.maxDriftLines). */
+const MAX_DRIFT_RANGE_LINES = 6;
 /** Random-walk step per fixation = driftRate × this, in lines... */
 const DRIFT_WALK_PER_RATE = 0.8;
 /** ...its σ rounded to this, lines (the kernel is rebuilt only when it moves a step). */
@@ -490,6 +497,10 @@ interface GlanceSnapshot {
   gain: number;
   lastSaccade: SaccadeKind | null;
   progressX: number;
+  /** What the glance's own fixation may have taught: where sweeps land, and the vertical noise. */
+  sidewaysPx: number;
+  sigmaLines: number;
+  residVar: number;
 }
 
 /** The tracker's mutable state just before a fixation was processed (for rewinding to it). */
@@ -582,7 +593,7 @@ export class LineTracker {
     this.opts = {
       sigmaYLines: num(opts.sigmaYLines, d.sigmaYLines, SIGMA_MIN_LINES, SIGMA_MAX_LINES),
       driftRate: num(opts.driftRate, d.driftRate, 0, 1),
-      maxDriftLines: num(opts.maxDriftLines, d.maxDriftLines, 0, 10),
+      maxDriftLines: num(opts.maxDriftLines, d.maxDriftLines, 0, MAX_DRIFT_RANGE_LINES),
     };
     this.sigmaLines = this.opts.sigmaYLines;
     this.residVar = (this.sigmaLines / SIGMA_INFLATE) ** 2;
@@ -713,6 +724,11 @@ export class LineTracker {
       this.gain = glance.gain;
       this.lastSaccade = glance.lastSaccade;
       this.progressX = glance.progressX;
+      // Undone with the rest: a glance down-left and back looked like a sweep landing 40 px off,
+      // and a few of them wore down the trust in where lines end.
+      this.sidewaysPx = glance.sidewaysPx;
+      this.sigmaLines = glance.sigmaLines;
+      this.residVar = glance.residVar;
       this.prevFix = glance.from;
       this.dyUntrusted = false;
       this.excursions++;
@@ -744,6 +760,9 @@ export class LineTracker {
           gain: this.gain,
           lastSaccade: this.lastSaccade,
           progressX: this.progressX,
+          sidewaysPx: this.sidewaysPx,
+          sigmaLines: this.sigmaLines,
+          residVar: this.residVar,
         };
       }
       const dxCol = (f.x - this.prevFix.x) / columnWidth;
@@ -878,8 +897,9 @@ export class LineTracker {
    *
    * Retroactive within the history window (HISTORY_MS, on the current layout, since the last page
    * turn): a report that arrives after that fixation rewinds the tracker to it, applies the change
-   * there and replays the fixations since — as if the report had come on time. Older onsets (and
-   * a non-finite `t`) apply at the next fixation. A change from before the last page turn is
+   * there and replays the fixations since — as if the report had come on time. An onset older than
+   * the window is applied at the oldest fixation still remembered (and replayed from there); with
+   * no history, or a non-finite `t`, at the next fixation. A change from before the last page turn is
    * dropped once the new page has fixations: the turn re-anchored the drift already.
    */
   appearanceChangedAt(t: number): void {
@@ -1315,15 +1335,18 @@ export class LineTracker {
         }
       }
       const next = transitionLines(col, kind, dyLines, leak, jk);
-      if (shortSweep) {
-        const swept = transitionLines(colSweep, 'return-sweep', dyLines, leak);
-        for (let k = 0; k < m; k++) next[k] = next[k]! + swept[k]!;
-      }
       if (sweepLike) {
         const sweep = transitionLines(col, 'return-sweep', dyLines, leak);
         for (let k = 0; k < m; k++) {
           next[k] = (1 - LONG_REGRESSION_SWEEP_SHARE) * next[k]! + LONG_REGRESSION_SWEEP_SHARE * sweep[k]!;
         }
+      }
+      // After the mix above, not before it: the short-line share is a sweep already, and mixed in
+      // first it was halved with nothing put back (a short line the reader re-read from lost a
+      // third of its probability to no other line).
+      if (shortSweep) {
+        const swept = transitionLines(colSweep, 'return-sweep', dyLines, leak);
+        for (let k = 0; k < m; k++) next[k] = next[k]! + swept[k]!;
       }
       for (let k = 0; k < m; k++) out[k * D + b] = out[k * D + b]! + next[k]!;
     }

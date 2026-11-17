@@ -407,6 +407,34 @@ describe('PageSession', () => {
     }
   });
 
+  it('says when the page sits elsewhere in the window than at calibration (fullscreen, a toolbar), once per change', async () => {
+    const notify = vi.spyOn(PagePill.prototype, 'notify'); // calls through
+    const moved = (): number => notify.mock.calls.filter(([n]) => n && /higher or lower in the window/.test(n.text)).length;
+    const t = setup({ gazeSource: 'webcam' });
+    // Calibrated with 90 px of browser chrome above the page; jsdom's window has none (as in fullscreen).
+    t.storage.data.set(KEYS.calibration, { ...(storedModel() as object), chromeTop: 90, dprAtCalibration: 1 });
+    const session = await PageSession.start(t.deps);
+    await flush();
+    t.hubSend({ type: 'camera-status', status: { state: 'running' } });
+    await flush(10);
+    expect(moved()).toBe(1);
+    window.dispatchEvent(new Event('resize'));
+    await vi.advanceTimersByTimeAsync(400);
+    expect(moved()).toBe(1); // still the same change: not said again
+    session.destroy();
+
+    // A calibration made in this window layout says nothing.
+    notify.mockClear();
+    const same = setup({ gazeSource: 'webcam' });
+    same.storage.data.set(KEYS.calibration, { ...(storedModel() as object), chromeTop: window.outerHeight - window.innerHeight, dprAtCalibration: 1 });
+    const second = await PageSession.start(same.deps);
+    await flush();
+    same.hubSend({ type: 'camera-status', status: { state: 'running' } });
+    await flush(10);
+    expect(moved()).toBe(0);
+    second.destroy();
+  });
+
   it('treats changing page content as a reflow, keeping what the line tracker has learned', async () => {
     const t = setup({ gazeSource: 'mouse' });
     const session = await PageSession.start(t.deps);
@@ -487,6 +515,48 @@ describe('PageSession', () => {
     await vi.advanceTimersByTimeAsync(5_000);
     expect(states.map((s) => s.state)).not.toContain('no-face');
     session.destroy();
+  });
+
+  it('a page that shadows document.visibilityState can’t keep the camera on behind other tabs (regression)', async () => {
+    const t = setup({ gazeSource: 'webcam' });
+    t.storage.data.set(KEYS.calibration, storedModel());
+    const session = await PageSession.start(t.deps);
+    await flush();
+    t.hubSend({ type: 'camera-status', status: { state: 'running' } });
+    await flush(10);
+    // What this tab told the camera hub (the tab's end of each port).
+    const sent = (): string[] => t.hubEnds.flatMap((p) => (p.peer?.sent ?? []).map((m) => (m as { type: string }).type));
+    const before = sent().filter((type) => type === 'unsubscribe').length;
+    // What `<img name="visibilityState">` does: the document's own property never says "hidden"…
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => ({ toString: () => 'visible' }) });
+    // …while the tab really is.
+    const real = vi.spyOn(Document.prototype, 'visibilityState', 'get').mockReturnValue('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(sent().filter((type) => type === 'unsubscribe').length).toBeGreaterThan(before);
+    real.mockRestore();
+    session.destroy();
+  });
+
+  it('finds the article when it arrives after the page did (a single-page app), and puts its own element back if the page removes it', async () => {
+    document.body.innerHTML = '<div id="app"><div class="spinner"></div></div>';
+    const t = setup({ gazeSource: 'mouse' });
+    const session = await PageSession.start(t.deps);
+    await vi.advanceTimersByTimeAsync(1_500);
+    const setLayout = vi.spyOn(LineTracker.prototype, 'setLayout'); // calls through
+    // The app renders its article a moment later; the address doesn't change again.
+    document.getElementById('app')!.innerHTML = `<nav><a href="/">Home</a><a href="/about">About</a></nav><article>${'<p>Reading is a sequence of fixations and saccades, with a return sweep at the end of every line of the text.</p>'.repeat(12)}</article>`;
+    await vi.advanceTimersByTimeAsync(2_500);
+    // Found anew, as new content (not as a reflow of "the whole body").
+    expect(setLayout.mock.calls.map(([, reason]) => reason)).toContain('content');
+
+    const host = document.querySelector(HOST_TAG)!;
+    host.remove(); // the page's own script, or a framework re-rendering <html>
+    expect(document.querySelector(HOST_TAG)).toBeNull();
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(document.querySelector(HOST_TAG)).toBe(host);
+    session.destroy();
+    expect(document.querySelector(HOST_TAG)).toBeNull();
   });
 
   it("Dewey's menu offers Resume while this tab is paused", async () => {

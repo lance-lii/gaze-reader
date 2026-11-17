@@ -1,5 +1,5 @@
 import type { FaceLandmarkerOptions, FilesetResolver } from '@mediapipe/tasks-vision';
-import { FACE_LANDMARKER_MODEL_URL, MEDIAPIPE_WASM_DIR } from '../core/constants';
+import { FACE_LANDMARKER_MODEL_PATH, FACE_LANDMARKER_MODEL_URL, MEDIAPIPE_WASM_DIR } from '../core/constants';
 import { IS_ARTIFACT } from '../core/target';
 import type { EyeFeatures, FeatureFrame, FeatureSource, LightingStats, Unsubscribe } from '../types';
 import {
@@ -47,6 +47,12 @@ export interface LandmarkerConfig {
   wasmBaseUrl: string;
   modelAssetPath: string;
   delegate: Delegate;
+  /**
+   * Where to get the model when `modelAssetPath` isn't there. The default configuration points
+   * `modelAssetPath` at the app's own copy and this at Google's: the app's copy is missing only
+   * when it was never fetched (a dev server started offline), and tracking should still work then.
+   */
+  fallbackModelAssetPath?: string;
 }
 
 /** A loaded landmarker, shareable between sources. */
@@ -154,6 +160,24 @@ function landmarkerOptions(modelAssetPath: string, delegate: Delegate): FaceLand
   };
 }
 
+/**
+ * `cfg.modelAssetPath` when it can be fetched, else the fallback. Asked with a HEAD request, so a
+ * missing copy costs one small request instead of a failed start. (A dev server answers unknown
+ * paths with its HTML page: that is not a model either.)
+ */
+async function usableModelPath(cfg: LandmarkerConfig): Promise<string> {
+  const fallback = cfg.fallbackModelAssetPath;
+  if (!fallback || fallback === cfg.modelAssetPath || typeof fetch !== 'function') return cfg.modelAssetPath;
+  try {
+    const res = await fetch(cfg.modelAssetPath, { method: 'HEAD' });
+    if (res.ok && !/text\/html/i.test(res.headers.get('content-type') ?? '')) return cfg.modelAssetPath;
+  } catch {
+    /* unreachable: use the fallback */
+  }
+  console.warn('[gaze] This copy of the app has no face model of its own; fetching it from Google’s model storage instead.');
+  return fallback;
+}
+
 /** FilesetResolver joins `${base}/${file}`, so a trailing slash would double up. */
 const normalizeBase = (url: string): string => url.replace(/\/+$/, '');
 
@@ -170,10 +194,11 @@ export function createLandmarkerLoader(importVision: () => Promise<VisionModuleL
     } catch (err) {
       throw new TrackerError('model-load-failed', "Couldn't load the face-tracking runtime.", { cause: err });
     }
+    const modelPath = await usableModelPath(cfg);
     const make = (delegate: Delegate): Promise<FaceLandmarkerLike> => {
       // Covers injected loaders too: no landmarker is built without the telemetry guard.
       if (!IS_ARTIFACT) blockMediapipeTelemetry();
-      return vision.FaceLandmarker.createFromOptions(fileset, landmarkerOptions(cfg.modelAssetPath, delegate));
+      return vision.FaceLandmarker.createFromOptions(fileset, landmarkerOptions(modelPath, delegate));
     };
 
     try {
@@ -225,12 +250,18 @@ function defaultWasmBaseUrl(): string {
   return new URL(MEDIAPIPE_WASM_DIR, base).href;
 }
 
+/** The app's own copy of the face model, next to the page (see FACE_LANDMARKER_MODEL_PATH). */
+function defaultModelUrl(): string {
+  const base = typeof document !== 'undefined' ? document.baseURI : globalThis.location?.href;
+  return new URL(FACE_LANDMARKER_MODEL_PATH, base).href;
+}
+
 function resolveLandmarkerConfig(opts: Pick<CameraFeatureSourceOptions, 'wasmBaseUrl' | 'modelAssetPath' | 'delegate'>): LandmarkerConfig {
-  return {
-    wasmBaseUrl: opts.wasmBaseUrl ?? defaultWasmBaseUrl(),
-    modelAssetPath: opts.modelAssetPath ?? FACE_LANDMARKER_MODEL_URL,
-    delegate: opts.delegate ?? 'GPU',
-  };
+  const common = { wasmBaseUrl: opts.wasmBaseUrl ?? defaultWasmBaseUrl(), delegate: opts.delegate ?? ('GPU' as const) };
+  // Served with the app, from its own origin; Google's copy only if that one is missing.
+  return opts.modelAssetPath !== undefined
+    ? { ...common, modelAssetPath: opts.modelAssetPath }
+    : { ...common, modelAssetPath: defaultModelUrl(), fallbackModelAssetPath: FACE_LANDMARKER_MODEL_URL };
 }
 
 /** Loads (or returns the cached) shared landmarker. */
@@ -278,14 +309,19 @@ const MAX_FRAME_INTERVAL_MS = 1000;
 
 type Cancel = () => void;
 
-/** Fires once per new frame the compositor receives (Chromium, Safari, Firefox 132+). */
-function driveByVideoFrames(video: HTMLVideoElement, tick: () => void): Cancel {
+/**
+ * Fires once per new frame the compositor receives (Chromium, Safari, Firefox 132+), with the time
+ * the frame was captured (or, where the browser doesn't say, presented) on the performance.now()
+ * clock, when it reports one.
+ */
+function driveByVideoFrames(video: HTMLVideoElement, tick: (capturedAt?: number) => void): Cancel {
   let active = true;
   let handle = 0;
-  const step = (): void => {
+  const step = (_now?: number, metadata?: Partial<Pick<VideoFrameCallbackMetadata, 'captureTime' | 'presentationTime'>>): void => {
     if (!active) return;
     handle = video.requestVideoFrameCallback(step);
-    tick();
+    const at = metadata?.captureTime ?? metadata?.presentationTime;
+    tick(typeof at === 'number' && Number.isFinite(at) ? at : undefined);
   };
   handle = video.requestVideoFrameCallback(step);
   return () => {
@@ -393,7 +429,7 @@ const CAMERA_ENDED_MESSAGE = 'The camera stopped sending video. It may have been
 export interface CameraFeatureSourceOptions {
   /** Default: new URL(MEDIAPIPE_WASM_DIR, document.baseURI).href */
   wasmBaseUrl?: string;
-  /** Default: FACE_LANDMARKER_MODEL_URL */
+  /** Default: the app's own copy (FACE_LANDMARKER_MODEL_PATH), else FACE_LANDMARKER_MODEL_URL. */
   modelAssetPath?: string;
   /** Default 'GPU', with automatic fallback to the CPU. */
   delegate?: Delegate;
@@ -426,8 +462,16 @@ interface Session {
   readonly landmarker: LandmarkerHandle;
   lastVideoTime: number;
   lastDriverTickAt: number;
+  /** Time stamped on the last frame processed (frame times never run backwards). */
+  lastFrameT: number;
   readonly cancels: Cancel[];
 }
+
+/**
+ * A frame's capture time is used as its time when it is this recent at most: older means the
+ * clocks don't agree (or the frame sat in a queue through a stall), and "now" is the better guess.
+ */
+const MAX_CAPTURE_LAG_MS = 250;
 
 const NO_FACE = (t: number): FeatureFrame => ({ t, faceFound: false, features: null, quality: 0 });
 
@@ -657,7 +701,7 @@ export class CameraFeatureSource implements FeatureSource {
   }
 
   private beginSession(camera: CameraHandle, landmarker: LandmarkerHandle): void {
-    const s: Session = { camera, landmarker, lastVideoTime: -1, lastDriverTickAt: this.deps.now(), cancels: [] };
+    const s: Session = { camera, landmarker, lastVideoTime: -1, lastDriverTickAt: this.deps.now(), lastFrameT: Number.NEGATIVE_INFINITY, cancels: [] };
     this.session = s;
     if (this.lightingProbe === undefined) {
       try {
@@ -690,9 +734,9 @@ export class CameraFeatureSource implements FeatureSource {
   }
 
   private driveFromVideo(s: Session): void {
-    const tick = (): void => {
+    const tick = (capturedAt?: number): void => {
       s.lastDriverTickAt = this.deps.now();
-      this.processFrame(s);
+      this.processFrame(s, undefined, capturedAt);
     };
     s.lastDriverTickAt = this.deps.now();
     const video = s.camera.video;
@@ -705,7 +749,7 @@ export class CameraFeatureSource implements FeatureSource {
     );
   }
 
-  private processFrame(s: Session, frame?: VideoFrame): void {
+  private processFrame(s: Session, frame?: VideoFrame, capturedAt?: number): void {
     if (this.session !== s) return;
 
     let input: TexImageSource;
@@ -724,7 +768,13 @@ export class CameraFeatureSource implements FeatureSource {
       aspectRatio = video.videoWidth / video.videoHeight;
     }
 
-    const t = this.deps.now();
+    // When the picture was taken, not when this code got round to it: main-thread work (a page
+    // turn, a book being parsed) otherwise becomes jitter in the spacing of the frames, which the
+    // gaze filter and the fixation detector read as jitter in the gaze.
+    const now = this.deps.now();
+    let t = capturedAt !== undefined && capturedAt <= now && now - capturedAt <= MAX_CAPTURE_LAG_MS ? capturedAt : now;
+    if (t <= s.lastFrameT) t = Math.max(now, s.lastFrameT + 0.001);
+    s.lastFrameT = t;
     let result: FaceResultLike;
     try {
       result = s.landmarker.detect(input, t);
