@@ -8,8 +8,10 @@ import { SLOW_MS, gateReport, gateSession, gateTitle, type Gate } from './endToE
 
 const GATES: Gate[] = [
   { scenario: 'clean', minutes: 20, maxFalse: 2, maxMissed: 2 },
-  { scenario: 'everyday', minutes: 20, maxFalse: 6, maxMissed: 3 },
-  { scenario: 'everyday', minutes: 20, sensitivity: 'relaxed', maxFalse: 3, maxMissed: 6 },
+  { scenario: 'everyday', minutes: 20, maxFalse: 2, maxMissed: 3 },
+  // A reader who skips the calibration's head-movement step: as it was before the step existed.
+  { scenario: 'everyday', minutes: 20, headStep: false, maxFalse: 6, maxMissed: 3 },
+  { scenario: 'everyday', minutes: 20, sensitivity: 'relaxed', maxFalse: 3, maxMissed: 5 },
   { scenario: 'distracted', minutes: 15, maxFalse: 2, maxMissed: 2 },
 ];
 

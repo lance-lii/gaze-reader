@@ -30,6 +30,8 @@ export interface Gate {
    */
   seeds?: number[];
   sensitivity?: Sensitivity;
+  /** The reader does the calibration's head-movement step (default true). */
+  headStep?: boolean;
   /** At most this many unintended turns over the sessions… */
   maxFalse: number;
   /** …and this many finished pages not turned (missed). */
@@ -44,10 +46,12 @@ const cache = new Map<string, { metrics: SessionMetrics[]; summary: Summary; fal
 
 export function gateSession(g: Gate): { metrics: SessionMetrics[]; summary: Summary; falses: number; missed: number } {
   const seeds = g.seeds ?? [GATE_SEED];
-  const key = `${g.scenario}/${g.minutes}/${g.sensitivity ?? 'balanced'}/${seeds.join(',')}`;
+  const key = `${g.scenario}/${g.minutes}/${g.sensitivity ?? 'balanced'}/${seeds.join(',')}/${g.headStep ?? true}`;
   let s = cache.get(key);
   if (!s) {
-    const metrics = seeds.map((seed) => runSession(scenario(g.scenario), seed, { minutes: g.minutes, sensitivity: g.sensitivity ?? 'balanced' }));
+    const metrics = seeds.map((seed) =>
+      runSession(scenario(g.scenario), seed, { minutes: g.minutes, sensitivity: g.sensitivity ?? 'balanced', ...(g.headStep !== undefined ? { headStep: g.headStep } : {}) }),
+    );
     const count = (kind: string): number => metrics.reduce((a, m) => a + m.turns.filter((t) => t.kind === kind).length, 0);
     s = { metrics, summary: summarize(metrics), falses: count('false'), missed: count('missed') };
     cache.set(key, s);
@@ -65,4 +69,4 @@ export function gateReport(s: Summary): string {
 }
 
 export const gateTitle = (g: Gate): string =>
-  `${g.scenario}${g.sensitivity && g.sensitivity !== 'balanced' ? ` (${g.sensitivity})` : ''}, ${g.seeds && g.seeds.length > 1 ? `${g.seeds.length} × ` : ''}${g.minutes} min: ≤ ${g.maxFalse} unintended turns, ≤ ${g.maxMissed} missed`;
+  `${g.scenario}${g.sensitivity && g.sensitivity !== 'balanced' ? ` (${g.sensitivity})` : ''}${g.headStep === false ? ' (no head-movement step)' : ''}, ${g.seeds && g.seeds.length > 1 ? `${g.seeds.length} × ` : ''}${g.minutes} min: ≤ ${g.maxFalse} unintended turns, ≤ ${g.maxMissed} missed`;

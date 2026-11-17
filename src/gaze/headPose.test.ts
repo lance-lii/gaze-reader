@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectMatrixLayout, headPoseFromMatrix, NEUTRAL_HEAD_POSE, tryHeadPoseFromMatrix, type MatrixLayout } from './headPose';
+import { cameraAnglesInHead, detectMatrixLayout, headPoseFromMatrix, NEUTRAL_HEAD_POSE, tryHeadPoseFromMatrix, type MatrixLayout } from './headPose';
 
 type M3 = number[][];
 
@@ -119,5 +119,65 @@ describe('detectMatrixLayout', () => {
 
   it('defaults to column-major (MediaPipe) when translation is zero', () => {
     expect(detectMatrixLayout(flatten(rotation(0.3, 0.1, 0), [0, 0, 0], 'row-major'))).toBe('column-major');
+  });
+});
+
+describe('cameraAnglesInHead', () => {
+  const DEG = Math.PI / 180;
+  const pose = (p: Partial<Record<'yaw' | 'pitch' | 'roll' | 'tx' | 'ty' | 'tz', number>>) => ({ yaw: 0, pitch: 0, roll: 0, tx: 0, ty: 0, tz: -60, ...p });
+
+  it('is zero for a head that faces the camera squarely, at any distance', () => {
+    for (const tz of [-30, -60, -90]) {
+      const a = cameraAnglesInHead(pose({ tz }))!;
+      expect(a.a).toBeCloseTo(0, 12);
+      expect(a.b).toBeCloseTo(0, 12);
+    }
+  });
+
+  it('a turn of the head moves the camera by that angle in the head’s frame: yaw across, pitch up-down', () => {
+    const yawed = cameraAnglesInHead(pose({ yaw: 5 * DEG }))!;
+    expect(Math.abs(yawed.a)).toBeCloseTo(5 * DEG, 6);
+    expect(yawed.b).toBeCloseTo(0, 6);
+    const pitched = cameraAnglesInHead(pose({ pitch: 5 * DEG }))!;
+    expect(Math.abs(pitched.b)).toBeCloseTo(5 * DEG, 6);
+    expect(pitched.a).toBeCloseTo(0, 6);
+    // Opposite turns, opposite signs.
+    expect(Math.sign(cameraAnglesInHead(pose({ pitch: -5 * DEG }))!.b)).toBe(-Math.sign(pitched.b));
+  });
+
+  it('a move of the head across the camera’s view is the same thing as a turn: 2 cm down at 60 cm is 1.9°', () => {
+    const lower = cameraAnglesInHead(pose({ ty: -2 }))!;
+    expect(Math.abs(lower.b)).toBeCloseTo(Math.atan2(2, 60), 9);
+    expect(lower.a).toBeCloseTo(0, 9);
+    // A head that turns to keep facing the camera as it moves hasn't changed at all.
+    const p = { yaw: 0, pitch: 0, roll: 0, tx: 0, ty: -2, tz: -60 };
+    const turn = cameraAnglesInHead({ ...p, pitch: 0 })!.b;
+    const facing = [cameraAnglesInHead({ ...p, pitch: turn })!.b, cameraAnglesInHead({ ...p, pitch: -turn })!.b];
+    expect(Math.min(...facing.map(Math.abs))).toBeLessThan(1e-9);
+  });
+
+  it('agrees with the matrix it comes from: the camera is at −Rᵀt', () => {
+    // Build R = Ry(yaw)·Rx(pitch)·Rz(roll) and t, as headPoseFromMatrix reads them, and compare.
+    const want = { yaw: 7 * DEG, pitch: -4 * DEG, roll: 6 * DEG, tx: 3, ty: -5, tz: -55 };
+    const [cy, sy, cp, sp, cr, sr] = [Math.cos(want.yaw), Math.sin(want.yaw), Math.cos(want.pitch), Math.sin(want.pitch), Math.cos(want.roll), Math.sin(want.roll)];
+    const R = [
+      [cy * cr + sy * sp * sr, -cy * sr + sy * sp * cr, sy * cp],
+      [cp * sr, cp * cr, -sp],
+      [-sy * cr + cy * sp * sr, sy * sr + cy * sp * cr, cy * cp],
+    ];
+    const t = [want.tx, want.ty, want.tz];
+    const decoded = headPoseFromMatrix([R[0][0], R[1][0], R[2][0], 0, R[0][1], R[1][1], R[2][1], 0, R[0][2], R[1][2], R[2][2], 0, t[0], t[1], t[2], 1]);
+    expect(decoded.yaw).toBeCloseTo(want.yaw, 9);
+    expect(decoded.roll).toBeCloseTo(want.roll, 9);
+    const cam = [0, 1, 2].map((col) => -(R[0][col] * t[0] + R[1][col] * t[1] + R[2][col] * t[2]));
+    const got = cameraAnglesInHead(decoded)!;
+    expect(got.a).toBeCloseTo(Math.atan2(cam[0], cam[2]), 9);
+    expect(got.b).toBeCloseTo(Math.atan2(cam[1], cam[2]), 9);
+  });
+
+  it('is null for a pose that isn’t one: no translation, a face behind the camera, non-finite numbers', () => {
+    expect(cameraAnglesInHead({ ...NEUTRAL_HEAD_POSE })).toBeNull();
+    expect(cameraAnglesInHead(pose({ tz: 40 }))).toBeNull();
+    expect(cameraAnglesInHead(pose({ pitch: Number.NaN }))).toBeNull();
   });
 });

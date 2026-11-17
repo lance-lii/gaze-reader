@@ -577,6 +577,86 @@ export function calibrationSession(seed: number, o: SessionOptions = {}): Calibr
   return out;
 }
 
+/**
+ * The head's pose after turning by (dyaw, dpitch, droll) from `base` the way a head on a neck
+ * does: about a pivot below and behind the eyes, so a nod also carries the face forward and down,
+ * and a tilt carries it sideways.
+ */
+export function neckPose(base: Pose, dyaw: number, dpitch: number, droll: number, pivot: { down: number; back: number } = { down: 12, back: 8 }): Pose {
+  const arm = [0, pivot.down, pivot.back];
+  const R = rotYXZ(dyaw, dpitch, droll);
+  const moved = R.map((row) => row[0] * arm[0] + row[1] * arm[1] + row[2] * arm[2]);
+  return {
+    yaw: base.yaw + dyaw,
+    pitch: base.pitch + dpitch,
+    roll: base.roll + droll,
+    tx: base.tx + moved[0] - arm[0],
+    ty: base.ty + moved[1] - arm[1],
+    tz: base.tz + moved[2] - arm[2],
+  };
+}
+
+export interface MovementOptions {
+  light?: Perturbation;
+  noise?: NoiseSpec;
+  /** Viewport-fraction targets the eyes stay on, one after the other (default the centre). */
+  targets?: readonly Point[];
+  /** How far the head goes each way, deg (defaults: nod 6, turn 7, tilt 5; 0 leaves a movement out). */
+  nodDeg?: number;
+  turnDeg?: number;
+  tiltDeg?: number;
+  /** Frames per movement and target (default 75: 2.5 s at 30 fps). */
+  perMove?: number;
+  /** Per-target fixation error SD and per-frame jitter SD, deg (defaults 0.4, 0.1). */
+  fixSdDeg?: number;
+  jitterDeg?: number;
+  /** The eyes take back this share of each head movement (the vestibulo-ocular reflex; default 0.97, the rest slips). */
+  vorGain?: number;
+  /** The pose the movements start from (default BASE_POSE). */
+  base?: Pose;
+}
+
+/**
+ * The calibration's head-movement step: the eyes stay on a dot while the head nods, turns and
+ * tilts (smooth back-and-forth movements about the neck, of slightly different size each time).
+ */
+export function headMovementSession(seed: number, o: MovementOptions = {}): CalibrationSample[] {
+  const r = rng(seed * 7919 + 13);
+  const out: CalibrationSample[] = [];
+  const per = o.perMove ?? 75;
+  const base = o.base ?? BASE_POSE;
+  const slip = 1 - (o.vorGain ?? 0.97);
+  let t = 0;
+  for (const tf of o.targets ?? [{ x: 0.5, y: 0.5 }]) {
+    const target = { x: tf.x * VIEW.width, y: tf.y * VIEW.height };
+    const fixSd = (o.fixSdDeg ?? 0.4) * DEG;
+    const fix = { h: gauss(r) * fixSd, v: gauss(r) * fixSd };
+    const moves: { amp: number; axis: 'pitch' | 'yaw' | 'roll' }[] = [
+      { amp: (o.nodDeg ?? 6) * DEG, axis: 'pitch' },
+      { amp: (o.turnDeg ?? 7) * DEG, axis: 'yaw' },
+      { amp: (o.tiltDeg ?? 5) * DEG, axis: 'roll' },
+    ];
+    for (const move of moves) {
+      if (!(move.amp > 0)) continue;
+      const amp = move.amp * (0.8 + 0.4 * r());
+      const cycles = 1.5;
+      for (let i = 0; i < per; i++) {
+        const swing = amp * Math.sin((2 * Math.PI * cycles * i) / per);
+        // Nobody moves on one axis only: a little of the others comes along.
+        const stray = (): number => 0.08 * swing + 0.15 * DEG * gauss(r);
+        const d = { pitch: move.axis === 'pitch' ? swing : stray(), yaw: move.axis === 'yaw' ? swing : stray(), roll: move.axis === 'roll' ? swing : stray() };
+        const pose = neckPose(base, d.yaw, d.pitch, d.roll);
+        const jd = (o.jitterDeg ?? 0.1) * DEG;
+        // The eyes lag the head a little: the part of the head's turn they haven't taken back.
+        const gn = { h: fix.h + jd * gauss(r) + slip * d.yaw, v: fix.v + jd * gauss(r) + slip * d.pitch };
+        const f = frameFeatures(makeFrame(target, pose, gn, o.light ?? {}, r, o.noise ?? NOMINAL_NOISE));
+        if (f) out.push({ target, features: f, t: (t += 33) });
+      }
+    }
+  }
+  return out;
+}
+
 /** Where a centred text column is read: 5 columns × 9 rows, viewport px. */
 export const READING_POINTS: readonly Point[] = Object.freeze(
   [0.3, 0.4, 0.5, 0.6, 0.7].flatMap((fx) => [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9].map((fy) => ({ x: fx * VIEW.width, y: fy * VIEW.height }))),
