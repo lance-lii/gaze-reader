@@ -73,6 +73,7 @@ import { LibraryScreen } from '../ui/libraryScreen';
 import { Onboarding, hasCompletedOnboarding } from '../ui/onboarding';
 import { SettingsPanel } from '../ui/settingsPanel';
 import { Toaster, type ToastAction } from '../ui/toast';
+import { HeadGestureDetector, type HeadGesture } from '../gaze/headGestures';
 import { Topbar } from '../ui/topbar';
 import {
   AppearanceChangeFilter,
@@ -355,6 +356,7 @@ export class AppController {
   // Lighting & eyelid appearance (webcam only), and the guidance they lead to
   private readonly lightingWatch = new LightingWatch();
   private readonly appearance = new AppearanceMonitor(null);
+  private readonly headGestures = new HeadGestureDetector();
   private offCameraFrames: Unsubscribe | null = null;
   private lightingState: AppEvents['lighting-state'] | null = null;
   private lastAppearanceDebugAt = Number.NEGATIVE_INFINITY;
@@ -2207,6 +2209,7 @@ export class AppController {
       // The model reads no lid features, so its y is a fair "where the eyes look" for the lid baseline.
       if (p && Number.isFinite(p.y)) gazeYNorm = p.y / model.viewport.height;
     }
+    this.watchHeadGestures(frame.t, f);
     const change = this.appearance.update({ t: frame.t, features: f, quality: frame.quality, gazeYNorm });
     if (change) this.cameraChange(change.t, 'lids', `${change.direction} eyes (${change.channel}, z ${change.z.toFixed(1)})`, frame.t);
     if (this.debug.visible && frame.t - this.lastAppearanceDebugAt >= APPEARANCE_DEBUG_MS) {
@@ -2220,8 +2223,44 @@ export class AppController {
     }
   };
 
+  /**
+   * Head gestures (Settings → Page turning): a quick head turn pages forward or back, eyebrows held
+   * up pause or resume. Only while the reader is reading: not under a dialog, where a turn of the
+   * head toward someone shouldn't do anything behind it.
+   */
+  private watchHeadGestures(t: number, features: FeatureFrame['features']): void {
+    if (!this.store.get().headGestures || this.modalOpen()) {
+      this.headGestures.reset();
+      return;
+    }
+    const gesture = this.headGestures.update({ t, features });
+    if (gesture) this.onHeadGesture(gesture);
+  }
+
+  private onHeadGesture(gesture: HeadGesture): void {
+    let message: string;
+    switch (gesture) {
+      case 'turn-right':
+        message = 'Head turn: next page';
+        this.runCommand('page-forward');
+        break;
+      case 'turn-left':
+        message = 'Head turn: previous page';
+        this.runCommand('page-back');
+        break;
+      case 'brows-up': {
+        this.runCommand('toggle-autoscroll');
+        message = this.store.get().autoScroll ? 'Eyebrows: page turning resumed' : 'Eyebrows: page turning paused';
+        break;
+      }
+    }
+    // Say what was understood: a gesture nobody meant to make shouldn't be a mystery.
+    this.toasts.show({ id: 'head-gesture', message, durationMs: 1800 });
+  }
+
   /** The camera stopped: forget this session's lighting window and eyelid history. */
   private stopConditionWatch(): void {
+    this.headGestures.reset();
     this.lightingWatch.reset();
     this.appearance.reset();
     this.sustainedFlags.reset();

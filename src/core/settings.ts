@@ -10,6 +10,8 @@ export const DEFAULT_SETTINGS: Readonly<AppSettings> = Object.freeze({
   overlapLines: 2,
   scrollDurationMs: 650,
   glanceDownToTurn: true,
+  // Off until asked for: a gesture nobody meant to make turns a page.
+  headGestures: false,
 
   fontSizePx: 22,
   // Generous leading makes lines easier to tell apart for a webcam tracker.
@@ -54,6 +56,7 @@ export function sanitizeSettings(input: unknown): AppSettings {
   pick('overlapLines', num(0, 3));
   pick('scrollDurationMs', num(0, 2000));
   pick('glanceDownToTurn', bool);
+  pick('headGestures', bool);
   pick('fontSizePx', num(12, 40));
   pick('lineHeight', num(1.2, 3));
   pick('fontFamily', oneOf('serif', 'sans', 'mono'));

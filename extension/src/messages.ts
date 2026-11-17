@@ -185,7 +185,8 @@ export function isEyeFeatures(x: unknown): x is EyeFeatures {
     isFiniteNum(x.faceScale) &&
     isPoint(x.faceCenter) &&
     // Optional (older offscreen documents don't send it): a 0..1 blendshape score.
-    (x.squint === undefined || (isFiniteNum(x.squint) && x.squint >= 0 && x.squint <= 1))
+    (x.squint === undefined || (isFiniteNum(x.squint) && x.squint >= 0 && x.squint <= 1)) &&
+    (x.browRaise === undefined || (isFiniteNum(x.browRaise) && x.browRaise >= 0 && x.browRaise <= 1))
   );
 }
 

@@ -1364,6 +1364,12 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
       },
       { kind: 'toggle', key: 'glanceDownToTurn', label: 'Glance down to turn', hint: 'Look below the page for a moment to turn it.' },
       {
+        kind: 'toggle',
+        key: 'headGestures',
+        label: 'Head gestures',
+        hint: 'With the webcam: turn your head quickly right and back for the next page, left and back for the previous one. Raise your eyebrows for a moment to pause or resume.',
+      },
+      {
         kind: 'range',
         key: 'overlapLines',
         label: 'Lines kept for context',
