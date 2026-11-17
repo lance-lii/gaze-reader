@@ -19,6 +19,7 @@ import { FEATURE_NAMES } from '../gaze/features';
 import { MouseGazeSource } from '../gaze/mouseGazeSource';
 import { loadBookFromText } from '../reader/bookLoader';
 import { getBook, listBooks, saveBook, saveProgress } from '../reader/library';
+import { savePdfSource } from '../reader/pdfStore';
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
 import { Toaster } from '../ui/toast';
@@ -61,6 +62,23 @@ vi.mock('../ui/calibrationOverlay', async (importOriginal) => {
   }
   return { ...m, CalibrationOverlay: ScriptedOverlay };
 });
+
+// The pages view draws a PDF with pdf.js; a test only needs to see that the file was opened and closed.
+const pdfDocs = vi.hoisted(() => ({ opened: 0, destroyed: 0 }));
+vi.mock('../reader/pdf', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../reader/pdf')>()),
+  openPdfDocument: () => {
+    pdfDocs.opened++;
+    return Promise.resolve({
+      pageCount: 2,
+      render: () => Promise.resolve(true),
+      cancel: () => undefined,
+      destroy: () => {
+        pdfDocs.destroyed++;
+      },
+    });
+  },
+}));
 
 const PITCH = 40;
 
@@ -253,6 +271,78 @@ describe('AppController', () => {
     expect((await listBooks()).length).toBe(entries);
   });
 
+  it('a PDF opens as text, V switches to its own pages and back, and the choice is remembered for that book', async () => {
+    const book: Book = { ...loadBookFromText('A paper about lamps and reading glasses. '.repeat(150), { source: 'paste' }), id: 'paper-1', title: 'A Paper', format: 'pdf', source: 'file' };
+    await saveBook(book);
+    await savePdfSource('paper-1', {
+      bytes: new Uint8Array([37, 80, 68, 70]).buffer,
+      pages: [
+        { width: 600, height: 800, columns: false, lines: [{ x0: 72, x1: 500, y: 100, size: 10, text: 'The first line of the paper' }] },
+        { width: 600, height: 800, columns: true, lines: [] },
+      ],
+    });
+    pdfDocs.opened = 0;
+    pdfDocs.destroyed = 0;
+    const reader = (): HTMLElement => document.querySelector<HTMLElement>('.gr-reader')!;
+    const pdfButton = (): HTMLButtonElement => document.querySelector<HTMLButtonElement>('.gr-topbar__pdf')!;
+    const press = (key: string): void => {
+      reader().dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+    };
+    const open = async (): Promise<void> => {
+      await (app as unknown as { openSaved(id: string): Promise<boolean> }).openSaved('paper-1');
+      await until(() => document.documentElement.dataset.screen === 'reader', 'the reader to open');
+    };
+
+    await open();
+    // As text first (what the eye tracker follows best), with the pages one key away.
+    expect(reader().dataset.view).toBeUndefined();
+    expect(pdfButton().hidden).toBe(false);
+    expect(pdfButton().getAttribute('aria-label')).toBe('Show this PDF’s original pages');
+    expect(toastText()).toContain('original pages');
+    expect(pdfDocs.opened).toBe(0);
+
+    const opened = record(app, 'book-opened');
+    press('v');
+    await until(() => reader().dataset.view === 'pages', 'the pages view');
+    expect(pdfDocs.opened).toBe(1);
+    expect(document.querySelectorAll('.gr-pdf-page')).toHaveLength(2);
+    expect(document.querySelector('.gr-pdf-line')!.textContent).toBe('The first line of the paper');
+    expect(pdfButton().getAttribute('aria-label')).toBe('Show this PDF as plain text');
+    expect(opened.at(-1)).toMatchObject({ id: 'paper-1' });
+    expect(toastText()).not.toContain('one key away');
+
+    // Back in the library and opened again: its pages, as the reader left it.
+    press('l');
+    await until(() => document.documentElement.dataset.screen === 'library', 'the library');
+    expect(pdfDocs.destroyed).toBe(1); // the file is closed with the book
+    await open();
+    expect(reader().dataset.view).toBe('pages');
+    expect(pdfDocs.opened).toBe(2);
+
+    pdfButton().click();
+    await until(() => reader().dataset.view === undefined, 'the text view');
+    expect(pdfDocs.destroyed).toBe(2);
+    expect(document.querySelector('.gr-pdf-page')).toBeNull();
+    expect(document.querySelectorAll('.gr-chapter').length).toBeGreaterThan(0);
+  });
+
+  it('books that aren’t PDFs have no pages to switch to, and a PDF whose file wasn’t kept says so', async () => {
+    await openPastedText();
+    const pdfButton = document.querySelector<HTMLButtonElement>('.gr-topbar__pdf')!;
+    expect(pdfButton.hidden).toBe(true);
+    document.querySelector<HTMLElement>('.gr-reader')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'v', bubbles: true, cancelable: true }));
+    await until(() => toastText().includes('Only PDFs'), 'the explanation');
+
+    const book: Book = { ...loadBookFromText('An older paper, saved before its pages were kept. '.repeat(120), { source: 'paste' }), id: 'paper-old', format: 'pdf', source: 'file' };
+    await saveBook(book);
+    await (app as unknown as { openSaved(id: string): Promise<boolean> }).openSaved('paper-old');
+    await until(() => document.title.includes('Pasted text') || document.querySelector('.gr-topbar__book')!.textContent !== '', 'the book to open');
+    expect(pdfButton.hidden).toBe(true);
+    document.querySelector<HTMLElement>('.gr-reader')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'v', bubbles: true, cancelable: true }));
+    await until(() => toastText().includes('aren’t kept on this device'), 'the explanation');
+    expect(document.querySelector<HTMLElement>('.gr-reader')!.dataset.view).toBeUndefined();
+  });
+
   it('keeps books saved before they had a source key, and adds the key when one is opened again', async () => {
     const text = 'Notes on reading glasses and the light. '.repeat(120);
     const legacy: Partial<Book> = loadBookFromText(text, { source: 'paste' });
@@ -291,6 +381,15 @@ describe('AppController', () => {
       await sleep(100);
       expect(finished).toHaveLength(1); // once
       expect(toastText()).toMatch(/The end!/);
+      // Finished is 100 %, wherever the scroller is (regression: a book that fits one screen stayed
+      // at "0 %" and came back in the library as one to continue).
+      expect(document.querySelector('.gr-topbar__progress')!.getAttribute('aria-valuenow')).toBe('100');
+      let saved = 0;
+      for (let i = 0; i < 50 && saved !== 1; i++) {
+        await sleep(20);
+        saved = (await listBooks()).find((b) => b.title === 'Pasted text')?.fraction ?? 0;
+      }
+      expect(saved).toBe(1);
     });
 
     it('finishes even while auto-scroll is paused (the reader paged through by hand)', async () => {
@@ -322,6 +421,43 @@ describe('AppController', () => {
     const undo = [...document.querySelectorAll<HTMLButtonElement>('.gr-toast__actions button')].find((b) => b.textContent === 'Undo')!;
     undo.click();
     expect(JSON.parse(localStorage.getItem('gazeReader.settings.v1')!)).toMatchObject({ buddyEnabled: true });
+  });
+
+  it('measures the lines again when Dewey changes corner, appears or is hidden (regression: the reading area moved, the lines didn’t)', async () => {
+    await openPastedText();
+    const layouts = record(app, 'layout');
+    await until(() => layouts.length > 0, 'the first layout');
+    await sleep(250);
+    const before = layouts.length;
+    app.bus.emit('settings-patch', { buddyCorner: 'top-left' });
+    await until(() => layouts.length > before, 'a new measurement after Dewey moved');
+    const after = layouts.length;
+    await sleep(250);
+    // Whichever way he was: one of these two is a change.
+    app.bus.emit('settings-patch', { buddyEnabled: true });
+    app.bus.emit('settings-patch', { buddyEnabled: false });
+    await until(() => layouts.length > after, 'a new measurement after Dewey was shown or hidden');
+  });
+
+  it('keeps the reading model out while the page is pinch-zoomed, and says why once (regression: nothing noticed a pinch)', async () => {
+    const fed = vi.spyOn(LineTracker.prototype, 'onSample'); // calls through
+    await openPastedText();
+    const layouts = record(app, 'layout');
+    await until(() => layouts.length > 0, 'the first layout');
+    moveMouse(400, 300);
+    await until(() => fed.mock.calls.length > 3, 'gaze to reach the reading model');
+    // A pinch: the visual viewport magnifies; no resize, no change of devicePixelRatio.
+    vi.stubGlobal('visualViewport', { scale: 1.6 });
+    await sleep(80);
+    fed.mockClear();
+    moveMouse(420, 320);
+    await sleep(300);
+    expect(fed).not.toHaveBeenCalled();
+    expect(toastText()).toMatch(/pinch-zoomed/);
+    vi.stubGlobal('visualViewport', { scale: 1 });
+    moveMouse(440, 300);
+    await until(() => fed.mock.calls.length > 3, 'the reading model to resume');
+    vi.unstubAllGlobals();
   });
 
   it('keyboard: P pauses (pill says so), shortcuts wait while typing, and nothing reacts after destroy', async () => {
@@ -460,6 +596,45 @@ describe('AppController', () => {
     expect(error.textContent).toMatch(/CORS/);
     expect(input.getAttribute('aria-invalid')).toBe('true');
     expect(toastText()).not.toMatch(/Couldn’t open that book/);
+  });
+
+  it('Cancel stops an "Open from URL" download and gives the library back (regression: it carried on and opened the book)', async () => {
+    let aborted = false;
+    let respond: ((r: Response) => void) | null = null;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init?: RequestInit) => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true;
+        });
+        return new Promise<Response>((resolve, reject) => {
+          respond = resolve;
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+        });
+      }),
+    );
+    const toggle = document.querySelector<HTMLButtonElement>('.gr-lib-url-toggle')!;
+    toggle.click();
+    const form = document.querySelector<HTMLFormElement>('.gr-inline-form:not([hidden])')!;
+    form.querySelector('input')!.value = 'https://example.org/slow-book.txt';
+    form.requestSubmit();
+    await until(() => respond !== null, 'the request to start');
+    const libraryEl = toggle.closest<HTMLElement>('[aria-busy]')!;
+    expect(libraryEl).not.toBeNull(); // busy: its controls are disabled meanwhile
+
+    form.querySelector<HTMLButtonElement>('[data-cancel]')!.click();
+    expect(aborted).toBe(true);
+    await sleep(30);
+    expect(libraryEl.hasAttribute('aria-busy')).toBe(false);
+    expect(toggle.disabled).toBe(false);
+    expect(document.documentElement.dataset.screen).toBe('library');
+    expect(document.activeElement).toBe(toggle);
+    // Even a response that still arrives opens nothing.
+    respond!(new Response('A late book. '.repeat(200), { headers: { 'content-type': 'text/plain' } }));
+    await sleep(60);
+    expect(document.documentElement.dataset.screen).toBe('library');
+    expect(toastText()).not.toMatch(/Couldn’t open/);
+    vi.unstubAllGlobals();
   });
 
   it('queues U pressed while a forward turn is still sliding, and undoes it when it lands (regression)', async () => {
@@ -899,6 +1074,42 @@ describe('AppController', () => {
     expect(toastText()).toMatch(/calibration starts over/);
   });
 
+  it('webcam: a camera that freezes in the middle of a calibration is restarted, and the calibration opens again (regression: stuck on the dots until Esc)', async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    const { camera } = await readWithWebcam(calibratedModel());
+    let cancelled: (() => void) | null = null;
+    overlays.run = () =>
+      new Promise((resolve) => {
+        cancelled = () => resolve(null);
+      });
+    vi.spyOn(CalibrationOverlay.prototype, 'cancel').mockImplementation(() => cancelled?.());
+    app.bus.emit('command', { name: 'recalibrate' });
+    await until(() => overlays.modes.length === 1, 'the recalibration');
+    camera.emit(webcamFrame());
+    const before = camera.starts();
+    skew += 6000; // six seconds without a frame: no 'ended' event, the camera just froze
+    await until(() => camera.starts() === before + 1, 'the camera to be restarted', 4000);
+    await until(() => overlays.modes.length === 2, 'the calibration to open again', 4000);
+    expect(overlays.modes).toEqual(['standard', 'standard']);
+  });
+
+  it('webcam: a first calibration isn’t restarted while the tracker is still warming up (no frame has arrived yet)', async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    overlays.run = () => new Promise(() => undefined); // the dots stay up
+    const { camera } = await readWithWebcam(null);
+    await until(() => overlays.modes.length === 1, 'the first calibration');
+    const before = camera.starts();
+    skew += 8000; // eight seconds and still no frame: the model is compiling, the camera is fine
+    await sleep(1300); // a heartbeat or two
+    expect(camera.starts()).toBe(before);
+    expect(toastText()).not.toMatch(/camera stopped/i);
+    expect(overlays.modes).toHaveLength(1);
+  });
+
   it('webcam: a camera that keeps stopping a little over a minute apart is reported on the third stop (regression: restarted silently forever)', async () => {
     const realNow = performance.now.bind(performance);
     let skew = 0;
@@ -1222,6 +1433,60 @@ describe('AppController', () => {
     expect(changes).toHaveLength(1);
     expect(changes[0]!.reason).toBe('lids');
     expect(changes[0]!.detail).toMatch(/narrower/);
+  });
+
+  it('webcam: head gestures page forward and back and pause, when switched on (and say what they understood)', async () => {
+    const turn = vi.spyOn(ScrollController.prototype, 'turnPage').mockResolvedValue(undefined);
+    const back = vi.spyOn(ScrollController.prototype, 'pageBack').mockResolvedValue(undefined);
+    vi.spyOn(ScrollController.prototype, 'atEnd').mockReturnValue(false);
+    const { camera } = await readWithWebcam(calibratedModel(), { settings: { headGestures: true } });
+    const settings = record(app, 'settings-changed');
+    let t = performance.now();
+    /** The reader's head over `ms`: yaw (radians; > 0 is the reader's left) and eyebrows as functions of the time since the start. */
+    const watch = (ms: number, yaw: (at: number) => number = () => 0, brows: (at: number) => number = () => 0.08): void => {
+      for (let at = 0; at < ms; at += 33) {
+        const f = webcamFrame();
+        camera.emit({ ...f, t: t + at, features: { ...f.features!, headPose: { ...f.features!.headPose, yaw: yaw(at) }, browRaise: brows(at) } });
+      }
+      t += ms;
+    };
+    const flick = (amp: number) => (at: number): number => (at < 400 || at > 850 ? 0 : amp * Math.sin((Math.PI * (at - 400)) / 450) ** 2);
+
+    watch(1500, flick(-0.35)); // a quick turn to the reader's right, and back
+    expect(turn).toHaveBeenCalledTimes(1);
+    expect(toastText()).toContain('Head turn: next page');
+    await new Promise((resolve) => setTimeout(resolve, 0)); // the (mocked) turn lands
+    watch(1500, flick(0.35));
+    expect(back).toHaveBeenCalledTimes(1);
+    expect(toastText()).toContain('Head turn: previous page');
+
+    watch(1500, undefined, (at) => (at > 300 && at < 1200 ? 0.6 : 0.08)); // eyebrows up for a moment
+    expect(settings.at(-1)?.settings.autoScroll).toBe(false);
+    expect(toastText()).toContain('Eyebrows: page turning paused');
+    watch(1500, undefined, (at) => (at > 300 && at < 1200 ? 0.6 : 0.08)); // and again: gestures keep working while paused
+    expect(settings.at(-1)?.settings.autoScroll).toBe(true);
+    expect(toastText()).toContain('Eyebrows: page turning resumed');
+
+    // Under a dialog nothing happens behind it.
+    pressKey('s');
+    watch(1500, flick(-0.35));
+    expect(turn).toHaveBeenCalledTimes(1);
+  });
+
+  it('webcam: head gestures are off unless the reader switches them on', async () => {
+    const turn = vi.spyOn(ScrollController.prototype, 'turnPage').mockResolvedValue(undefined);
+    vi.spyOn(ScrollController.prototype, 'atEnd').mockReturnValue(false);
+    const { camera } = await readWithWebcam(calibratedModel());
+    const settings = record(app, 'settings-changed');
+    const t = performance.now();
+    for (let at = 0; at < 1500; at += 33) {
+      const f = webcamFrame();
+      const yaw = at < 400 || at > 850 ? 0 : -0.35 * Math.sin((Math.PI * (at - 400)) / 450) ** 2;
+      camera.emit({ ...f, t: t + at, features: { ...f.features!, headPose: { ...f.features!.headPose, yaw }, browRaise: at > 900 ? 0.7 : 0.08 } });
+    }
+    expect(turn).not.toHaveBeenCalled();
+    expect(settings).toEqual([]);
+    expect(toastText()).not.toContain('Head turn');
   });
 
   it('keeps the learned drift when a book is reopened with the same source, and re-learns it for another', async () => {

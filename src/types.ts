@@ -58,6 +58,12 @@ export interface EyeFeatures {
    * Used to notice light-driven squinting; never a gaze-model input.
    */
   squint?: number;
+  /**
+   * 0..1 mean of MediaPipe's eyebrow-raise blendshapes (browInnerUp, browOuterUpLeft/Right);
+   * absent when the tracker reports none of them. Read by head gestures (src/gaze/headGestures.ts)
+   * only; never a gaze-model input.
+   */
+  browRaise?: number;
 }
 
 export interface FeatureFrame {
@@ -372,6 +378,11 @@ export interface AppSettings {
   scrollDurationMs: number;
   /** Looking at/below the bottom edge for a moment turns the page. */
   glanceDownToTurn: boolean;
+  /**
+   * Head gestures (webcam only): a quick turn of the head right / left pages forward / back,
+   * eyebrows raised and held pause or resume page turning (src/gaze/headGestures.ts).
+   */
+  headGestures: boolean;
 
   fontSizePx: number;
   lineHeight: number;
@@ -422,7 +433,9 @@ export type CommandName =
   | 'toggle-gaze-dot'
   | 'open-library'
   | 'show-help'
-  | 'check-accuracy';
+  | 'check-accuracy'
+  /** A PDF: switch between its own pages and its text set as a book. */
+  | 'toggle-pdf-view';
 
 export type BuddyMood =
   | 'idle'

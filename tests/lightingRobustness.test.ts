@@ -17,6 +17,7 @@ import {
   measureOffset,
   refineGazeModel,
   trainGazeModel,
+  type RidgeGazeModel,
 } from '../src/gaze/calibrationModel';
 import { FEATURE_NAMES } from '../src/gaze/features';
 import type { LightingSignature } from '../src/types';
@@ -167,27 +168,39 @@ describe('calibration environment', () => {
 });
 
 /**
- * Posture after calibration (the scoreboard is bench/lighting/posture.bench.test.ts). Head yaw and
- * pitch are not gaze features: the corner-referenced iris already measures gaze relative to the
- * camera, and weights fitted to calibration's tiny head movements turned a reader's 4° chin drop
- * into 1.6–2.3 lines of offset.
+ * Posture after calibration (the scoreboard is bench/lighting/posture.bench.test.ts). The head's
+ * pose is not a set of gaze features: the corner-referenced iris already measures gaze relative to
+ * the camera, and weights fitted to calibration's tiny head movements turned a reader's 4° chin
+ * drop into 1.6–2.3 lines of offset and 3 cm to one side into 0.9. A change of distance is
+ * corrected geometrically instead (DepthCompensation in calibrationModel.ts).
  */
-describe('posture robustness of the gaze model', () => {
+describe('posture robustness of the gaze model', { timeout: 20_000 }, () => {
   // Calibrations vary a lot here (with yaw/pitch, 4 of 24 W1 calibrations happen to compensate a
   // chin drop better), so the guard averages over 8.
   const POSTURE_SEEDS = [1, 2, 3, 4, 5, 6, 7, 8];
+  /** One calibration per (feature set, world, seed), shared by the postures it is tried in. */
+  const models = new Map<string, RidgeGazeModel>();
+  const calibrated = (excluded: readonly string[], world: WorldName, seed: number): RidgeGazeModel => {
+    const key = `${excluded.join(',')}|${world}|${seed}`;
+    let model = models.get(key);
+    if (!model) {
+      model = trainGazeModel(calibrationSession(seed, { noise: WORLDS[world].noise }), {
+        viewport: { ...VIEW },
+        maxBlink: 0.85,
+        featureNames: FEATURE_NAMES,
+        excludedFeatures: excluded,
+      }).model;
+      models.set(key, model);
+    }
+    return model;
+  };
   /** Mean over calibrations of |that calibration's mean shift| on the reading grid (each reader has one calibration). */
   const shift = (excluded: readonly string[], world: WorldName, delta: Partial<Pose>): { dx: number; dy: number } => {
     const noise = WORLDS[world].noise;
     const dx: number[] = [];
     const dy: number[] = [];
     for (const seed of POSTURE_SEEDS) {
-      const { model } = trainGazeModel(calibrationSession(seed, { noise }), {
-        viewport: { ...VIEW },
-        maxBlink: 0.85,
-        featureNames: FEATURE_NAMES,
-        excludedFeatures: excluded,
-      });
+      const model = calibrated(excluded, world, seed);
       const r = rng(seed * 101);
       const sx: number[] = [];
       const sy: number[] = [];
@@ -206,11 +219,31 @@ describe('posture robustness of the gaze model', () => {
     return { dx: mean(dx), dy: mean(dy) };
   };
   const withHeadRotation = [...GAZE_EXCLUDED_FEATURES].filter((n) => n !== 'yaw' && n !== 'pitch');
+  /** Roll and head position fitted as features, no distance compensation (as before it existed). */
+  const withHeadPosition = [...GAZE_EXCLUDED_FEATURES].filter((n) => !['roll', 'tx', 'ty', 'tz', 'faceScale'].includes(n));
 
-  it('excludes head yaw and pitch from the gaze, and keeps roll and head position', () => {
-    expect(GAZE_EXCLUDED_FEATURES.has('yaw')).toBe(true);
-    expect(GAZE_EXCLUDED_FEATURES.has('pitch')).toBe(true);
-    for (const name of ['roll', 'tx', 'ty', 'tz', 'faceScale']) expect(GAZE_EXCLUDED_FEATURES.has(name)).toBe(false);
+  it('excludes the whole head pose from the gaze', () => {
+    for (const name of ['yaw', 'pitch', 'roll', 'tx', 'ty', 'tz', 'faceScale']) expect(GAZE_EXCLUDED_FEATURES.has(name), name).toBe(true);
+  });
+
+  it('leaning 6 or 10 cm in or back moves the gaze at most 0.45 lines (0.6–2.3 with head position as features)', () => {
+    for (const world of ['W1', 'W3'] as const) {
+      for (const tz of [-66, -54, -50]) {
+        const now = shift([...GAZE_EXCLUDED_FEATURES], world, { tz });
+        const before = shift(withHeadPosition, world, { tz });
+        expect(now.dy, `${world} tz ${tz}`).toBeLessThanOrEqual(0.45);
+        expect(before.dy, `${world} tz ${tz} with head position`).toBeGreaterThan(now.dy + 0.25);
+      }
+    }
+  });
+
+  it('sitting 3 cm to one side moves the gaze at most 0.4 lines (0.8+ with head position as features)', () => {
+    for (const world of ['W1', 'W3'] as const) {
+      const now = shift([...GAZE_EXCLUDED_FEATURES], world, { tx: 3 });
+      const before = shift(withHeadPosition, world, { tx: 3 });
+      expect(now.dy, world).toBeLessThanOrEqual(0.4);
+      expect(before.dy, `${world} with head position`).toBeGreaterThan(now.dy + 0.3);
+    }
   });
 
   it('a 4° chin drop after calibration moves the gaze at most 1.35 lines (1.6+ with yaw/pitch as features)', () => {

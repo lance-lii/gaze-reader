@@ -13,27 +13,32 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+# Actions are pinned to the commit their major tag pointed to when this was written: a tag can be
+# moved, and the deploy job runs with pages: write and an identity token. To update one, look up the
+# new commit (git ls-remote --tags https://github.com/actions/<name>) and change hash and comment together.
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # Dependencies with a published advisory fail the build (production ones; dev tooling is checked by hand).
+      - run: npm audit --omit=dev
       # prebuild copies the MediaPipe WASM runtime into public/ so it is served from our own origin.
       - run: npm run build
       # The Chrome extension shares most of its code with the app; make sure it still packages.
       - run: npm run build:ext
       # The claude.ai Artifact build must keep passing its CSP and size checks.
       - run: npm run build:artifact
-      - uses: actions/configure-pages@v6
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
         if: github.event_name != 'pull_request'
-      - uses: actions/upload-pages-artifact@v5
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         if: github.event_name != 'pull_request'
         with:
           path: dist
@@ -50,4 +55,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

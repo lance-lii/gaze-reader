@@ -163,7 +163,8 @@ export function replayRecording(rec: DiagnosticsRecording, opts: ReplayOptions =
         tracker.afterPageTurn(e.line);
         return;
       case 'scrolled':
-        pageEnd.notifyScrolled(e.t);
+        if (e.undone) pageEnd.notifyUndone(e.t);
+        else pageEnd.notifyScrolled(e.t, e.resumeBottom);
         return;
       case 'page-end-reset':
         pageEnd.reset();

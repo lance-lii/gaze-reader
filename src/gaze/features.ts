@@ -207,6 +207,21 @@ const BLINK_LEFT_KEY = normalizeBlendshapeName('eyeBlinkLeft');
 const BLINK_RIGHT_KEY = normalizeBlendshapeName('eyeBlinkRight');
 const SQUINT_KEYS = ['eyeSquintLeft', 'eyeSquintRight'].map(normalizeBlendshapeName);
 
+const BROW_KEYS = ['browInnerUp', 'browOuterUpLeft', 'browOuterUpRight'].map(normalizeBlendshapeName);
+
+/** Mean of the eyebrow-raise scores that are present; undefined when none is. */
+function browRaiseScore(scores: Map<string, number> | null): number | undefined {
+  let sum = 0;
+  let count = 0;
+  for (const key of BROW_KEYS) {
+    const v = scores?.get(key);
+    if (v === undefined) continue;
+    sum += v;
+    count++;
+  }
+  return count > 0 ? sum / count : undefined;
+}
+
 /** Mean of the eyeSquint scores that are present; 0 when neither is. */
 function squintScore(scores: Map<string, number> | null): number {
   let sum = 0;
@@ -319,6 +334,7 @@ export function extractEyeFeatures(
   for (const x of vector) if (!Number.isFinite(x)) return null;
 
   const faceCenter: Point = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+  const browRaise = browRaiseScore(scores);
   return {
     vector,
     headPose: pose,
@@ -327,6 +343,7 @@ export function extractEyeFeatures(
     faceScale,
     faceCenter,
     squint: squintScore(scores),
+    ...(browRaise !== undefined ? { browRaise } : {}),
   };
 }
 

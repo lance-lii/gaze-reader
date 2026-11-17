@@ -1,6 +1,6 @@
 # Privacy policy
 
-*Gaze Reader web app and Gaze Reader browser extension. Last updated: 25 September 2026.*
+*Gaze Reader web app and Gaze Reader browser extension. Last updated: 16 November 2026.*
 
 Gaze Reader is built so that nothing about you leaves your computer. There is no account, no
 server of ours that receives your data, no analytics, no telemetry, no ads and no remote logging.
@@ -20,6 +20,10 @@ requests they make.
   running as WebAssembly. From each frame it computes face landmarks and a few numbers about your
   eyes (where each iris sits, how open the lids are, head angle). Those numbers are turned into an
   estimate of where you're looking, and then thrown away.
+- If you switch on **head gestures** (web app, off by default), the same numbers are also watched
+  for a quick turn of your head or raised eyebrows: the head angle already computed for every
+  frame, and the face tracker's eyebrow score. Nothing more is measured, and they are thrown away
+  like the rest.
 - A few times a second Gaze Reader also measures the **lighting** in the same frame, so it can
   suggest better light and notice when the light has changed since you calibrated (a lamp
   switched on makes most people squint a little, which can throw the tracking off). It reads
@@ -42,14 +46,20 @@ requests they make.
 **Web app** (in your browser's storage for the site, on your computer):
 
 - your library: books you open or paste, their text and your reading positions (IndexedDB);
-- your settings and your calibration (`localStorage`). A calibration is a small set of numbers
-  that map eye measurements to screen positions. It also keeps a short summary of the
-  conditions while you calibrated: a few lighting ratios (such as the whites of your eyes
+- for PDFs you open from a file, the file itself and where the lines are on its pages (IndexedDB,
+  a database named `gazeReaderPdf`), so the app can show the PDF's own pages. It is removed when
+  you remove the book. Which view you last chose for a PDF is kept with your settings;
+- your settings and your calibration (`localStorage`), together with a few small markers: that
+  you have seen the introduction, when the "please calibrate once more" note was shown, which view
+  you chose for each PDF, and that the pages view was pointed out for it. A calibration is a small
+  set of numbers that map eye measurements to screen positions. It also keeps a short summary of
+  the conditions while you calibrated: a few lighting ratios (such as the whites of your eyes
   against the background, or one side of your face against the other) and how open your eyes
-  were, so the app can tell later when the light has changed. The summary uses ratios only,
-  not how light or dark your skin is. It contains no images. With it the app keeps which camera
-  you calibrated with, as the browser's own id for it (a random code that differs from site to
-  site and changes when you clear the site's data), so it can tell when you read through another one.
+  were, so the app can tell later when the light has changed. The summary is made of ratios and
+  one brightness level of the whites of your eyes, not how light or dark your skin is. It contains
+  no images. With it the app keeps which camera you calibrated with, as the browser's own id for
+  it (a random code that differs from site to site and changes when you clear the site's data), so
+  it can tell when you read through another one.
 
 **Extension** (in `chrome.storage.local`, on your computer):
 
@@ -79,7 +89,9 @@ start it, and a chip in the top bar shows while it records.
   your skin tone), where the lines of text are and when pages turn, your settings and
   calibration, and your browser, screen and camera settings, including the camera's name as your
   computer reports it (usually its model, for example "Integrated Webcam (0bda:5634)").
-- **What is not:** video, images, the book's text or its title.
+- **What is not:** video, images, the book's text or its title. (The positions of the lines on
+  screen are recorded, with how many characters each has: no words, but someone who has the same
+  text could tell from line lengths that it was the one on your screen.)
 - **Where it goes:** it stays in memory until you press **Stop and download**, which saves a JSON
   file on your computer. It is never uploaded. It reaches the developers only if you send them
   the file yourself.
@@ -91,12 +103,14 @@ of its stored data).
 
 ## Network requests
 
-- **The face-tracking model.** When you first use eye tracking, the app or extension downloads the
-  model file (`face_landmarker.task`, about 3.6 MB) from Google's model storage at
-  `https://storage.googleapis.com/mediapipe-models/…`. It is a plain file download: no data about
-  you is sent with it, and your browser caches it afterwards. Like any web request, it reveals your
-  IP address to Google, and Google's own privacy policy applies to that request. The rest of
-  MediaPipe (its WebAssembly runtime) ships with the app and the extension.
+- **The face-tracking model.** The model file (`face_landmarker.task`, about 3.8 MB) ships with the
+  app and with the extension, like the rest of MediaPipe (its WebAssembly runtime): the hosted app
+  loads it from its own address a few seconds after the page opens (when the webcam is the chosen
+  way to read), and the extension from its own package. Using the webcam makes no request to
+  Google or anyone else. Only a copy of the app that was built without the model (a developer's
+  local server started offline) fetches it from Google's model storage at
+  `https://storage.googleapis.com/mediapipe-models/…` instead; that request carries no data about
+  you beyond what any web request does (your IP address, and the address of the page it came from).
 - **Books you ask for.** If you open a book from a web address in the app, your browser downloads
   it directly from that address. Nothing goes through us.
 - **The app itself.** The hosted app at <https://lance-lii.github.io/gaze-reader/> is served by
@@ -105,8 +119,11 @@ of its stored data).
   installed on your computer and loads nothing from GitHub.
 
 There are no other network requests: no analytics, crash reporting, fonts or ads from third
-parties. MediaPipe has built-in usage logging that would report timing and version data to
-Google (`odml.pa.googleapis.com`); Gaze Reader blocks those requests before they are sent.
+parties. The hosted app also declares this to the browser (a content security policy): scripts
+run only from the app's own files, so a book or web page you open can't bring code of its own.
+MediaPipe has built-in usage logging that would report timing and version data to Google
+(`odml.pa.googleapis.com`); Gaze Reader blocks those requests before they are sent, and the
+extension's own pages are not allowed to contact any server at all.
 
 The hosted app shares its web origin (`https://lance-lii.github.io`) with the account's other
 GitHub Pages sites, and browsers scope storage and camera permission per origin. See the Privacy

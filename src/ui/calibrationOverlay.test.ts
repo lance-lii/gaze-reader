@@ -8,6 +8,7 @@ import { accuracyCheckView } from '../app/logic';
 import {
   CHECK_TARGETS,
   CalibrationOverlay,
+  DEFAULT_CALIBRATION_TIMING,
   DEFAULT_POSITION_THRESHOLDS,
   QUICK_TARGETS,
   STANDARD_TARGETS,
@@ -140,6 +141,8 @@ interface Reader {
   squint: number | undefined;
   /** Page zoom relative to the calibration: the eyes look at CSS px / zoom in calibration-time px. */
   zoom: number;
+  /** Reads a notice (toast) for as long as it is on screen, at the top of the window, instead of following the dot. */
+  readsNotices: boolean;
   pointIndex: number;
   attempt: number;
 }
@@ -157,6 +160,7 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
     lighting: null,
     squint: undefined,
     zoom: 1,
+    readsNotices: false,
     pointIndex: -1,
     attempt: 0,
   };
@@ -174,6 +178,7 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
     if ((phase === 'targets' || phase === 'validating') && target?.dataset.x && target.dataset.y) {
       gaze = { x: Number(target.dataset.x), y: Number(target.dataset.y) };
     }
+    if (reader.readsNotices && scope.querySelector('.gr-cal-toast.is-on')) gaze = { x: VW / 2, y: 30 };
     if (!reader.faceFound) {
       src.push({ t: performance.now(), faceFound: false, features: null, quality: 0 });
       return;
@@ -538,6 +543,66 @@ describe('CalibrationOverlay — standard flow', () => {
     q<HTMLButtonElement>('.gr-cal-pause [data-action="cancel"]').click();
     await expect(done).resolves.toBeNull();
     expect(events.at(-1)).toEqual({ phase: 'cancelled' });
+    ctx.sim.stop();
+  });
+
+  it('waits for the "once more" notice to clear before the repeated dot counts', async () => {
+    // A reader who reads the notice looks at it, not at the dot. Without the wait the repeated dot
+    // collected most of its samples meanwhile, and the calibration learned that spot wrong.
+    const run = async (noticeMs: number): Promise<number> => {
+      const ctx = setup({ timing: { noticeMs } });
+      ctx.sim.reader.readsNotices = true;
+      ctx.sim.reader.closeEyes = (index, attempt) => (index === 2 || index === 7) && attempt === 0;
+      const done = ctx.overlay.run();
+      await startCalibration(ctx);
+      await advanceUntil(() => ctx.root.dataset.phase === 'results', 120_000, 250);
+      expect(ctx.events.filter((e) => e.phase === 'point' && e.message === 'retry')).toHaveLength(2);
+      ctx.q<HTMLButtonElement>('[data-action="use"]').click();
+      const result = await done;
+      ctx.sim.stop();
+      ctx.host.remove();
+      return result!.report.meanErrorPx;
+    };
+    const waited = await run(DEFAULT_CALIBRATION_TIMING.noticeMs);
+    const rushed = await run(0);
+    expect(DEFAULT_CALIBRATION_TIMING.noticeMs).toBeGreaterThanOrEqual(1800); // as long as the notice is shown
+    expect(waited).toBeLessThan(25);
+    expect(rushed).toBeGreaterThan(waited * 1.5);
+  });
+
+  it('pauses when the tab is hidden mid-run, instead of skipping dots it can’t see (regression: trained on 9 of 13, silently)', async () => {
+    const ctx = setup();
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(ctx.root.dataset.paused).toBeUndefined();
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(ctx.root.dataset.paused).toBe('user');
+    const index = ctx.events.at(-1)?.index;
+    await vi.advanceTimersByTimeAsync(30_000); // away for half a minute: nothing moves on
+    expect(ctx.events.filter((e) => e.phase === 'point' && e.message === 'retry')).toHaveLength(0);
+    expect(ctx.events.at(-1)?.index).toBe(index);
+    Reflect.deleteProperty(document, 'visibilityState');
+    ctx.q<HTMLButtonElement>('.gr-cal-pause [data-action="continue"]').click();
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 120_000, 250);
+    ctx.q<HTMLButtonElement>('[data-action="use"]').click();
+    expect((await done)?.report.quality).toBe('excellent');
+    ctx.sim.stop();
+  });
+
+  it('can be told which key presses are real (the extension: a page must not cancel a calibration with a fake Escape)', async () => {
+    const ctx = setup({ isTrustedKey: (e) => (e as KeyboardEvent & { real?: boolean }).real === true });
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await vi.advanceTimersByTimeAsync(1500);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+    expect(ctx.root.dataset.paused).toBeUndefined();
+    expect(ctx.events.at(-1)?.phase).not.toBe('cancelled');
+    const real = Object.assign(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }), { real: true });
+    window.dispatchEvent(real);
+    await expect(done).resolves.toBeNull();
     ctx.sim.stop();
   });
 

@@ -13,7 +13,7 @@ brings the same page turning (and Dewey) to articles and online books on any web
 - **Web app: <https://lance-lii.github.io/gaze-reader/>.** Nothing to install. The site is served
   over HTTPS, so the webcam works there in a recent Chrome, Edge, Firefox or Safari. The first run
   asks how you'd like to read: **webcam**, **mouse** or **demo**. With the webcam, the browser asks
-  for camera access and the app downloads the face model (about 3.6 MB) once. Without one, pick
+  for camera access and the app loads its face model (about 3.8 MB) once. Without one, pick
   **Demo** and watch a simulated reader turn the pages, or **Mouse** and point at the line you're
   reading. For private documents, read the note on the shared origin under [Privacy](#privacy).
 - **claude.ai Artifact preview.** The same reader, built to run inside a claude.ai Artifact
@@ -37,12 +37,21 @@ What's new in each release is in [CHANGELOG.md](CHANGELOG.md).
   follows the structure of reading instead of trusting raw coordinates. It groups gaze into
   fixations, tracks which line you're on with a hidden Markov model, spots return sweeps to the
   next line, and learns your vertical drift as you read.
+- **Copes with leaning in and sitting back.** The tracker measures how far you are from the screen
+  from the size of your face in the camera image and rescales your gaze to match, so moving nearer
+  or further after calibrating no longer shifts the reading position.
 - **Copes with changing light.** Turning on a lamp or reading as the sun goes down no longer throws
   the page turns off: the tracker reads your gaze from the iris rather than your eyelids, the reading
   model re-learns the offset by itself, and **A** checks the accuracy in about 10 seconds. See
   [Lighting](#lighting).
 - **You stay in control.** Choose from three sensitivity presets. You can also look below the page
   to turn it, press **U** to undo a turn, press **P** to pause, or page with the keyboard as usual.
+- **PDFs as they are.** A PDF opens as plain text set like a book, which the eye tracker follows
+  best. Press **V** and it shows its original pages instead, with figures, equations and layout,
+  and the tracker follows the lines on those pages. See [PDFs](#pdfs).
+- **Head gestures.** With the webcam on, a quick turn of your head pages forward or back and
+  raised eyebrows pause, for when you want to steer without reaching for a key. Off until you
+  switch it on. See [Head gestures](#head-gestures).
 - **Dewey.** An animated nerd with round glasses whose pupils follow your gaze. He flips his tiny
   book on every page turn, coaches you through calibration, cheers at 25/50/75 % and at the end,
   and reminds you to rest your eyes (20-20-20). He's chatty, quiet or hidden, whichever you like.
@@ -71,9 +80,10 @@ Open <http://localhost:5173>. The first run walks you through a short intro and 
 like to read: **webcam**, **mouse** or **demo**.
 
 `npm run dev` first copies the MediaPipe WASM runtime from `node_modules` into
-`public/mediapipe/wasm/`, so it's served from your own origin. The face model (about 3.6 MB) is
-downloaded from Google's model storage and cached by the browser, but the web app has no offline
-mode: the webcam needs a connection the first time it starts in a tab.
+`public/mediapipe/wasm/`, and downloads the face model (about 3.8 MB) once into
+`public/mediapipe/models/`, checking it against a pinned hash, so both are served from your own
+origin and the webcam needs no connection to anyone else. (Started offline before the model was
+ever fetched, the dev server still works: the app then gets the model from Google's storage.)
 
 Browsers only allow camera access in a secure context. `localhost` counts as one. To use another
 device on your network, serve the app over HTTPS.
@@ -136,6 +146,7 @@ In the app (shortcuts are ignored while you're typing in a field):
 | P | Pause or resume auto-scroll |
 | C | Recalibrate the camera |
 | A | Check tracking accuracy (a few dots; correct it on the spot if it's off) |
+| V | PDFs: switch between the original pages and plain text |
 | D | Show or hide the debug overlay |
 | G | Show or hide the gaze dot |
 | S | Settings |
@@ -148,6 +159,54 @@ shortcuts. For example, Alt+Shift+P pauses, Alt+Shift+↓/↑ turns pages, Alt+S
 Alt+Shift+C recalibrates, Alt+Shift+H lists all of them, and Alt+Shift+X turns Gaze Reader off.
 Alt+Shift+G turns it on or off from anywhere; you can change this shortcut at
 `chrome://extensions/shortcuts`.
+
+## PDFs
+
+A PDF opens as **text**: its words are extracted and set as a book in your own typeface and size.
+That is the view the eye tracker follows best, because the lines are large and evenly spaced.
+
+Press **V** (or the pages button in the top bar) for the **pages** view: the PDF's own pages, one
+below the other, with their figures, equations, tables and layout. Press it again to go back; you
+keep your place, and the choice is remembered for that book.
+
+- **Page turns work on the pages too.** Each line of a page is measured where it is drawn, so the
+  reading model follows them like any text: finish the last line on screen and the page scrolls on,
+  keeping your last lines at the top.
+- **Smaller lines are harder to follow.** A page fitted to the window has lines about half as tall
+  as the text view's, and a webcam is accurate to a line or two of the text view at best. Expect
+  the "Unsure of your line" state more often; resting your eyes at the bottom right of the text,
+  or a glance below the page, still turns it. A wider window makes the pages, and their lines,
+  larger.
+- **Two-column pages and pages without text** (scans, full-page figures) can't be followed line by
+  line. They are marked in their corner, and you turn them with Space or a head gesture. A PDF
+  that is nothing but scans has no text to open at all yet.
+- **The original file is kept on this device** for the pages view (in the browser's storage, up
+  to 64 MB per PDF), and is removed when you remove the book. See [PRIVACY.md](PRIVACY.md).
+- PDFs added before this version have no original kept: open the file again to get their pages.
+  The Artifact build shows PDFs as text only.
+
+## Head gestures
+
+Switch them on in Settings → Page turning → **Head gestures**. They use the webcam and the face
+tracker that is already running for your eyes: no second model, nothing more is measured or stored.
+
+| Gesture | What it does |
+|---|---|
+| Turn your head quickly to your right, and back | Next page |
+| Turn your head quickly to your left, and back | Previous page |
+| Raise your eyebrows and hold them for a moment | Pause or resume automatic page turning |
+
+A short message says what was understood each time. A gesture is a movement that is quick, mostly
+sideways, and comes straight back (within a second), about 12° or more; keep your eyes on the page
+as you make it. Looking away at something, nodding, tilting or shaking your head, leaning, settling
+into a new posture, and another person's face passing through the picture don't count, and
+nothing happens while Settings or Help is open. The page turns about a sixth of a second after
+your head is back, which is how a turn is told from the start of a head shake.
+
+Gestures have been tested on simulated head movement only (no false gesture in 4.5 simulated hours
+of reading, fidgeting and looking around), not yet on recordings of real people: if one fires when
+you didn't mean it, or doesn't when you did, switch them off and please say so. The Chrome
+extension doesn't have them yet.
 
 ## Lighting
 
@@ -212,13 +271,17 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
 
 1. **Eye features.** For each video frame, the app measures where the centre of each iris (the
    mean of MediaPipe's five iris points) sits relative to the eye corners. It adds head tilt and
-   position and the model's "look up/down/in/out" blendshape scores. Head turns need no extra
-   input: the iris-to-corner measure already includes them. Lid aperture and blink scores are still
+   position and the model's "look up/down/in/out" blendshape scores. Head pose is measured too but
+   isn't a gaze input: the iris-to-corner measure already includes where the head points, and the
+   distance from the screen is applied in step 2. Lid aperture and blink scores are still
    measured, for blink detection and to notice squinting, but the gaze model ignores them: light
    moves the lids. Blinks, and frames where the eyes are closed, are dropped.
 2. **Calibration** fits a ridge regression from those features to screen coordinates, with a few
    quadratic terms for the strongest features. The regularisation strength is chosen by
-   leave-one-target-out cross-validation. Gaze is then smoothed with a One Euro filter.
+   leave-one-target-out cross-validation. The prediction is then scaled about the camera by how
+   much nearer or further you sit than when you calibrated (the eye features measure an angle, and
+   the same angle reaches further across the screen from further away), and smoothed with a One
+   Euro filter.
 3. **Fixations.** A dispersion-based detector groups the smoothed gaze into fixations (pauses of
    roughly 80–600 ms).
 4. **Which line?** The reader view measures every visible line of text. A hidden Markov model
@@ -254,8 +317,9 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
    detector waits for your eyes to come back up the page, so a resting gaze or mouse can't page
    through the book on its own.
 6. **Scrolling** puts the next unread line near the top (keeping 2 lines of context by default)
-   with an eased animation, or instantly if you prefer reduced motion. Scrolling or pressing a key
-   during the animation cancels it.
+   with an eased animation, or instantly if you prefer reduced motion. Scrolling (wheel, touch or
+   the scrollbar) or pressing a navigation key (arrows, Page Up/Down, Home, End, Space) during
+   the animation cancels it.
 
 ## Privacy
 
@@ -273,9 +337,12 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
   documents, run it locally (`npm run dev` / `npm run preview`) or host it on its own origin, and
   prefer "Allow this time" for the camera on the hosted demo. Forks deployed to
   `<you>.github.io` have the same property.
-- There are no analytics, no telemetry and no remote logging. The only network requests are the
-  face-landmark model file and any book URL you ask the reader to open. MediaPipe's built-in
-  usage logging to Google (`odml.pa.googleapis.com`) is blocked before it can send anything.
+- There are no analytics, no telemetry and no remote logging. The face model and the MediaPipe
+  runtime ship with the app, so the only requests to other servers are for a book URL you ask the
+  reader to open. MediaPipe's built-in usage logging to Google (`odml.pa.googleapis.com`) is
+  blocked before it can send anything, and a test fails if an upgrade of the library would reach
+  the network any other way. The built app carries a content security policy: only its own
+  scripts run.
 
 ## Chrome extension
 
@@ -332,12 +399,13 @@ CDNs, no network URLs in `fetch()`, no leftover chunks, under 16 MB) and fails o
 index.html, src/main.ts     App entry
 src/types.ts                Shared contracts between modules
 src/core/                   Event bus, settings store, storage, constants
-src/gaze/                   Camera, MediaPipe face tracker, eye features, head pose,
+src/gaze/                   Camera, MediaPipe face tracker, eye features, head pose, head gestures,
                             ridge regression + calibration model, webcam and mouse gaze sources
 src/signal/                 One Euro filter, fixation detector, saccade classification
 src/reading/                Line tracker (HMM) and how sure it is of the line, page-end detector,
                             simulated reader (demo + tests)
 src/reader/                 Book loading (txt/md/html/epub/pdf), sanitizer, library (IndexedDB),
+                            the PDF pages view and the store for PDF originals,
                             reader view, line measurement, scroll controller
 src/buddy/                  Dewey: avatar, behaviour, quips, styles
 src/ui/                     Calibration overlay, top bar, library, settings, help, onboarding,
@@ -384,17 +452,27 @@ docs/ARCHITECTURE.md        Module contracts and design notes
   the iris moves the iris-based gaze more than it moved 1.0's lid-based gaze. The lighting and
   eyelid thresholds were tuned on simulations and a synthetic face, not yet on many real webcams:
   diagnostics recordings (see [Lighting](#lighting)) are the way to check them.
-- **Posture drift.** Calibration assumes you sit roughly as you did while calibrating. Turning or
-  tilting your head moves the gaze about a line per 4° (in simulation), and leaning 6 cm in or
-  back about a line; the reading model learns that kind of offset as you read. The model also
-  compensates for window moves, but after a big change in posture it's best to recalibrate. The web app doesn't compensate for page zoom, fullscreen or toolbar
-  changes; it notices them and offers a quick 5-dot refresh instead (the extension compensates for
-  zoom).
+- **Posture drift.** Calibration assumes you sit roughly as you did while calibrating. Lowering or
+  raising your chin moves the gaze about a line per 4° (in simulation); the reading model learns
+  that kind of offset as you read. Leaning in or back is corrected (0.1–0.3 lines for 6–10 cm in
+  simulation, down from 1–2), but the correction assumes the camera sits just above the middle of
+  the screen you're reading on, as a laptop's or a monitor-top webcam does. With the camera
+  somewhere else (a laptop's camera while you read on a second monitor), leaning still shifts the
+  gaze, and it's best to calibrate where you'll sit. The model also compensates for window moves,
+  but after a big change in posture it's best to recalibrate. The web app doesn't compensate for
+  page zoom, fullscreen or toolbar changes; it notices them and offers a quick 5-dot refresh
+  instead (the extension compensates for zoom). A pinch-zoomed page can't be followed at all: page
+  turning waits until you pinch back out.
 - **Not validated at scale.** The page-end rules were tuned against a simulated reader with noise,
   drift, blinks and calibration bias, not against recordings of real readers. Expect to adjust
   sensitivity to taste.
-- **Books.** Images are dropped, since only text is rendered. PDFs need selectable text (there's
-  no OCR), and PDFs using CJK/CID fonts may extract poorly. DRM-protected EPUBs can't be opened.
+- **Books.** Images are dropped in the text view, since only text is rendered (a PDF's pages view
+  shows them). PDFs need selectable text (there's no OCR), and PDFs using CJK/CID fonts may extract
+  poorly; in the pages view, a PDF that doesn't embed its fonts is drawn in substitutes, two-column
+  and scanned pages aren't followed line by line, and the smaller lines are tracked less surely
+  than the text view's. DRM-protected EPUBs can't be opened, and the parts of an EPUB its
+  publisher marks as outside the reading order (`linear="no"`: some footnote and answer pages)
+  are left out. Text, Markdown and web pages over 32 MB aren't opened.
 - **Extension.** It needs Chrome 116 or later. A site's main content is detected heuristically,
   so it can miss articles that single-page apps render late. Text inside frames isn't measured.
   It must be turned on again after a full page navigation. On canvas and image readers, page mode

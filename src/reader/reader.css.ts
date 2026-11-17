@@ -232,4 +232,85 @@ export const READER_CSS = /* css */ `
   .gr-reader-content p + p { text-indent: 1.1em; }
   .gr-reader-content .gr-chapter-start { margin-top: 2.6em; }
 }
+
+/* ── The pages view: a PDF's own pages, each a picture with its lines of text laid over it ── */
+.gr-reader[data-view="pages"] .gr-reader-content {
+  max-width: min(100%, 68rem);
+  padding-inline: clamp(0.5rem, 2vw, 1.5rem);
+  font-size: 1rem;
+  line-height: 1.4;
+}
+.gr-pdf-page {
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0 auto 1rem;
+  overflow: hidden;
+  container-type: inline-size;
+  background: #fff;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px var(--gr-r-border), 0 2px 10px color-mix(in srgb, var(--gr-r-fg) 10%, transparent);
+}
+.gr-pdf-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.gr-pdf-text {
+  position: absolute;
+  inset: 0;
+}
+/* One element per line of the page, where the line is drawn. The text is there to be measured,
+   selected and read out, not seen: transparent (never opacity or visibility, which would hide it
+   from the line measurement too). */
+.gr-pdf-line {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  overflow: visible;
+  white-space: pre;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: calc(var(--gr-pdf-size, 0.02) * 100cqw);
+  line-height: 1;
+  color: transparent;
+  transform-origin: 0 0;
+  transform: scaleX(var(--gr-pdf-stretch, 1));
+  cursor: text;
+}
+.gr-pdf-line::selection {
+  color: transparent;
+  background: color-mix(in srgb, var(--gr-r-accent) 35%, transparent);
+}
+.gr-pdf-page[data-gr-untracked]::after {
+  content: attr(data-gr-untracked);
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font: 500 0.72rem/1.4 system-ui, sans-serif;
+  color: #fff;
+  background: rgba(40, 40, 46, 0.72);
+  pointer-events: none;
+}
+/* A white page in a dark room: turn the picture down rather than repaint the document. */
+:root[data-theme="dark"] .gr-pdf-canvas {
+  filter: invert(0.9) hue-rotate(180deg);
+}
+:root[data-theme="dark"] .gr-pdf-page {
+  background: #1a1a1a;
+}
+:root[data-theme="sepia"] .gr-pdf-canvas {
+  filter: sepia(0.28) brightness(0.97);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .gr-pdf-canvas {
+    filter: invert(0.9) hue-rotate(180deg);
+  }
+  :root:not([data-theme]) .gr-pdf-page {
+    background: #1a1a1a;
+  }
+}
 `;

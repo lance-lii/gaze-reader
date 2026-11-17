@@ -421,6 +421,32 @@ describe('measureLines', () => {
     }
   });
 
+  it('still finds the lines on screen when a child is positioned out of the flow (regression: the search went the wrong way)', () => {
+    // 60 paragraphs of 2 lines; the reader has scrolled so that paragraphs 10–19 are on screen.
+    // Wherever the search's probes land, a child drawn away from its place in the list must not
+    // send it past the lines on screen.
+    for (let pinnedAt = 20; pinnedAt <= 46; pinnedAt += 2) {
+      document.body.replaceChildren();
+      const el = root(-600, 3600);
+      for (let i = 0; i < 60; i++) {
+        if (i === pinnedAt) {
+          // A toolbar the page pins to the top of the article: late in the list, drawn at the top.
+          const bar = document.createElement('div');
+          const node = document.createTextNode('share · print');
+          bar.appendChild(node);
+          el.appendChild(bar);
+          elementRects.set(bar, rect(COL_LEFT, -600, COL_W, 30));
+          textLayout.set(node, () => [rect(COL_LEFT, -595, 120, LINE_H)]);
+        }
+        para(el, -600 + i * 60, 2);
+      }
+      const layout = measure(el, { marginPx: 0 });
+      const tops = layout.lines.map((l) => l.top).filter((t) => t >= 0 && t < 600);
+      expect(tops, `toolbar at ${pinnedAt}`).toHaveLength(20);
+      expect(Math.min(...tops), `toolbar at ${pinnedAt}`).toBe(5);
+    }
+  });
+
   it('windows a huge text node (a whole book in one <pre>) instead of measuring all of it', () => {
     const CHARS_PER_LINE = 80;
     const TOTAL_LINES = 800;
