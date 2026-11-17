@@ -185,7 +185,16 @@ export interface CalibrationTiming {
   startAnywayMs: number;
   /** Minimum time the "learning" screen stays up (it reads as work, not a glitch). */
   minTrainingMs: number;
+  /**
+   * After a "once more" or "the dots start over" notice, the next dot waits this long (the notice
+   * is on screen for as long). Someone reading the notice is looking at it, half a screen from the
+   * dot, and without the wait most of the dot's samples were collected meanwhile.
+   */
+  noticeMs: number;
 }
+
+/** How long a notice (toast) stays on screen, ms. */
+const NOTICE_MS = 1800;
 
 export const DEFAULT_CALIBRATION_TIMING: Readonly<CalibrationTiming> = Object.freeze({
   appearMs: 500,
@@ -200,6 +209,7 @@ export const DEFAULT_CALIBRATION_TIMING: Readonly<CalibrationTiming> = Object.fr
   readyHoldMs: 500,
   startAnywayMs: 8000,
   minTrainingMs: 700,
+  noticeMs: NOTICE_MS,
 });
 
 /** Target positions as fractions of the viewport. */
@@ -788,8 +798,10 @@ export class CalibrationOverlay implements Mountable {
     let restart = false;
     for (;;) {
       this.runMode = mode;
-      if (restart) this.showToast('The window changed, so the dots start over.');
-      else await this.positioning(signal, mode);
+      if (restart) {
+        this.showToast('The window changed, so the dots start over.');
+        await this.sleep(this.timing.noticeMs, signal); // read it first, then follow the dots
+      } else await this.positioning(signal, mode);
       restart = false;
       // The saved model can't read today's features: only a full calibration helps.
       if (mode !== 'standard' && base && this.lastFeatureLength !== null && this.lastFeatureLength !== base.featureLength) {
@@ -1069,6 +1081,11 @@ export class CalibrationOverlay implements Mountable {
           if (announce) {
             this.emit({ phase: kind, index, total, ...(attempts > 0 ? { message: 'retry' } : {}) });
             announce = false;
+            if (attempts > 0) {
+              // The "once more" notice is up: let the reader finish it before the dot counts again.
+              await this.sleep(this.timing.noticeMs, signal);
+              continue; // paused or resized meanwhile? check again, then show the dot
+            }
           }
           const got = await this.presentTarget(fractions[index], appear, signal);
           appear = false;
@@ -1748,7 +1765,7 @@ export class CalibrationOverlay implements Mountable {
     this.toastTimer = setTimeout(() => {
       this.toastTimer = null;
       this.dom?.toast.classList.remove('is-on');
-    }, 1800);
+    }, NOTICE_MS);
   }
 
   // ──────────────────────────────── Results ──────────────────────────────────
