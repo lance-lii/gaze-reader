@@ -449,7 +449,12 @@ export class AppController {
     this.readerScreen = document.createElement('div');
     this.readerScreen.className = 'gr-reader-screen';
     this.readerScreen.hidden = true;
-    this.topbar = new Topbar({ bus: this.bus, getSettings, onSelectSource: (kind) => this.selectSource(kind) });
+    this.topbar = new Topbar({
+      bus: this.bus,
+      getSettings,
+      onSelectSource: (kind) => this.selectSource(kind),
+      onExplainStatus: (text) => this.toasts.show({ id: 'status', message: text, durationMs: 6000 }),
+    });
     this.topbar.mount(this.readerScreen);
     const stage = document.createElement('div');
     stage.className = 'gr-reader-stage';
@@ -1616,6 +1621,7 @@ export class AppController {
       () => {
         this.scrollSettling = false;
         if (!this.session) return;
+        this.scroll?.noteManualScroll(this.reader.scroller.scrollTop);
         this.measure('scroll');
         this.resetFixations(false);
         this.scheduleSavePosition();

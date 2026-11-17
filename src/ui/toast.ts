@@ -157,9 +157,20 @@ export class Toaster implements Mountable {
     this.resume(id, entry);
 
     while (this.entries.size > MAX_VISIBLE) {
-      const oldest = this.entries.keys().next().value;
-      if (oldest === undefined) break;
-      this.dismiss(oldest);
+      // The oldest goes, but one that waits for the reader (it stays until dismissed: an error to
+      // read, a choice to make) only when nothing else can: a fourth passing message used to push
+      // the question off the screen.
+      let evict: string | undefined;
+      for (const [key, e] of this.entries) {
+        if (key === id) continue;
+        if (!e.sticky) {
+          evict = key;
+          break;
+        }
+        evict ??= key;
+      }
+      if (evict === undefined) break;
+      this.dismiss(evict);
     }
     return id;
   }

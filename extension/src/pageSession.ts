@@ -732,6 +732,7 @@ export class PageSession {
 
   private onScrollSettled(): void {
     this.scrollSettling = false;
+    if (this.scroller) this.scroll?.noteManualScroll(scrollMetrics(this.scroller).scrollTop);
     this.remeasure('scroll');
     this.fixations.reset();
     if (this.scroll && !this.scroll.atEnd()) this.endAnnounced = false;

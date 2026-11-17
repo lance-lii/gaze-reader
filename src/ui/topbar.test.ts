@@ -55,6 +55,21 @@ describe('Topbar', () => {
     bar.destroy();
   });
 
+  it('a tap on the status pill says what it means (on a narrow screen it is only a coloured dot)', () => {
+    const bus = createEventBus();
+    const said: string[] = [];
+    const bar = new Topbar({ bus, getSettings: () => ({ ...DEFAULT_SETTINGS }), onSelectSource: () => undefined, onExplainStatus: (t) => said.push(t) });
+    bar.mount(document.body);
+    bar.setStatus({ state: 'unsure', kind: 'webcam', cameraOn: true });
+    bar.el.querySelector<HTMLElement>('.gr-pill')!.click();
+    bar.setStatus({ state: 'no-face', kind: 'webcam', cameraOn: true });
+    bar.el.querySelector<HTMLElement>('.gr-pill')!.click();
+    expect(said).toHaveLength(2);
+    expect(said[0]).not.toBe(said[1]);
+    expect(said[0]!.length).toBeGreaterThan(20);
+    bar.destroy();
+  });
+
   it('re-picking the selected source still reaches the controller, so a failed webcam can be retried', () => {
     const { bar, picked } = setup({ gazeSource: 'webcam' });
     expect(radio(bar, 'webcam').checked).toBe(true);
