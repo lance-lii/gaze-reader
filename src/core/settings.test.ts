@@ -20,6 +20,10 @@ describe('sanitizeSettings', () => {
   it('fills what is missing or invalid from the defaults, or from the settings a patch is applied to', () => {
     expect(sanitizeSettings(null)).toEqual(DEFAULT_SETTINGS);
     expect(sanitizeSettings({ fontSizePx: 99, theme: 'neon', headGestures: 'yes' })).toEqual(DEFAULT_SETTINGS);
+    // The real-face model is opt-in: off by default, on only for a real `true`.
+    expect(DEFAULT_SETTINGS.realFaceModel).toBe(false);
+    expect(sanitizeSettings({ realFaceModel: 1 }).realFaceModel).toBe(false);
+    expect(sanitizeSettings({ realFaceModel: true }).realFaceModel).toBe(true);
     const mine: AppSettings = { ...DEFAULT_SETTINGS, fontSizePx: 30, theme: 'dark', headGestures: true };
     expect(sanitizeSettings({ ...mine, fontSizePx: 99 }, mine).fontSizePx).toBe(30);
     expect(sanitizeSettings({ ...mine, fontSizePx: 18 }, mine)).toEqual({ ...mine, fontSizePx: 18 });

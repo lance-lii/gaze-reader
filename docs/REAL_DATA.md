@@ -11,8 +11,12 @@ has measured the app itself with a real camera and a known gaze target.
 screen the person was looking at, the screen's size and where the camera sits.
 
 **Licence: CC BY-NC-SA 4.0.** Non-commercial use only, and anything adapted from it carries the same
-terms. This repository is MIT, so nothing derived from the pictures is committed: not the features,
-not fitted weights. Everything lives in the git-ignored `.data/`.
+terms. This repository is MIT, so the pictures and the features extracted from them are not
+committed: they live in the git-ignored `.data/`. One derived file is committed, under the
+dataset's licence and not MIT: `src/gaze/realFaceWeights.json`, the 3 kB of weights of the shared
+model below, fitted on all 15 people. It is what the app's opt-in **Real-face model** setting
+uses. Whether fitted weights are an adaptation of the data in the licence's sense is not settled;
+this repository treats them as one.
 
 ## Reproducing
 
@@ -64,7 +68,10 @@ Two protocols (`bench/realdata/protocol.ts`):
 - **Every feature**: the same with nothing excluded, as in version 1.0.
 - **Shared model**: a linear model of gaze direction fitted on the other 14 people
   (`bench/realdata/shared.ts`), whose two outputs are the only inputs of the app's own calibration
-  for the tested person. Nobody is tested on a model that saw them.
+  for the tested person. Nobody is tested on a model that saw them. This is the app's opt-in
+  Real-face model setting, run through the same code (`src/gaze/gazePrior.ts`,
+  `trainGazeModel(…, { prior })`); the weights the app ships are the same fit on all 15 people, so
+  a reader of the app is in the position of the tested person here.
 
 ## What it says
 
@@ -89,3 +96,9 @@ and a neural-network runtime in the browser.
 
 Fifteen people, all on laptops with the camera above the screen, 32 to 74 cm away, photographed
 between 2012 and 2015. No external monitors, no phones, few glasses wearers.
+
+The Real-face model setting has only been scored here, one picture at a time. It has not been
+measured in the app with a live camera, where the fixation filter, the line tracker and the
+head-movement step sit on top of it, and the simulator the regression gates use says it is worse
+than the default (`simcross.bench.test.ts`: about twice the error with the head still). That is
+why it is off by default.

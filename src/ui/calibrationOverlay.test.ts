@@ -1709,6 +1709,32 @@ describe('the head-movement step', () => {
     }
   });
 
+  it('builds the calibration on a shared gaze model when given one, head step included', async () => {
+    // A stand-in for the shipped weights, for the synthetic eye: across from e0, down from e3.
+    const prior = {
+      id: 'toy',
+      names: ['e0', 'e3'],
+      mean: [0.3, 0.5, 0, 0],
+      sd: [0.2, 1, 1, 1],
+      w: [
+        [1, 0],
+        [0, 1],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+      ],
+    };
+    const { ctx, result } = await calibrate({ nodDeg: 6, turnDeg: 7, tiltDeg: 5 }, undefined, { prior });
+    const model = asRidgeGazeModel(result!.model)!;
+    expect(model.prior?.id).toBe('toy');
+    expect(model.dominantFeatures).toEqual([]);
+    expect(ctx.events.map((e) => e.phase)).toContain('validating');
+    expect(result?.headStep).toBeDefined();
+    // The same reader without it: the calibration the app has always made.
+    const plain = await calibrate({ nodDeg: 6, turnDeg: 7, tiltDeg: 5 });
+    expect(asRidgeGazeModel(plain.result!.model)!.prior).toBeNull();
+  });
+
   it('says so and carries on when the head hardly moved, and the calibration is as good as without the step', async () => {
     const { result, note } = await calibrate({ nodDeg: 0.2, turnDeg: 0.2, tiltDeg: 0.1 });
     expect(result?.headStep).toEqual({ learned: null, reason: 'still' });

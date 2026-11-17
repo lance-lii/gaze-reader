@@ -5,6 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppEvents, AppSettings, Book, EventBus, FeatureFrame, GazeModel, LightingSignature, LineLayout, PageEndDecision, TextLine } from '../types';
+import { REAL_FACE_PRIOR } from '../gaze/gazePrior';
 import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationResult } from '../ui/calibrationOverlay';
 import { AppearanceMonitor } from '../gaze/appearance';
 import { GAZE_MODEL_KIND, GAZE_MODEL_VERSION, deserializeGazeModel } from '../gaze/calibrationModel';
@@ -41,6 +42,8 @@ vi.mock('../gaze/faceTracker', async (importOriginal) => ({
 // script its outcome (the dots themselves are the overlay's own tests).
 const overlays = vi.hoisted(() => ({
   modes: [] as (string | undefined)[],
+  /** The shared gaze model each overlay was told to build full calibrations on. */
+  priors: [] as ({ id: string } | null | undefined)[],
   run: null as ((bus: EventBus) => Promise<CalibrationResult | null>) | null,
   check: null as AccuracyCheckResult | null,
 }));
@@ -51,6 +54,7 @@ vi.mock('../ui/calibrationOverlay', async (importOriginal) => {
     constructor(opts: ConstructorParameters<typeof m.CalibrationOverlay>[0]) {
       super(opts);
       overlays.modes.push(opts.mode);
+      overlays.priors.push(opts.prior);
       this.testBus = opts.bus;
     }
     override run(): Promise<CalibrationResult | null> {
@@ -226,6 +230,7 @@ describe('AppController', () => {
     Reflect.deleteProperty(document, 'hidden');
     saved.model = null;
     overlays.modes = [];
+    overlays.priors = [];
     overlays.run = null;
     overlays.check = null;
     vi.unstubAllGlobals();
@@ -1054,6 +1059,53 @@ describe('AppController', () => {
     await until(() => camera.running() && !/A different camera/.test(toastText()), 'the offer to go');
     await sleep(100);
     expect(toastText()).not.toMatch(/A different camera/);
+  });
+
+  describe('webcam: the real-face model setting', () => {
+    const scriptCalibration = (): void => {
+      overlays.run = async (bus) => {
+        bus.emit('calibration', { phase: 'start' });
+        bus.emit('calibration', { phase: 'done', report: REPORT });
+        return { model: calibratedModel({ trainedAt: 5000 }), report: REPORT };
+      };
+    };
+
+    it('is off unless asked for: calibrations are built as before', async () => {
+      scriptCalibration();
+      await readWithWebcam(null);
+      await until(() => overlays.modes.length === 1, 'the first calibration');
+      expect(overlays.priors).toEqual([null]);
+    });
+
+    it('builds full calibrations on the shipped weights when on', async () => {
+      scriptCalibration();
+      await readWithWebcam(null, { settings: { realFaceModel: true } });
+      await until(() => overlays.modes.length === 1, 'the first calibration');
+      expect(overlays.modes).toEqual(['standard']);
+      expect(overlays.priors[0]).toBe(REAL_FACE_PRIOR);
+    });
+
+    it('says that switching it changes nothing until the next full calibration, and offers one', async () => {
+      await readWithWebcam(calibratedModel());
+      expect(overlays.modes).toEqual([]);
+      app.bus.emit('settings-patch', { realFaceModel: true });
+      expect(toastText()).toContain('The real-face model is used from your next full calibration.');
+      // Back to what the current calibration is: nothing left to say.
+      app.bus.emit('settings-patch', { realFaceModel: false });
+      expect(toastText()).not.toMatch(/real-face model/);
+
+      app.bus.emit('settings-patch', { realFaceModel: true });
+      scriptCalibration();
+      toastButton('Calibrate now')!.click();
+      await until(() => overlays.modes.length === 1, 'the calibration');
+      expect(overlays.modes).toEqual(['standard']);
+      expect(overlays.priors[0]).toBe(REAL_FACE_PRIOR);
+    });
+
+    it('says nothing in mouse mode', async () => {
+      app.bus.emit('settings-patch', { realFaceModel: true });
+      expect(toastText()).not.toMatch(/real-face model/);
+    });
   });
 
   it('webcam: a camera that stops during a recalibration the reader asked for opens it again after the restart (regression: dropped, reading went on with the old one)', async () => {

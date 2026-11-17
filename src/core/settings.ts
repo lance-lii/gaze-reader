@@ -12,6 +12,8 @@ export const DEFAULT_SETTINGS: Readonly<AppSettings> = Object.freeze({
   glanceDownToTurn: true,
   // Off until asked for: a gesture nobody meant to make turns a page.
   headGestures: false,
+  // Off until asked for: measured on photographs only, and its weights are non-commercial (CC BY-NC-SA).
+  realFaceModel: false,
 
   fontSizePx: 22,
   // Generous leading makes lines easier to tell apart for a webcam tracker.
@@ -60,6 +62,7 @@ export function sanitizeSettings(input: unknown, base: Readonly<AppSettings> = D
   pick('scrollDurationMs', num(0, 2000));
   pick('glanceDownToTurn', bool);
   pick('headGestures', bool);
+  pick('realFaceModel', bool);
   pick('fontSizePx', num(12, 40));
   pick('lineHeight', num(1.2, 3));
   pick('fontFamily', oneOf('serif', 'sans', 'mono'));

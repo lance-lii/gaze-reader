@@ -1361,6 +1361,12 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
           { value: 'simulated', label: 'Demo' },
         ],
       },
+      {
+        kind: 'toggle',
+        key: 'realFaceModel',
+        label: 'Real-face model (experimental)',
+        hint: 'Builds your calibration on a model fitted on photographs of 15 people, to hold up better when your head moves. Used from your next full calibration.',
+      },
       { kind: 'toggle', key: 'showCameraPreview', label: 'Camera preview', hint: 'A small mirrored thumbnail, only you can see it.' },
       { kind: 'toggle', key: 'showGazeDot', label: 'Gaze dot', hint: 'Show where the tracker thinks you are looking.' },
     ],

@@ -383,6 +383,13 @@ export interface AppSettings {
    * eyebrows raised and held pause or resume page turning (src/gaze/headGestures.ts).
    */
   headGestures: boolean;
+  /**
+   * Full calibrations stand on a model of gaze direction fitted on photographs of other people
+   * (src/gaze/gazePrior.ts): better when the head moves after calibrating, on those photographs.
+   * Off by default: not measured with this app's own camera pipeline. Changes nothing until the
+   * next full calibration.
+   */
+  realFaceModel: boolean;
 
   fontSizePx: number;
   lineHeight: number;

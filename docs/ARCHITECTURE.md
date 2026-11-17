@@ -276,6 +276,23 @@ returns viewport px compensated for window moves since calibration (store `windo
 train time; subtract the delta). Serialize everything needed (means, stds, weights, feature-length,
 viewport, screen offset, trainedAt, `depth`: reference face scale, camera point, feature indices; `pose`: see below). Reject deserialization when the feature length changed.
 
+**Shared gaze model** (`src/gaze/gazePrior.ts`, `TrainOptions.prior`, setting `realFaceModel`, off
+by default, web app only). A linear model fitted on photographs of other people
+(`realFaceWeights.json`: 24 named features plus the head's place in the picture, tx ÷ tz and
+ty ÷ tz, standardized, to two outputs: the direction of gaze as tangents from the camera). With a
+prior, `trainGazeModel` writes those two outputs into the vector's `tx` and `ty` slots (which the
+personal regression never reads otherwise), neutralizes every other feature and fits a plain
+ridge with no squared terms: a straight line from the shared answer to the screen. Outlier
+rejection, the blink filter, distance compensation, pose compensation, `refineGazeModel` and the
+accuracy check run on that model unchanged. The resolved prior (indices, not names) is serialized
+with the model as `prior`; a model whose saved prior fails validation is void, since its ridge
+maps mean nothing without it. A frame the prior cannot answer (no distance, a non-finite input)
+predicts `null`. The weights are fitted by `bench/realdata/shared.ts` on all 15 people of
+MPIIFaceGaze and `bench/realdata/simcross.bench.test.ts` checks the committed file against a
+fresh fit; they are CC BY-NC-SA 4.0, not MIT. Measured on those photographs only
+(`docs/REAL_DATA.md`); the simulator's faces disagree, so the regression gates say nothing for or
+against it, and `src/gaze/gazePrior.test.ts` tests the mechanism on a toy eye.
+
 **Head-pose compensation** (`PoseCompensation`, `fitPoseCompensation`, `headPose.cameraAnglesInHead`).
 The eye features measure the iris against the eye corners, and the corners sit a few millimetres
 in front of the eyeball's centre of rotation: when the head turns or moves across the camera's
