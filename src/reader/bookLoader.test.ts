@@ -20,6 +20,7 @@ import {
   tameShouting,
   textOfNode,
   titleFromFileName,
+  MAX_TEXT_BYTES,
 } from './bookLoader';
 import { mulberry32 } from '../reading/simulatedReader';
 import story from '../../public/samples/dewey-and-the-midnight-library.md?raw';
@@ -532,6 +533,18 @@ describe('plain text: lines that only look like headings', () => {
   it('without numbered chapters, capitals still open a chapter', () => {
     const b = loadBookFromText(['THE LAMP', '', para(1), '', 'THE KEEPER', '', para(2), '', 'THE STORM', '', para(3)].join('\n'), { format: 'txt' });
     expect(b.chapters.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('size limits for text', () => {
+  it('refuses a text or HTML file too large to parse in one go, with a size the reader can act on', async () => {
+    expect(MAX_TEXT_BYTES).toBeLessThanOrEqual(64 * 1024 * 1024);
+    const big = new Uint8Array(MAX_TEXT_BYTES + 1024).fill(0x61);
+    const file = new File([big], 'everything.txt', { type: 'text/plain' });
+    await expect(loadBookFromFile(file)).rejects.toMatchObject({ code: 'too-large', message: expect.stringMatching(/too much text.*32 MB/) as unknown });
+    // A long novel is nowhere near it.
+    const novel = new File(['It was a dark and stormy night, and the rain fell in torrents. '.repeat(20_000)], 'novel.txt', { type: 'text/plain' });
+    await expect(loadBookFromFile(novel)).resolves.toMatchObject({ format: 'txt' });
   });
 });
 

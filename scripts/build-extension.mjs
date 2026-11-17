@@ -12,7 +12,7 @@
 // Usage: node scripts/build-extension.mjs
 import { build } from 'vite';
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,6 +30,7 @@ const RUNTIME_FILES = [
   'mediapipe/wasm/vision_wasm_internal.wasm',
   'mediapipe/wasm/vision_wasm_nosimd_internal.js', // FilesetResolver (no SIMD)
   'mediapipe/wasm/vision_wasm_nosimd_internal.wasm',
+  'mediapipe/models/face_landmarker.task', // the offscreen tracker's model (FACE_LANDMARKER_MODEL_PATH)
 ];
 
 const shared = {
@@ -107,6 +108,14 @@ execFileSync(process.execPath, [join(root, 'scripts/copy-mediapipe-wasm.mjs'), j
   cwd: root,
   stdio: 'inherit',
 });
+// The face model ships in the package (downloaded once into public/, hash-checked): the extension
+// then makes no network request at all for tracking.
+execFileSync(process.execPath, [join(root, 'scripts/fetch-face-model.mjs'), join(root, 'public/mediapipe/models'), '--required'], {
+  cwd: root,
+  stdio: 'inherit',
+});
+mkdirSync(join(out, 'mediapipe/models'), { recursive: true });
+cpSync(join(root, 'public/mediapipe/models/face_landmarker.task'), join(out, 'mediapipe/models/face_landmarker.task'));
 
 // ──────────────────────────────── verify ─────────────────────────────────────
 
