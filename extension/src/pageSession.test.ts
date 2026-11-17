@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppEvents, AppSettings, EventBus, EventName, LayoutChangeReason } from '../../src/types';
 import { DEFAULT_SETTINGS } from '../../src/core/settings';
 import { LineTracker } from '../../src/reading/lineTracker';
+import { FixationDetector } from '../../src/signal/fixations';
 import { KEYS } from './extStorage';
 import { PORT_TAB, type HubToTab } from './messages';
 import { PagePill } from './pagePill';
@@ -286,6 +287,43 @@ describe('PageSession', () => {
     expect(top).toBeGreaterThan(firstPage + 500);
     session.destroy();
     vi.unstubAllGlobals();
+  });
+
+  it('keeps the reading model out while the reader scrolls the page, until it settles', async () => {
+    document.body.innerHTML = `<div id="app" style="overflow-y: auto"><article>${'<p>Some reading text that goes on for a while.</p>'.repeat(30)}</article></div>`;
+    const app = document.getElementById('app')!;
+    let top = 0;
+    Object.defineProperty(app, 'scrollHeight', { configurable: true, value: 6000 });
+    Object.defineProperty(app, 'clientHeight', { configurable: true, value: 800 });
+    Object.defineProperty(app, 'scrollTop', { configurable: true, get: () => top, set: (v: number) => (top = v) });
+    const t = setup({ gazeSource: 'mouse' });
+    const session = await PageSession.start(t.deps);
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      // Only the session's reading pipeline feeds the line tracker (the debug overlay has a fixation detector of its own).
+      const fed = vi.spyOn(LineTracker.prototype, 'onSample'); // calls through
+      const fresh = vi.spyOn(FixationDetector.prototype, 'reset');
+      await vi.advanceTimersByTimeAsync(300);
+      expect(fed.mock.calls.length).toBeGreaterThan(3); // gaze samples reach the reading model while the page is still
+
+      // The reader scrolls by hand for half a second (a wheel or trackpad: events keep coming).
+      fed.mockClear();
+      for (let i = 0; i < 10; i++) {
+        top += 30;
+        app.dispatchEvent(new Event('scroll'));
+        await vi.advanceTimersByTimeAsync(50);
+      }
+      // The lines are no longer where they were measured: nothing was scored against them.
+      expect(fed).not.toHaveBeenCalled();
+
+      // It settles (the lines are measured again): reading starts on a fresh fixation.
+      fresh.mockClear();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(fresh).toHaveBeenCalled();
+      expect(fed.mock.calls.length).toBeGreaterThan(3);
+    } finally {
+      session.destroy();
+    }
   });
 
   it('forgets undo history when the window width changes (the text reflows), not on height-only resizes', async () => {
