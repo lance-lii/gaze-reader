@@ -58,6 +58,7 @@ import type {
 } from '../types';
 import { readJSON, removeKey, writeJSON } from '../core/storage';
 import { FEATURE_NAMES, type FeatureName } from './features';
+import { applyGazePrior, cloneGazePrior, resolveGazePrior, sanitizeGazePrior, serializeGazePrior, type GazePrior, type GazePriorWeights } from './gazePrior';
 import { cameraAnglesInHead } from './headPose';
 import { RidgeNormalEquations, dot, ridgeFit } from './ridge';
 
@@ -325,6 +326,12 @@ export interface TrainOptions {
   poseCompensation?: boolean;
   /** Where the camera is, in viewport px (default: just above the middle of the screen's top edge). */
   camera?: Point;
+  /**
+   * A model of gaze direction shared between people (gazePrior.ts). Its two answers become the
+   * only inputs of the regression (`excludedFeatures` and `quadraticFeatures` are then ignored);
+   * the distance and head-pose corrections work as without it. Needs `featureNames`.
+   */
+  prior?: GazePriorWeights | null;
 }
 
 /** What the caller measured about the calibration conditions; the eyelid baseline is computed here. */
@@ -443,6 +450,8 @@ export interface GazeModelParams {
   depth?: DepthCompensation | null;
   /** Head-pose compensation; null/absent: none (older models). */
   pose?: PoseCompensation | null;
+  /** The shared model the ridge maps were fitted on the answers of; null/absent: none. */
+  prior?: GazePrior | null;
 }
 
 const IDENTITY: Readonly<AxisAffine> = Object.freeze({ sx: 1, ox: 0, sy: 1, oy: 0 });
@@ -471,6 +480,9 @@ export class RidgeGazeModel implements GazeModel {
   private readonly params: GazeModelParams;
   private readonly glitchCheck: readonly number[];
   // Scratch buffers: predict runs at camera rate, so avoid per-call allocation.
+  /** The shared model this calibration stands on (see gazePrior.ts), or null: the features go straight into the ridge maps. */
+  readonly prior: Readonly<GazePrior> | null;
+  private readonly priorBuf: Float64Array | null;
   private readonly zBuf: Float64Array;
   private readonly phiBuf: Float64Array;
 
@@ -490,6 +502,8 @@ export class RidgeGazeModel implements GazeModel {
     this.depthCompensation = params.depth ? Object.freeze({ ...params.depth, camera: { ...params.depth.camera } }) : null;
     this.poseCompensation = params.pose ? Object.freeze(clonePose(params.pose)) : null;
     this.poseActive = !!params.pose && (params.pose.gain.some((g) => g !== 0) || params.pose.rollGain !== 0);
+    this.prior = params.prior ? Object.freeze(cloneGazePrior(params.prior)) : null;
+    this.priorBuf = this.prior ? new Float64Array(params.featureLength) : null;
     this.zBuf = new Float64Array(params.featureLength);
     this.phiBuf = new Float64Array(params.expMean.length);
   }
@@ -554,6 +568,10 @@ export class RidgeGazeModel implements GazeModel {
   private ridgeAt(v: ArrayLike<number>): Point | null {
     const P = this.params;
     if (v.length !== P.featureLength) return null;
+    if (this.prior && this.priorBuf) {
+      if (!applyGazePrior(this.prior, v, this.priorBuf)) return null;
+      v = this.priorBuf;
+    }
     const z = this.zBuf;
     for (let j = 0; j < P.featureLength; j++) {
       const x = v[j];
@@ -777,6 +795,7 @@ export class RidgeGazeModel implements GazeModel {
       environment: this.environment ? cloneEnvironment(this.environment) : null,
       depth: this.depthCompensation ? { ...this.depthCompensation, camera: { ...this.depthCompensation.camera } } : null,
       pose: this.poseCompensation ? clonePose(this.poseCompensation) : null,
+      ...(this.prior ? { prior: serializeGazePrior(this.prior) } : {}),
     };
   }
 }
@@ -869,7 +888,10 @@ function effectiveFaceScale(v: ArrayLike<number>, scaleIndex: number, yawIndex: 
 
 interface Row {
   target: Point;
+  /** What the regression is fitted on: the feature vector, or with a prior that vector with the prior's answers in their slots. */
   x: Float64Array;
+  /** The feature vector as measured (the same array as `x` without a prior). */
+  v: Float64Array;
   key: string;
   /** The sample the row came from (for the eyelid-appearance baseline). */
   source: CalibrationSample;
@@ -896,17 +918,20 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
   if (opts.featureNames && opts.featureNames.length !== p) {
     throw new RangeError(`featureNames lists ${opts.featureNames.length} features but the vectors have ${p}.`);
   }
-  let rows = prepared.rows;
+  const prior = opts.prior ? resolveGazePrior(opts.prior, opts.featureNames) : null;
+  if (opts.prior && !prior) throw new Error('The shared gaze model does not fit this build’s eye features.');
+  let rows = prior ? rowsOnPrior(prepared.rows, prior) : prepared.rows;
   const initialGroups = groupRows(rows);
   if (initialGroups.length < MIN_TARGETS) {
     throw new Error(`Need at least ${MIN_TARGETS} calibration points with usable samples (got ${initialGroups.length}).`);
   }
   const qWanted = Math.max(0, Math.floor(opts.quadraticFeatures ?? DEFAULT_QUADRATIC_FEATURES));
   // Quadratic terms need several distinct targets to be identifiable at all.
-  const qMax = Math.min(qWanted, Math.max(0, initialGroups.length - 3));
+  // The prior's answers are already the gaze direction: a straight line to the screen, no squares.
+  const qMax = prior ? 0 : Math.min(qWanted, Math.max(0, initialGroups.length - 3));
 
   // Posture features enter linearly only (see POSTURE_FEATURES); excluded ones not at all.
-  const excluded = excludedMask(p, opts.featureNames, opts.excludedFeatures);
+  const excluded = prior ? allBut(p, prior.slots) : excludedMask(p, opts.featureNames, opts.excludedFeatures);
   const noQuad = Uint8Array.from(excluded);
   if (opts.featureNames) {
     opts.featureNames.forEach((name, j) => {
@@ -917,8 +942,10 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
   let stats = columnStats(rows, p, excluded);
   let dominant = selectDominant(rows, stats, qMax, noQuad);
   let rejected = 0;
-  if (opts.rejectOutliers !== false && dominant.length > 0) {
-    const keep = rejectOutliers(rows, initialGroups, stats, dominant);
+  // Glances away and half-blinks show in the dominant features, or in the prior's answers.
+  const outlierCheck = prior ? prior.slots : dominant;
+  if (opts.rejectOutliers !== false && outlierCheck.length > 0) {
+    const keep = rejectOutliers(rows, initialGroups, stats, outlierCheck);
     rejected = rows.length - keep.length;
     if (rejected > 0) {
       rows = keep.map((i) => rows[i]);
@@ -985,7 +1012,7 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     mean: stats.mean,
     std: stats.std,
     quad: dominant,
-    glitchCheck: glitchCheckFor(dominant, opts.featureNames),
+    glitchCheck: prior ? [...prior.slots] : glitchCheckFor(dominant, opts.featureNames),
     excluded: excludedIndices,
     expMean: exp.mean,
     expStd: exp.std,
@@ -1001,7 +1028,9 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     adjust: { ...IDENTITY },
     trainedAt,
     depth: depthCompensationFor(rows, excluded, viewport, origin, opts),
-    pose: poseReferenceFor(rows, excluded, viewport, origin, opts),
+    // With a prior the ridge maps read no feature directly, so the pose correction has nothing to double.
+    pose: poseReferenceFor(rows, prior ? new Uint8Array(p).fill(1) : excluded, viewport, origin, opts),
+    prior,
     environment: {
       lighting: sanitizeLightingSignature(opts.environment?.lighting ?? null),
       // From the samples the model was fitted on (blinks and glances away already dropped).
@@ -1327,6 +1356,9 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
       adjust = { sx: a.sx, ox: a.ox, sy: a.sy, oy: a.oy };
     }
 
+    // The ridge maps mean nothing without the prior they were fitted on: a damaged one voids the model.
+    const prior = json.prior === undefined || json.prior === null ? null : sanitizeGazePrior(json.prior, featureLength);
+    if (json.prior !== undefined && json.prior !== null && !prior) return null;
     return new RidgeGazeModel({
       featureLength,
       featureSignature: typeof sig === 'string' ? sig : null,
@@ -1352,6 +1384,7 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
       environment: sanitizeEnvironment(json.environment),
       depth: sanitizeDepth(json.depth, featureLength),
       pose: sanitizePose(json.pose, featureLength),
+      prior,
     });
   } catch {
     return null;
@@ -1470,7 +1503,7 @@ function depthCompensationFor(
   const yawIndex = names.indexOf('yaw');
   const scales: number[] = [];
   for (const r of rows) {
-    const s = effectiveFaceScale(r.x, scaleIndex, yawIndex);
+    const s = effectiveFaceScale(r.v, scaleIndex, yawIndex);
     if (s > 0) scales.push(s);
   }
   const ref = median(scales);
@@ -1497,7 +1530,7 @@ function poseReferenceFor(
   const b: number[] = [];
   const roll: number[] = [];
   for (const r of rows) {
-    const now = poseAngles(r.x, index);
+    const now = poseAngles(r.v, index);
     if (!now) continue;
     a.push(now.a);
     b.push(now.b);
@@ -1623,7 +1656,7 @@ function prepareRows(
       dropped++;
       continue;
     }
-    rows.push({ target: { x: s.target.x, y: s.target.y }, x, key: targetKey(s.target), source: s });
+    rows.push({ target: { x: s.target.x, y: s.target.y }, x, v: x, key: targetKey(s.target), source: s });
   }
   if (len <= 0) throw new Error('Calibration samples carry no features.');
   return { rows, featureLength: len, dropped };
@@ -1660,6 +1693,23 @@ function excludedMask(p: number, names: readonly string[] | undefined, excluded:
     if (j < p && set.has(name)) mask[j] = 1;
   });
   return mask;
+}
+
+/** Every feature excluded but `keep`. */
+function allBut(p: number, keep: readonly number[]): Uint8Array {
+  const mask = new Uint8Array(p).fill(1);
+  for (const j of keep) mask[j] = 0;
+  return mask;
+}
+
+/** The rows as the regression sees them with a prior; rows the prior has no answer for are dropped. */
+function rowsOnPrior(rows: readonly Row[], prior: GazePrior): Row[] {
+  const out: Row[] = [];
+  for (const r of rows) {
+    const x = new Float64Array(r.v.length);
+    if (applyGazePrior(prior, r.v, x)) out.push({ ...r, x });
+  }
+  return out;
 }
 
 function maskIndices(mask: Uint8Array): number[] {

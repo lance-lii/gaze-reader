@@ -8,6 +8,29 @@ All notable changes to Gaze Reader are listed here. Versions follow
 Steadier tracking. Readers found the tracker "very buggy": the gaze dot trembled, the reading
 position sat a line or two off after shifting in the chair, and page turns came early or late.
 
+### New, opt-in: a calibration built on real faces (web app)
+
+- **Settings → Eye tracking → Real-face model (experimental).** Off by default. When on, your next
+  full calibration no longer learns the whole way from eye measurements to the screen from your 13
+  dots. A model fitted on photographs of 15 other people (MPIIFaceGaze) first turns the eye and
+  head measurements into a direction of gaze, and your dots only fit that direction to your eyes
+  and your screen: a straight line, four numbers per axis. Everything after that is unchanged: the
+  distance correction, the head-movement step, the quick 5-dot refresh, saving and loading.
+- **What it buys, on those photographs** (`docs/REAL_DATA.md`; nobody is scored on a model that saw
+  them). With the head where it was during calibration the two are level (4.1° against 4.3°).
+  With the head 6–10° away the error is 4.4° against 6.5°, over 10° away 5.4° against 9.2°, and on
+  a different day 5.3° against 8.3°.
+- **Why it is not the default.** It has not been measured with this app and a live camera, and the
+  simulator this project's regression tests run on says the opposite (about twice the error, and
+  a 4° head turn throws it until the head-movement step corrects it). The photographs are from
+  laptops only, 2012–2015. Try it, and switch it off and recalibrate if tracking is worse.
+- **The weights carry their own licence.** `src/gaze/realFaceWeights.json` (3 kB, 26 inputs → 2
+  outputs) is fitted on data licensed CC BY-NC-SA 4.0 and is published under the same terms:
+  **non-commercial use only**. It is not covered by the repository's MIT licence. For commercial
+  use, delete that file and the setting; nothing else depends on it. The fit is reproducible from
+  the public dataset (`bench/realdata/simcross.bench.test.ts` checks the file against it).
+- The extension and the Artifact build do not include it: their calibrations are as before.
+
 ### New: the tracker allows for your head moving (web app and extension)
 
 - **A head-movement step at the end of a full calibration.** After the 13 dots, one dot stays in

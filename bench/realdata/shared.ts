@@ -1,8 +1,13 @@
-import { FEATURE_INDEX, type FeatureName } from '../../src/gaze/features';
+import { FEATURE_INDEX, FEATURE_NAMES, type FeatureName } from '../../src/gaze/features';
+import { priorDirection, resolveGazePrior, type GazePrior, type GazePriorWeights } from '../../src/gaze/gazePrior';
 import type { EyeFeatures, Point } from '../../src/types';
 import type { Participant, RealSample } from './dataset';
 
-/** EXPERIMENT: a model of gaze direction shared between people, and the four numbers that fit it to one person. */
+/**
+ * The fit of the model of gaze direction shared between people (src/gaze/gazePrior.ts runs it;
+ * src/gaze/realFaceWeights.json is this fit on all 15 people), and a minimal way of fitting it to
+ * one person, for comparison with the app's own calibration on its answers.
+ */
 export const SHARED_FEATURES: FeatureName[] = [
   'rightU5', 'rightVc5', 'leftU5', 'leftVc5', 'meanU5', 'meanVc5',
   'yaw', 'pitch', 'roll',
@@ -21,13 +26,7 @@ export function faceScale(v: ArrayLike<number>): number {
   return v[F.faceScale] / Math.cos(Math.max(-0.7, Math.min(0.7, v[F.yaw])));
 }
 
-export interface SharedWeights {
-  names: readonly FeatureName[];
-  mean: number[];
-  sd: number[];
-  /** [input][axis], last row the constant. */
-  w: number[][];
-}
+export type SharedWeights = GazePriorWeights;
 
 function solve(A: number[][], B: number[][]): number[][] {
   const n = A.length;
@@ -81,19 +80,21 @@ export function fitShared(people: readonly Participant[], lambda = 0.01, names: 
   }
   for (let a = 0; a <= d; a++) for (let b = 0; b < a; b++) A[a][b] = A[b][a];
   for (let a = 0; a < d; a++) A[a][a] += lambda * X.length;
-  return { names, mean, sd, w: solve(A, B) };
+  return { id: 'bench', names, mean, sd, w: solve(A, B) };
 }
 
+const resolved = new WeakMap<SharedWeights, GazePrior>();
+
+/** The app's own code on these weights (gazePrior.ts), so the scoreboards score what ships. */
 export function sharedDirection(weights: SharedWeights, v: ArrayLike<number>): Point | null {
-  const x = sharedInputs(v, weights.names);
-  let wx = weights.w[x.length][0];
-  let wy = weights.w[x.length][1];
-  for (let j = 0; j < x.length; j++) {
-    const zj = (x[j] - weights.mean[j]) / weights.sd[j];
-    wx += zj * weights.w[j][0];
-    wy += zj * weights.w[j][1];
+  let prior = resolved.get(weights);
+  if (!prior) {
+    const r = resolveGazePrior(weights, FEATURE_NAMES);
+    if (!r) throw new Error('Shared weights do not fit FEATURE_NAMES.');
+    prior = r;
+    resolved.set(weights, prior);
   }
-  return Number.isFinite(wx) && Number.isFinite(wy) ? { x: wx, y: wy } : null;
+  return priorDirection(prior, v);
 }
 
 /** The shared model fitted to one person: screen = camera + (K·direction + c) ÷ face size, K and c per axis. */

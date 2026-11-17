@@ -56,8 +56,10 @@ const CONFIGS: Config[] = [
   { label: 'no distance correction', fit: (p, cal) => train(cal, { ...base(p), depthCompensation: false }) },
   { label: '1.1: head pose as gaze features', fit: (p, cal) => train(cal, { ...base(p), excludedFeatures: [...GAZE_EXCLUDED_FEATURES].filter((n) => !HEAD.includes(n)) }) },
   { label: '1.0: every feature', fit: (p, cal) => train(cal, { ...base(p), excludedFeatures: [] }) },
+  // The "Real-face model" setting, as the app runs it (TrainOptions.prior), on a fit that never saw the tested person.
+  { label: 'real-face setting (as shipped)', fit: (p, cal, shared) => train(cal, { ...base(p), prior: shared }) },
+  { label: 'the same, without outlier rejection', fit: (p, cal, shared) => train(cal, { ...base(p), prior: shared, rejectOutliers: false }) },
   { label: 'app calibration on the shared answer alone', fit: (p, cal, shared) => trainWithPrior(p, cal, shared, FEATURE_NAMES.filter((n) => !PRIOR.includes(n))) },
-  { label: 'the same, no squares', fit: (p, cal, shared) => trainWithPrior(p, cal, shared, FEATURE_NAMES.filter((n) => !PRIOR.includes(n)), { quadraticFeatures: 0 }) },
   { label: 'app calibration + the shared answer', fit: (p, cal, shared) => trainWithPrior(p, cal, shared, [...GAZE_EXCLUDED_FEATURES].filter((n) => !PRIOR.includes(n))) },
   { label: 'shared model + 4 personal numbers', fit: (p, cal, shared) => SharedPersonalModel.fit(shared, cal, { width: p.screen.widthPx, height: p.screen.heightPx }) },
 ];
