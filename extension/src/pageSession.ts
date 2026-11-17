@@ -1212,6 +1212,8 @@ export class PageSession {
 
   private async undoTurn(): Promise<void> {
     const undone = await this.manualMove((scroll) => scroll.undo());
+    // Back at the bottom of the page the turn left: it may be finished without a look up it first.
+    if (undone && !this.disposed) this.pageEnd.notifyUndone(performance.now());
     // Direct feedback to a key press: 'high', or Dewey would hold it while the reader is mid-line
     // (and at the default chattiness drop a 'low' line altogether).
     if (!undone && !this.disposed) this.say('Nothing to undo yet.', 'high', 'thinking');

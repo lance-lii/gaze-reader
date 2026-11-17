@@ -1,6 +1,6 @@
 # Privacy policy
 
-*Gaze Reader web app and Gaze Reader browser extension. Last updated: 25 September 2026.*
+*Gaze Reader web app and Gaze Reader browser extension. Last updated: 16 November 2026.*
 
 Gaze Reader is built so that nothing about you leaves your computer. There is no account, no
 server of ours that receives your data, no analytics, no telemetry, no ads and no remote logging.
@@ -20,6 +20,10 @@ requests they make.
   running as WebAssembly. From each frame it computes face landmarks and a few numbers about your
   eyes (where each iris sits, how open the lids are, head angle). Those numbers are turned into an
   estimate of where you're looking, and then thrown away.
+- If you switch on **head gestures** (web app, off by default), the same numbers are also watched
+  for a quick turn of your head or raised eyebrows: the head angle already computed for every
+  frame, and the face tracker's eyebrow score. Nothing more is measured, and they are thrown away
+  like the rest.
 - A few times a second Gaze Reader also measures the **lighting** in the same frame, so it can
   suggest better light and notice when the light has changed since you calibrated (a lamp
   switched on makes most people squint a little, which can throw the tracking off). It reads
@@ -42,6 +46,9 @@ requests they make.
 **Web app** (in your browser's storage for the site, on your computer):
 
 - your library: books you open or paste, their text and your reading positions (IndexedDB);
+- for PDFs you open from a file, the file itself and where the lines are on its pages (IndexedDB,
+  a database named `gazeReaderPdf`), so the app can show the PDF's own pages. It is removed when
+  you remove the book. Which view you last chose for a PDF is kept with your settings;
 - your settings and your calibration (`localStorage`). A calibration is a small set of numbers
   that map eye measurements to screen positions. It also keeps a short summary of the
   conditions while you calibrated: a few lighting ratios (such as the whites of your eyes

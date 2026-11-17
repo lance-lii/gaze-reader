@@ -8,6 +8,42 @@ All notable changes to Gaze Reader are listed here. Versions follow
 Steadier tracking. Readers found the tracker "very buggy": the gaze dot trembled, the reading
 position sat a line or two off after shifting in the chair, and page turns came early or late.
 
+### New: PDFs as their own pages (web app)
+
+- **A PDF can be read as it is.** Until now a PDF was shown only as its extracted text, set like a
+  book: figures, equations, tables and the page's layout were gone. Press **V** (or the new button
+  in the top bar) and the PDF shows its original pages instead, one below the other; press it again
+  for the text. You keep your place between the two, and the choice is remembered per book. The
+  first time a PDF opens, a message points the pages out.
+- **Page turns work on the pages.** Each line of a page is laid over its picture where it is drawn,
+  so the reading model measures and follows the page's own lines: finish the last one on screen and
+  the page scrolls on, with your last lines kept at the top. The text is selectable and read aloud
+  by screen readers. Pages are drawn as they come near the view and let go of when they leave; a
+  dark or sepia theme tones the white page down.
+- **What it can't follow.** Lines on a fitted page are about half as tall as the text view's, so
+  the tracker is less sure of its line there; the bottom-right rest and the glance below the page
+  still turn it, and a wider window helps. Pages set in two columns, and pages with no text, are
+  marked in their corner and turned with Space or a head gesture. A PDF that is only scans still
+  can't be opened.
+- **The file is kept on your device** for this (the browser's storage, up to 64 MB per PDF) and
+  removed with the book; Undo brings it back. PDFs added before this version need opening from the
+  file once more. Not in the Artifact build.
+
+### New: head gestures (web app, off by default)
+
+- **Turn your head to turn the page.** Settings → Page turning → Head gestures. A quick turn of
+  the head to the right and back is the next page, to the left and back the previous one, and
+  eyebrows raised and held for a moment pause or resume automatic page turning. A short message
+  says what was understood. It uses the head angle and eyebrow score the face tracker already
+  reports: no second model, nothing more measured or kept.
+- **What isn't a gesture.** Looking away and back, a nod, a tilt, a shake of the head, leaning,
+  settling into a new posture, a tracker glitch, or another face crossing the picture. A gesture is
+  quick, mostly sideways, at least about 12°, and back within a second; the page turns a sixth of a
+  second after your head is back. Nothing happens while Settings or Help is open.
+- **How it was tested.** On synthetic gestures at 10 to 30 frames a second, and on the simulated
+  readers of the end-to-end harness, who make no gestures: none was reported in 4.5 simulated
+  hours of reading, fidgeting, looking around and being walked past. Not yet on real people.
+
 ### Web app and extension
 
 - **Leaning in or sitting back no longer shifts your reading position.** The calibration used to
@@ -30,6 +66,16 @@ position sat a line or two off after shifting in the chair, and page turns came 
   away from the dot for most of its samples, and the calibration learned that spot wrong. The dot
   now waits the 1.8 seconds the notice is shown; the same after "The window changed, so the dots
   start over."
+- **A page whose turn you undid turns again when you finish it.** After any page turn the app
+  waits for your eyes to go back up the page before it will turn again, so that a gaze or a mouse
+  left resting at the bottom can't page through the book. After **U** you are back at the bottom
+  of the page you left, reading on, and never look up: the page then never turned again by itself.
+  An undone turn now lets the last line turn the page once you have come onto it again; resting
+  at the bottom still doesn't.
+- **A touch-up is no longer offered on a second of evidence.** The offer for a quick 5-dot refresh
+  comes when the reading model has corrected more than 1.5 lines for 20 seconds. It counted the
+  seconds from the first such estimate even when every later one came from a tracker that wasn't
+  sure of anything. A long unsure stretch now starts the count over.
 - **Head turns no longer throw the gaze off.** The calibration used to read head turn and tilt as
   extra gaze cues, but during calibration the head barely moves, so what it learned was mostly
   noise. Sitting with your chin 4° lower then moved the gaze 1.5–2.3 lines in simulation, and a 4°
@@ -119,6 +165,25 @@ position sat a line or two off after shifting in the chair, and page turns came 
 
 ### Web app
 
+- **Web pages keep their sections.** Opening a saved page or a URL removed anything whose name
+  contained words like "related", "social", "sharing", "comments" or "modal", to drop sharing
+  buttons and comment threads. Documentation and papers name their sections after their headings,
+  so "Related work", "Social impact" and headings such as "Modal verbs" vanished without a word.
+  Headings are now never removed for their name, and a block named by its id alone stays when it
+  reads as running text. Pages whose whole body sits in one form (many council and university
+  sites) or behind a dialog that was open when the page was saved used to come out as "no readable
+  text"; they open now.
+- **A finished book is finished.** A book read to its end by eye showed "The end!" while the top
+  bar said 0 % (a short text) or ninety-something, and the library offered to continue it: the
+  last page of a book can't scroll to the bottom. Finished now counts as 100 %.
+- **Clicking a top-bar button doesn't capture the Space bar.** After a click on Pause, Settings or
+  Help, the button kept the keyboard: Space pressed it again instead of turning the page, and the
+  bar never hid. A pointer click now gives the keyboard back to the page.
+- **Help can be scrolled from the keyboard.** The Help dialog is taller than most windows and
+  nothing in it took focus, so the arrow keys scrolled the page behind it. It also lists the head
+  gestures now.
+- **A book that can't be saved says so.** When the browser's storage is full, a book opened and was
+  simply missing from the library next time. A message now says it couldn't be saved.
 - **A camera that stops comes back on its own.** After a laptop wakes from sleep the camera often
   freezes or stops: a frozen camera left the reader at "looking for you" for good, and a stopped
   one got a toast blaming another app, even when the camera had been unplugged. Gaze Reader now

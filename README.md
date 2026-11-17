@@ -46,6 +46,12 @@ What's new in each release is in [CHANGELOG.md](CHANGELOG.md).
   [Lighting](#lighting).
 - **You stay in control.** Choose from three sensitivity presets. You can also look below the page
   to turn it, press **U** to undo a turn, press **P** to pause, or page with the keyboard as usual.
+- **PDFs as they are.** A PDF opens as plain text set like a book, which the eye tracker follows
+  best. Press **V** and it shows its original pages instead, with figures, equations and layout,
+  and the tracker follows the lines on those pages. See [PDFs](#pdfs).
+- **Head gestures.** With the webcam on, a quick turn of your head pages forward or back and
+  raised eyebrows pause, for when you want to steer without reaching for a key. Off until you
+  switch it on. See [Head gestures](#head-gestures).
 - **Dewey.** An animated nerd with round glasses whose pupils follow your gaze. He flips his tiny
   book on every page turn, coaches you through calibration, cheers at 25/50/75 % and at the end,
   and reminds you to rest your eyes (20-20-20). He's chatty, quiet or hidden, whichever you like.
@@ -139,6 +145,7 @@ In the app (shortcuts are ignored while you're typing in a field):
 | P | Pause or resume auto-scroll |
 | C | Recalibrate the camera |
 | A | Check tracking accuracy (a few dots; correct it on the spot if it's off) |
+| V | PDFs: switch between the original pages and plain text |
 | D | Show or hide the debug overlay |
 | G | Show or hide the gaze dot |
 | S | Settings |
@@ -151,6 +158,54 @@ shortcuts. For example, Alt+Shift+P pauses, Alt+Shift+↓/↑ turns pages, Alt+S
 Alt+Shift+C recalibrates, Alt+Shift+H lists all of them, and Alt+Shift+X turns Gaze Reader off.
 Alt+Shift+G turns it on or off from anywhere; you can change this shortcut at
 `chrome://extensions/shortcuts`.
+
+## PDFs
+
+A PDF opens as **text**: its words are extracted and set as a book in your own typeface and size.
+That is the view the eye tracker follows best, because the lines are large and evenly spaced.
+
+Press **V** (or the pages button in the top bar) for the **pages** view: the PDF's own pages, one
+below the other, with their figures, equations, tables and layout. Press it again to go back; you
+keep your place, and the choice is remembered for that book.
+
+- **Page turns work on the pages too.** Each line of a page is measured where it is drawn, so the
+  reading model follows them like any text: finish the last line on screen and the page scrolls on,
+  keeping your last lines at the top.
+- **Smaller lines are harder to follow.** A page fitted to the window has lines about half as tall
+  as the text view's, and a webcam is accurate to a line or two of the text view at best. Expect
+  the "Unsure of your line" state more often; resting your eyes at the bottom right of the text,
+  or a glance below the page, still turns it. A wider window makes the pages, and their lines,
+  larger.
+- **Two-column pages and pages without text** (scans, full-page figures) can't be followed line by
+  line. They are marked in their corner, and you turn them with Space or a head gesture. A PDF
+  that is nothing but scans has no text to open at all yet.
+- **The original file is kept on this device** for the pages view (in the browser's storage, up
+  to 64 MB per PDF), and is removed when you remove the book. See [PRIVACY.md](PRIVACY.md).
+- PDFs added before this version have no original kept: open the file again to get their pages.
+  The Artifact build shows PDFs as text only.
+
+## Head gestures
+
+Switch them on in Settings → Page turning → **Head gestures**. They use the webcam and the face
+tracker that is already running for your eyes: no second model, nothing more is measured or stored.
+
+| Gesture | What it does |
+|---|---|
+| Turn your head quickly to your right, and back | Next page |
+| Turn your head quickly to your left, and back | Previous page |
+| Raise your eyebrows and hold them for a moment | Pause or resume automatic page turning |
+
+A short message says what was understood each time. A gesture is a movement that is quick, mostly
+sideways, and comes straight back (within a second), about 12° or more; keep your eyes on the page
+as you make it. Looking away at something, nodding, tilting or shaking your head, leaning, settling
+into a new posture, and another person's face passing through the picture don't count, and
+nothing happens while Settings or Help is open. The page turns about a sixth of a second after
+your head is back, which is how a turn is told from the start of a head shake.
+
+Gestures have been tested on simulated head movement only (no false gesture in 4.5 simulated hours
+of reading, fidgeting and looking around), not yet on recordings of real people: if one fires when
+you didn't mean it, or doesn't when you did, switch them off and please say so. The Chrome
+extension doesn't have them yet.
 
 ## Lighting
 
@@ -339,12 +394,13 @@ CDNs, no network URLs in `fetch()`, no leftover chunks, under 16 MB) and fails o
 index.html, src/main.ts     App entry
 src/types.ts                Shared contracts between modules
 src/core/                   Event bus, settings store, storage, constants
-src/gaze/                   Camera, MediaPipe face tracker, eye features, head pose,
+src/gaze/                   Camera, MediaPipe face tracker, eye features, head pose, head gestures,
                             ridge regression + calibration model, webcam and mouse gaze sources
 src/signal/                 One Euro filter, fixation detector, saccade classification
 src/reading/                Line tracker (HMM) and how sure it is of the line, page-end detector,
                             simulated reader (demo + tests)
 src/reader/                 Book loading (txt/md/html/epub/pdf), sanitizer, library (IndexedDB),
+                            the PDF pages view and the store for PDF originals,
                             reader view, line measurement, scroll controller
 src/buddy/                  Dewey: avatar, behaviour, quips, styles
 src/ui/                     Calibration overlay, top bar, library, settings, help, onboarding,
@@ -404,8 +460,11 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 - **Not validated at scale.** The page-end rules were tuned against a simulated reader with noise,
   drift, blinks and calibration bias, not against recordings of real readers. Expect to adjust
   sensitivity to taste.
-- **Books.** Images are dropped, since only text is rendered. PDFs need selectable text (there's
-  no OCR), and PDFs using CJK/CID fonts may extract poorly. DRM-protected EPUBs can't be opened.
+- **Books.** Images are dropped in the text view, since only text is rendered (a PDF's pages view
+  shows them). PDFs need selectable text (there's no OCR), and PDFs using CJK/CID fonts may extract
+  poorly; in the pages view, a PDF that doesn't embed its fonts is drawn in substitutes, two-column
+  and scanned pages aren't followed line by line, and the smaller lines are tracked less surely
+  than the text view's. DRM-protected EPUBs can't be opened.
 - **Extension.** It needs Chrome 116 or later. A site's main content is detected heuristically,
   so it can miss articles that single-page apps render late. Text inside frames isn't measured.
   It must be turned on again after a full page navigation. On canvas and image readers, page mode

@@ -363,6 +363,13 @@ export class PageEndDetector {
   private belowFromEnd = false;
   /** The gaze has been up the page since the last trigger (rules 1 and 2 wait for it). */
   private lookedUp = true;
+  /**
+   * The last turn was undone: the reader is back at the bottom of the page it left, and may finish
+   * it without ever looking up. Rule 1 may fire again once they have entered the last line anew
+   * (see notifyUndone); rule 2, which a gaze or pointer merely resting there would satisfy, still
+   * waits for the look up.
+   */
+  private undone = false;
 
   constructor(opts: Partial<PageEndOptions> = {}) {
     this.opts = { ...DEFAULT_PAGE_END_OPTIONS };
@@ -401,7 +408,21 @@ export class PageEndDetector {
     this.belowFromEnd = false;
   }
 
+  /**
+   * The reader undid the last page turn: the page it left is on screen again, with its last lines
+   * unread. Like notifyScrolled, and the line-tracker rule no longer waits for the gaze to go up
+   * the page first: after an undo the reader is at the bottom, reading on, and without this a page
+   * turned a line early and undone never turned again by itself (the gaze has to rise a line above
+   * the bottom zone, and someone finishing the last two lines never does that). The rule still
+   * needs the reader to enter the last line again, which notifyScrolled makes it forget.
+   */
+  notifyUndone(t: number): void {
+    this.notifyScrolled(t);
+    if (Number.isFinite(t)) this.undone = true;
+  }
+
   reset(): void {
+    this.undone = false;
     this.lineDwell.reset();
     this.zoneDwell.reset();
     this.glanceDwell.reset();
@@ -515,6 +536,8 @@ export class PageEndDetector {
     // dwells don't build up meanwhile, or they would fire the moment it leaves).
     if (valid && yc < zones.zoneTop - LOOK_UP_LINES * pitch) this.lookedUp = true;
     const armed = this.lookedUp;
+    /** Rule 1 after an undone turn (see notifyUndone). */
+    const lineArmed = armed || this.undone;
 
     // Rule 1: on the last line, far enough along it.
     const pAbove = est && L > 0 ? est.posterior[L - 1]! : 0;
@@ -522,7 +545,7 @@ export class PageEndDetector {
     const dwellMs = doubt ? th.dwellMs * DOUBT_DWELL_FACTOR : th.dwellMs;
     const onLastLine = est !== null && entered && pEnd >= th.minPosterior;
     const withinReach = yc >= Lline.top - LAST_LINE_REACH_LINES * pitch;
-    const c1: Tri = valid ? armed && onLastLine && withinReach && progress >= th.minProgress : est ? null : false;
+    const c1: Tri = valid ? lineArmed && onLastLine && withinReach && progress >= th.minProgress : est ? null : false;
     this.lineDwell.step(c1, dt);
 
     // Rule 1b: return sweep after having been (confidently) at the end of the last line.
@@ -638,7 +661,7 @@ export class PageEndDetector {
     }
 
     if (reason === 'none') {
-      const waiting = !armed
+      const waiting = !lineArmed
         ? 'waiting: gaze has not left the bottom since the last trigger · '
         : (lineReady || zoneReady) && !readEnough
           ? `waiting: ${fixations}/${PAGE_END_GUARDS.minFixationsOnPage} fixations, ${fmtMs(sinceTurn)}/${PAGE_END_GUARDS.minMsSinceTurn} ms on page · `
@@ -651,6 +674,7 @@ export class PageEndDetector {
 
     this.lastFireAt = t;
     this.lookedUp = false;
+    this.undone = false;
     this.disarm();
     // A deliberate glance means "next page"; the other rules hedge when the tracker isn't sure.
     const target = reason === 'glance-down' ? targetLineIndex : cautiousTarget;

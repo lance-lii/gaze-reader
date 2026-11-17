@@ -22,4 +22,4 @@ export function fullAppLinkHtml(label: string = FULL_APP_LABEL): string {
 }
 
 /** Dewey says this once per visit in the Artifact build. */
-export const DEWEY_FULL_APP_LINE = 'Psst! In the full Gaze Reader, your own eyes turn the page. This version can’t use a camera.';
+export const DEWEY_FULL_APP_LINE = 'Psst! In the full Gaze Reader, your own eyes turn the page. This one has no camera.';

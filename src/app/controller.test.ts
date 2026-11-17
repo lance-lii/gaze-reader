@@ -381,6 +381,15 @@ describe('AppController', () => {
       await sleep(100);
       expect(finished).toHaveLength(1); // once
       expect(toastText()).toMatch(/The end!/);
+      // Finished is 100 %, wherever the scroller is (regression: a book that fits one screen stayed
+      // at "0 %" and came back in the library as one to continue).
+      expect(document.querySelector('.gr-topbar__progress')!.getAttribute('aria-valuenow')).toBe('100');
+      let saved = 0;
+      for (let i = 0; i < 50 && saved !== 1; i++) {
+        await sleep(20);
+        saved = (await listBooks()).find((b) => b.title === 'Pasted text')?.fraction ?? 0;
+      }
+      expect(saved).toBe(1);
     });
 
     it('finishes even while auto-scroll is paused (the reader paged through by hand)', async () => {
