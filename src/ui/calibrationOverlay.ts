@@ -76,6 +76,7 @@ import {
   type LightingSample,
 } from '../gaze/lighting';
 import { BlinkGate, DEFAULT_BLINK_GATE } from '../gaze/webcamGazeSource';
+import type { GazePriorWeights } from '../gaze/gazePrior';
 import { DOT_OFF_LINES, offsetVerdict, withinWords, type OffsetWords } from '../app/offsetWords';
 
 // ─────────────────────────────── Public API ──────────────────────────────────
@@ -118,6 +119,11 @@ export interface CalibrationOverlayOptions {
    * always skip it there and then.
    */
   headStep?: boolean;
+  /**
+   * A model of gaze direction shared between people, for full calibrations to stand on
+   * (src/gaze/gazePrior.ts). Default: none. A quick calibration keeps whatever its base model has.
+   */
+  prior?: GazePriorWeights | null;
 }
 
 export interface CalibrationResult {
@@ -903,7 +909,7 @@ export class CalibrationOverlay implements Mountable {
         trained =
           mode === 'quick' && base
             ? refineGazeModel(alignCore(current, base, collected.samples), collected.samples, { viewport, maxBlink, environment })
-            : trainGazeModel(collected.samples, { viewport, maxBlink, featureNames: this.opts.featureNames, environment });
+            : trainGazeModel(collected.samples, { viewport, maxBlink, featureNames: this.opts.featureNames, environment, prior: this.opts.prior ?? null });
       } catch (err) {
         if (mode === 'quick') {
           // The saved model can't explain today's eyes; retrying the refresh would fail the same way.
