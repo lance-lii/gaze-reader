@@ -123,10 +123,9 @@ description)
 > transmitted.
 
 **Remote code:** answer **No, I am not using remote code**. All JavaScript and WebAssembly ship in
-the package (the MediaPipe runtime is copied into `mediapipe/wasm/`). The one download, the
-face-landmark model `face_landmarker.task` from `storage.googleapis.com`, is model data (neural
-network weights) loaded by the bundled runtime, not executable code. If a reviewer disagrees, the
-fix is to bundle the model file in the package (about 3.6 MB) and point `modelAssetPath` at it.
+the package (the MediaPipe runtime is copied into `mediapipe/wasm/`), and so does the
+face-landmark model (`mediapipe/models/face_landmarker.task`, model data, about 3.8 MB): the
+extension downloads nothing to run.
 
 ### Data usage disclosure
 

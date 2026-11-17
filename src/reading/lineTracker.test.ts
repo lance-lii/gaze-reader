@@ -328,6 +328,43 @@ describe('LineTracker', () => {
     expect(away.posterior).toBe(before.posterior);
   });
 
+  it('a transition never loses probability, also when a long regression leaves the end of a short line (regression: a third of it went nowhere)', () => {
+    // Paragraphs of three lines: every third line is short.
+    const doc = makeDocument({ lines: 30, paragraphLines: [3, 3], seed: 4 });
+    const layout = doc.layoutAt(0, { viewport: { left: 0, top: 0, right: 1024, bottom: 20.5 * 42 } });
+    const width = layout.column.right - layout.column.left;
+    const shortRow = layout.lines.findIndex((l) => l.right - l.left < 0.6 * width && l.right - l.left > 0.25 * width);
+    expect(shortRow).toBeGreaterThan(0);
+    const tracker = new LineTracker();
+    tracker.setLayout(layout, 'initial');
+    // The tracker's internals, to put all belief on the short line and step one transition.
+    const inner = tracker as unknown as {
+      joint: Float64Array;
+      states: number[];
+      grid: Float64Array;
+      predict(kind: string, dyLines: number, dxCol: number, sweepLike: boolean, ends: { xFrom: number; xTo: number; columnWidth: number; trust: number }): void;
+    };
+    const D = inner.grid.length;
+    const k = inner.states.indexOf(shortRow);
+    const mass = (): number => inner.joint.reduce((a, b) => a + b, 0);
+    const line = layout.lines[shortRow]!;
+    for (const [sweepLike, label] of [[false, 'short-line share alone'], [true, 'with the long-regression share']] as const) {
+      const joint = new Float64Array(inner.states.length * D);
+      joint[k * D + (D >> 1)] = 1;
+      inner.joint = joint;
+      // From the end of the short line to the column's left edge, half a line up: a regression.
+      inner.predict('regression', -0.6, -(line.right - layout.column.left - 20) / width, sweepLike, { xFrom: line.right - 10, xTo: layout.column.left + 10, columnWidth: width, trust: 1 });
+      expect(mass(), label).toBeCloseTo(1, 9);
+    }
+  });
+
+  it('accepts a drift range only as wide as its grid can walk', () => {
+    const wide = new LineTracker({ maxDriftLines: 10 }) as unknown as { grid: Float64Array };
+    expect(wide.grid[wide.grid.length - 1]).toBeCloseTo(6, 9);
+    const usual = new LineTracker() as unknown as { grid: Float64Array };
+    expect(usual.grid[usual.grid.length - 1]).toBeCloseTo(5, 9);
+  });
+
   it('clamps options to sane ranges', () => {
     const tracker = new LineTracker({ sigmaYLines: 50, driftRate: -1, maxDriftLines: NaN });
     tracker.setLayout(page, 'initial');

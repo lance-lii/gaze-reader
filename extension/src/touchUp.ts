@@ -64,6 +64,9 @@ export interface TouchUpAdvisorOptions {
   calibratedAt?: number | null;
 }
 
+/** No estimate for this long (the reader is away) restarts the drift hold, as DriftWatch does in the app. */
+const ESTIMATE_GAP_MS = 6000;
+
 export class TouchUpAdvisor {
   private readonly policy: TouchUpPolicy;
   private readonly wallNow: () => number;
@@ -72,6 +75,8 @@ export class TouchUpAdvisor {
   /** Fixation time (performance.now()) since when the offset has been large, and its sign. */
   private driftSince: number | null = null;
   private driftSign = 0;
+  /** The latest estimate's time: a long silence (the reader away) starts the hold over. */
+  private lastEstimateT = Number.NEGATIVE_INFINITY;
   /** An offer for this reason is on screen or was just made; one per episode. */
   private lightingEpisodeOffered = false;
 
@@ -131,6 +136,9 @@ export class TouchUpAdvisor {
   onEstimate(est: LineEstimate | null, pitchPx: number): TouchUpOffer | null {
     const p = this.policy;
     if (!est || !(pitchPx > 0) || !Number.isFinite(est.driftY)) return null;
+    // One estimate after a long break isn't twenty seconds of a large offset.
+    if (est.t - this.lastEstimateT > ESTIMATE_GAP_MS) this.driftSince = null;
+    this.lastEstimateT = est.t;
     const lines = est.driftY / pitchPx;
     const sdLines = isTrackedLineEstimate(est) && Number.isFinite(est.driftSdY) ? (est.driftSdY as number) / pitchPx : Infinity;
     const pinned = est.lineIndex >= 0 && est.probability >= p.minLineProbability && sdLines <= p.maxDriftSdLines;

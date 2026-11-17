@@ -34,6 +34,8 @@ export interface LibraryScreenOptions {
   onOpenFile(file: File): void;
   onOpenText(text: string, title: string | null): void;
   onOpenUrl(url: string): void;
+  /** Cancel (or Escape) in a form while something is being opened: stop it. */
+  onCancelOpen?(): void;
   onOpenSample(id: string): void;
   onOpenBook(id: string): void;
   onDeleteBook(id: string, title: string): void;
@@ -436,6 +438,9 @@ export class LibraryScreen implements Mountable {
       form.querySelector<HTMLButtonElement>('[data-cancel]')!.addEventListener(
         'click',
         () => {
+          // Cancel means cancel: a download in flight stops (it used to carry on, and open the
+          // book seconds later), and the controls it had disabled come back before focus moves.
+          this.opts.onCancelOpen?.();
           this.setFormOpen(btn, form, false);
           btn.focus();
         },
@@ -446,6 +451,7 @@ export class LibraryScreen implements Mountable {
         (e) => {
           if (e.key !== 'Escape') return;
           e.stopPropagation();
+          this.opts.onCancelOpen?.();
           this.setFormOpen(btn, form, false);
           btn.focus();
         },

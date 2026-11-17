@@ -4,7 +4,8 @@ import { createEventBus } from '../core/events';
 import { DEFAULT_SETTINGS } from '../core/settings';
 import type { AppSettings, Book } from '../types';
 import { READER_STYLE_ATTR } from './reader.css';
-import { ReaderView } from './readerView';
+import type { PdfPageLayout } from './pdf';
+import { ReaderView, type PagesSource } from './readerView';
 
 // ─────────────────────────── fixtures ───────────────────────────
 
@@ -397,5 +398,196 @@ describe('ReaderView behaviour', () => {
     view.open(makeBook()); // no-op after destroy
     expect(view.book).toBeNull();
     view.destroy();
+  });
+});
+
+// ───────────────────────────── the pages view ─────────────────────────────
+
+describe('ReaderView pages view (a PDF’s own pages)', () => {
+  const PAGES: PdfPageLayout[] = [
+    {
+      width: 600,
+      height: 800,
+      columns: false,
+      lines: [
+        // Out of order on purpose: the view lays them out top to bottom.
+        { x0: 72, x1: 500, y: 130, size: 10, text: 'the second line of the page' },
+        { x0: 87, x1: 520, y: 116, size: 10, text: 'The first line of the page' },
+        { x0: 72, x1: 300, y: 400, size: 20, text: '<img src=x onerror=alert(1)> stays text' },
+      ],
+    },
+    { width: 600, height: 800, columns: true, lines: [{ x0: 60, x1: 280, y: 100, size: 10, text: 'left column' }, { x0: 330, x1: 550, y: 100, size: 10, text: 'right column' }] },
+    { width: 800, height: 600, columns: false, lines: [] }, // a scan: a picture with no text
+  ];
+
+  class FakeIntersectionObserver {
+    static instances: FakeIntersectionObserver[] = [];
+    readonly observed: Element[] = [];
+    disconnected = false;
+    constructor(
+      private readonly cb: IntersectionObserverCallback,
+      readonly options?: IntersectionObserverInit,
+    ) {
+      FakeIntersectionObserver.instances.push(this);
+    }
+    observe(el: Element): void {
+      this.observed.push(el);
+    }
+    unobserve(): void {}
+    disconnect(): void {
+      this.disconnected = true;
+    }
+    /** The page comes near the view, or leaves. */
+    show(el: Element, isIntersecting: boolean): void {
+      this.cb([{ target: el, isIntersecting } as IntersectionObserverEntry], this as unknown as IntersectionObserver);
+    }
+  }
+
+  function pagesSource(): PagesSource & { rendered: [number, number, number][]; cancelled: number } {
+    const rendered: [number, number, number][] = [];
+    const src = {
+      pages: PAGES,
+      rendered,
+      cancelled: 0,
+      render: (index: number, canvas: HTMLCanvasElement, cssWidth: number, ratio: number): Promise<boolean> => {
+        rendered.push([index, cssWidth, ratio]);
+        canvas.width = Math.round(cssWidth * ratio);
+        canvas.height = 10;
+        return Promise.resolve(true);
+      },
+      cancel: (): void => {
+        src.cancelled++;
+      },
+    };
+    return src;
+  }
+
+  const pdfBook = (): Book => makeBook({ id: 'pdf-1', title: 'A Paper', format: 'pdf', source: 'file' });
+
+  beforeEach(() => {
+    FakeIntersectionObserver.instances = [];
+  });
+
+  it('lays every page out as a picture with one element per line, where the line is', () => {
+    const view = newView();
+    expect(view.view).toBe('text');
+    view.openPages(pdfBook(), pagesSource());
+    expect(view.view).toBe('pages');
+    expect(view.scroller.dataset.view).toBe('pages');
+    expect(view.book?.id).toBe('pdf-1');
+
+    const pages = [...view.content.querySelectorAll<HTMLElement>('.gr-pdf-page')];
+    expect(pages).toHaveLength(3);
+    expect(pages.map((p) => p.id)).toEqual(['pg0', 'pg1', 'pg2']);
+    expect(pages[0]!.getAttribute('aria-label')).toBe('Page 1 of 3');
+    expect(pages[0]!.style.aspectRatio).toBe('600 / 800');
+    expect(pages[2]!.style.aspectRatio).toBe('800 / 600');
+    for (const p of pages) expect(p.querySelector('canvas')!.getAttribute('aria-hidden')).toBe('true');
+
+    const lines = [...pages[0]!.querySelectorAll<HTMLElement>('.gr-pdf-line')];
+    expect(lines.map((l) => l.textContent)).toEqual(['The first line of the page', 'the second line of the page', '<img src=x onerror=alert(1)> stays text']);
+    expect(lines.map((l) => l.id)).toEqual(['pg0-l0', 'pg0-l1', 'pg0-l2']);
+    expect(pages[0]!.querySelector('img')).toBeNull(); // a line's text is only ever text
+    const first = lines[0]!;
+    expect(Number.parseFloat(first.style.left)).toBeCloseTo((100 * 87) / 600, 3);
+    expect(Number.parseFloat(first.style.width)).toBeCloseTo((100 * (520 - 87)) / 600, 3);
+    // The box reaches from above the baseline (116) to a little below it.
+    expect(Number.parseFloat(first.style.top)).toBeCloseTo((100 * (116 - 8)) / 800, 3);
+    expect(Number.parseFloat(first.style.height)).toBeCloseTo((100 * 10.5) / 800, 3);
+    expect(Number.parseFloat(first.style.getPropertyValue('--gr-pdf-size'))).toBeCloseTo(10 / 600, 4);
+    expect(Number.parseFloat(lines[2]!.style.getPropertyValue('--gr-pdf-size'))).toBeCloseTo(20 / 600, 4);
+
+    // Two columns, and a page with no text: no line elements (nothing there can be followed top to bottom), and a note saying so.
+    expect(pages[1]!.querySelectorAll('.gr-pdf-line')).toHaveLength(0);
+    expect(pages[1]!.dataset.grUntracked).toMatch(/Two columns/);
+    expect(pages[2]!.querySelectorAll('.gr-pdf-line')).toHaveLength(0);
+    expect(pages[2]!.dataset.grUntracked).toMatch(/No text/);
+    expect(pages[0]!.dataset.grUntracked).toBeUndefined();
+
+    // The end marker follows the last page, as it follows the last chapter.
+    expect(view.content.lastElementChild!.classList.contains('gr-end')).toBe(true);
+    expect(view.content.lastElementChild!.previousElementSibling).toBe(pages[2]);
+  });
+
+  it('draws a page’s picture when it comes near the view, lets go of it when it leaves, and redraws at a new width', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver);
+    vi.stubGlobal('devicePixelRatio', 2);
+    const view = newView();
+    const source = pagesSource();
+    view.openPages(pdfBook(), source);
+    const io = FakeIntersectionObserver.instances[0]!;
+    expect(io.options?.root).toBe(view.scroller);
+    const pages = [...view.content.querySelectorAll<HTMLElement>('.gr-pdf-page')];
+    expect(io.observed).toEqual(pages);
+    let width = 900;
+    for (const p of pages) Object.defineProperty(p, 'clientWidth', { configurable: true, get: () => width });
+    Object.defineProperty(view.scroller, 'clientWidth', { configurable: true, get: () => width + 100 });
+
+    io.show(pages[0]!, true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(source.rendered).toEqual([[0, 900, 2]]);
+    expect(pages[0]!.querySelector('canvas')!.width).toBe(1800);
+    io.show(pages[0]!, true); // already drawn at this width: nothing to do
+    await vi.advanceTimersByTimeAsync(0);
+    expect(source.rendered).toHaveLength(1);
+
+    io.show(pages[0]!, false);
+    expect(pages[0]!.querySelector('canvas')!.width).toBe(0); // the picture's memory is given back
+
+    io.show(pages[1]!, true);
+    await vi.advanceTimersByTimeAsync(0);
+    width = 600;
+    FakeResizeObserver.instances[0]!.fire(); // first size
+    FakeResizeObserver.instances[0]!.fire();
+    await vi.advanceTimersByTimeAsync(400);
+    expect(source.rendered.at(-1)).toEqual([1, 600, 2]);
+
+    view.close();
+    expect(io.disconnected).toBe(true);
+    expect(view.view).toBe('text');
+    expect(view.scroller.dataset.view).toBeUndefined();
+    expect(view.content.childElementCount).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('a picture that can’t be drawn is reported once and never stops the others', async () => {
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver);
+    const bus = createEventBus();
+    const errors: string[] = [];
+    bus.on('error', (e) => errors.push(e.code));
+    const view = new ReaderView({ mount, bus });
+    const source = pagesSource();
+    let fail = true;
+    const render = source.render;
+    source.render = (...args) => (fail ? Promise.reject(new Error('bad page')) : render(...args));
+    view.openPages(pdfBook(), source);
+    const io = FakeIntersectionObserver.instances[0]!;
+    const pages = [...view.content.querySelectorAll<HTMLElement>('.gr-pdf-page')];
+    for (const p of pages) Object.defineProperty(p, 'clientWidth', { configurable: true, value: 800 });
+    io.show(pages[0]!, true);
+    io.show(pages[1]!, true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(errors).toEqual(['reader-render']);
+    fail = false;
+    io.show(pages[2]!, true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(source.rendered).toEqual([[2, 800, 1]]);
+    view.destroy();
+  });
+
+  it('remembers the place by line, and goes back to a text book cleanly', () => {
+    const view = newView();
+    view.openPages(pdfBook(), pagesSource());
+    const pos = view.getPosition();
+    expect(pos?.bookId).toBe('pdf-1');
+    expect(pos?.anchor).toMatch(/^pg\d+(-l\d+)?$/); // a page or one of its lines (nothing is laid out here to say which)
+    expect(view.pagesStatus()).toEqual({ page: 0, count: 3, trackable: true });
+
+    view.open(makeBook());
+    expect(view.view).toBe('text');
+    expect(view.pagesStatus()).toBeNull();
+    expect(view.content.querySelector('.gr-pdf-page')).toBeNull();
+    expect(view.content.querySelectorAll('section.gr-chapter')).toHaveLength(3);
   });
 });

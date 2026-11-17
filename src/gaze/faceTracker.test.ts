@@ -209,6 +209,36 @@ describe('createLandmarkerLoader', () => {
     expect(loader.load({ ...CFG, delegate: 'CPU' })).not.toBe(a);
   });
 
+  it('uses the app’s own copy of the model, and Google’s only when that copy is missing', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const own = 'https://app.test/mediapipe/models/face_landmarker.task';
+    const cfg = { ...CFG, modelAssetPath: own, fallbackModelAssetPath: 'https://models.test/face.task' };
+    const modelUsed = async (response: () => Promise<Response>): Promise<{ path: string; asked: unknown[][] }> => {
+      const fetchSpy = vi.fn(response);
+      vi.stubGlobal('fetch', fetchSpy);
+      const v = fakeVision();
+      await createLandmarkerLoader(v.importVision).load(cfg);
+      return { path: (v.createFromOptions.mock.calls[0][1] as { baseOptions: { modelAssetPath: string } }).baseOptions.modelAssetPath, asked: fetchSpy.mock.calls };
+    };
+    // There: one small request to our own origin, none to anyone else.
+    const there = await modelUsed(() => Promise.resolve(new Response(null, { status: 200, headers: { 'content-type': 'application/octet-stream' } })));
+    expect(there.path).toBe(own);
+    expect(there.asked).toEqual([[own, { method: 'HEAD' }]]);
+    expect(warn).not.toHaveBeenCalled();
+    // Missing, unreachable, or a dev server's HTML page in its place: the fallback.
+    expect((await modelUsed(() => Promise.resolve(new Response(null, { status: 404 })))).path).toBe(cfg.fallbackModelAssetPath);
+    expect((await modelUsed(() => Promise.reject(new TypeError('Failed to fetch')))).path).toBe(cfg.fallbackModelAssetPath);
+    expect((await modelUsed(() => Promise.resolve(new Response('<!doctype html>', { status: 200, headers: { 'content-type': 'text/html' } })))).path).toBe(cfg.fallbackModelAssetPath);
+    expect(warn).toHaveBeenCalledTimes(3);
+    // A caller that names a model outright gets exactly that, unasked.
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+    const v = fakeVision();
+    await createLandmarkerLoader(v.importVision).load(CFG);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
   it('falls back to the CPU when the GPU delegate cannot be created', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const v = fakeVision({ failGpu: true });
@@ -685,6 +715,37 @@ describe('CameraFeatureSource', () => {
     h.src.stop();
     expect(cancel).toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('stamps a frame with when it was captured, not when it was processed, and never lets time run backwards', async () => {
+    const h = harness();
+    const callbacks: VideoFrameRequestCallback[] = [];
+    Object.assign(h.video, {
+      requestVideoFrameCallback: vi.fn((cb: VideoFrameRequestCallback) => callbacks.push(cb)),
+      cancelVideoFrameCallback: vi.fn(),
+    });
+    await h.src.start();
+    const deliver = (metadata: Partial<VideoFrameCallbackMetadata>): number => {
+      vi.advanceTimersByTime(FRAME_MS);
+      const before = h.frames.length;
+      callbacks.pop()?.(performance.now(), metadata as VideoFrameCallbackMetadata);
+      expect(h.frames.length).toBe(before + 1);
+      return h.frames[h.frames.length - 1].t;
+    };
+    // Captured 12 ms ago (the main thread was busy): that is the frame's time.
+    expect(deliver({ captureTime: performance.now() + FRAME_MS - 12 })).toBeCloseTo(performance.now() - 12, 6);
+    // No capture time: when it was presented.
+    expect(deliver({ presentationTime: performance.now() + FRAME_MS - 5 })).toBeCloseTo(performance.now() - 5, 6);
+    // No metadata, a time in the future, or one too old to believe (another clock): now.
+    expect(deliver({})).toBe(performance.now());
+    expect(deliver({ captureTime: performance.now() + FRAME_MS + 40 })).toBe(performance.now());
+    expect(deliver({ captureTime: performance.now() + FRAME_MS - 900 })).toBe(performance.now());
+    // A capture time before the last frame's: time still moves forward.
+    const last = h.frames[h.frames.length - 1].t;
+    expect(deliver({ captureTime: last - 3 })).toBeGreaterThan(last);
+    const times = h.frames.map((f) => f.t);
+    expect(times).toEqual([...times].sort((a, b) => a - b));
+    h.src.stop();
   });
 
   it('falls back to a timer when frame callbacks stall (hidden preview, offscreen page)', async () => {

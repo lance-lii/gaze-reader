@@ -163,7 +163,7 @@ export interface RigStep {
 /** What the rig needs of a page-end detector: the working tree's, or the deployed one (deployedPageEndDetector.ts). */
 export interface PageEndDetectorLike {
   update(input: PageEndInput): PageEndDecision;
-  notifyScrolled(t: number): void;
+  notifyScrolled(t: number, resumeBottom?: number): void;
   reset(): void;
 }
 
@@ -290,10 +290,11 @@ export function runSession(scenario: Scenario, seed: number, opts: { minutes?: n
     }
     world.scrollTo(next);
     tracker.setLayout(world.layout, 'page-turn');
-    tracker.afterPageTurn(resumeLineIndex(world.layout.lines, anchor.docTop, world.layout.linePitch));
+    const resume = resumeLineIndex(world.layout.lines, anchor.docTop, world.layout.linePitch);
+    tracker.afterPageTurn(resume);
     // The app starts the cooldown when the scroll animation ends (afterJump → notifyScrolled); nothing
     // reaches the detector in between, so telling it now with that time is the same.
-    detector.notifyScrolled(t + SCROLL_MS);
+    detector.notifyScrolled(t + SCROLL_MS, world.layout.lines[resume]?.bottom);
     fixations.reset();
     blockedUntil = t + SCROLL_MS;
     guidance.notePageTurn(t);

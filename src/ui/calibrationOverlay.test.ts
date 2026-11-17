@@ -570,6 +570,42 @@ describe('CalibrationOverlay — standard flow', () => {
     expect(rushed).toBeGreaterThan(waited * 1.5);
   });
 
+  it('pauses when the tab is hidden mid-run, instead of skipping dots it can’t see (regression: trained on 9 of 13, silently)', async () => {
+    const ctx = setup();
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(ctx.root.dataset.paused).toBeUndefined();
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(ctx.root.dataset.paused).toBe('user');
+    const index = ctx.events.at(-1)?.index;
+    await vi.advanceTimersByTimeAsync(30_000); // away for half a minute: nothing moves on
+    expect(ctx.events.filter((e) => e.phase === 'point' && e.message === 'retry')).toHaveLength(0);
+    expect(ctx.events.at(-1)?.index).toBe(index);
+    Reflect.deleteProperty(document, 'visibilityState');
+    ctx.q<HTMLButtonElement>('.gr-cal-pause [data-action="continue"]').click();
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 120_000, 250);
+    ctx.q<HTMLButtonElement>('[data-action="use"]').click();
+    expect((await done)?.report.quality).toBe('excellent');
+    ctx.sim.stop();
+  });
+
+  it('can be told which key presses are real (the extension: a page must not cancel a calibration with a fake Escape)', async () => {
+    const ctx = setup({ isTrustedKey: (e) => (e as KeyboardEvent & { real?: boolean }).real === true });
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await vi.advanceTimersByTimeAsync(1500);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+    expect(ctx.root.dataset.paused).toBeUndefined();
+    expect(ctx.events.at(-1)?.phase).not.toBe('cancelled');
+    const real = Object.assign(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }), { real: true });
+    window.dispatchEvent(real);
+    await expect(done).resolves.toBeNull();
+    ctx.sim.stop();
+  });
+
   it('repeats a target that collected too few samples', async () => {
     const ctx = setup();
     ctx.sim.reader.closeEyes = (index, attempt) => index === 2 && attempt === 0;

@@ -93,6 +93,56 @@ function joinItems(items: PdfTextItem[], size: number): string {
   return collapseWhitespace(text);
 }
 
+/** A large initial: one or two letters at least this many times the size of the text beside it. */
+const DROP_CAP_RATIO = 1.8;
+
+/**
+ * Rows as text reads them. A row's size is that of most of its text, not of its largest run: one
+ * large initial (a drop cap) made its whole line "larger type", which reads as a heading and
+ * opened a chapter there. And the initial itself belongs to the first of the lines it spans, where
+ * the word it starts is: "T" + "he quick brown fox", not a "T" in front of the line below.
+ */
+function settleRows(rows: { y: number; size: number; items: PdfTextItem[] }[]): void {
+  for (const row of rows) {
+    const chars = new Map<number, number>();
+    for (const it of row.items) chars.set(it.height, (chars.get(it.height) ?? 0) + it.str.trim().length);
+    let body = row.size;
+    let most = -1;
+    for (const [size, n] of chars) {
+      if (n > most || (n === most && size > body)) {
+        body = size;
+        most = n;
+      }
+    }
+    if (body !== row.size) {
+      row.size = body;
+      const baselines = row.items.filter((it) => it.height === body).map((it) => it.y);
+      row.y = median(baselines);
+    }
+  }
+  for (const row of rows) {
+    for (const cap of [...row.items]) {
+      const text = cap.str.trim();
+      if (row.items.length < 2 || cap.height < DROP_CAP_RATIO * row.size || !/^\p{L}{1,2}$/u.test(text)) continue;
+      if (row.items.some((it) => it !== cap && it.x < cap.x)) continue; // not at the start of its line
+      // The lines the initial stands beside: the rows inside its height that start to its right.
+      const spanned = rows
+        .filter((r) => r.y <= row.y && r.y > cap.y - 0.95 * cap.height && r.items.every((it) => it === cap || it.x >= cap.x + 0.5 * cap.width))
+        .sort((a, b) => a.y - b.y);
+      const beside = spanned[0];
+      if (!beside || beside === row) continue;
+      row.items.splice(row.items.indexOf(cap), 1);
+      for (const r of spanned) {
+        const start = r.items.reduce((min, it) => Math.min(min, it.x), Infinity);
+        // In the first line: the letter itself, flush against the word it starts, at that line's
+        // size and baseline. In the others: nothing but its width, so that they start where the
+        // paragraph does (set in beside the initial, they read as first lines of new paragraphs).
+        r.items.push({ str: r === beside ? text : '', x: cap.x, y: r.y, width: Math.max(0, start - cap.x), height: r.size });
+      }
+    }
+  }
+}
+
 /** Groups items into baseline rows, then splits rows at gaps wide enough to be column gutters. */
 function pagePieces(page: PdfPageText): Piece[] {
   const items = cleanItems(page).sort((a, b) => a.y - b.y || a.x - b.x);
@@ -100,7 +150,12 @@ function pagePieces(page: PdfPageText): Piece[] {
   for (const it of items) {
     let row: (typeof rows)[number] | undefined;
     for (let k = rows.length - 1; k >= 0 && k >= rows.length - 4; k--) {
-      if (Math.abs(rows[k].y - it.y) <= 0.5 * Math.max(rows[k].size, it.height)) {
+      // Half the larger size, but never more than 0.8 of the smaller: a superscript sits a few
+      // units off its line's baseline, while a three-line initial would otherwise gather three
+      // lines of body text into its own row.
+      const big = Math.max(rows[k].size, it.height);
+      const small = Math.min(rows[k].size, it.height);
+      if (Math.abs(rows[k].y - it.y) <= 0.5 * Math.min(big, 1.6 * small)) {
         row = rows[k];
         break;
       }
@@ -117,6 +172,7 @@ function pagePieces(page: PdfPageText): Piece[] {
     }
   }
 
+  settleRows(rows);
   const pieces: Piece[] = [];
   for (const row of rows) {
     const sorted = row.items.sort((a, b) => a.x - b.x);
@@ -208,6 +264,81 @@ function pageLines(page: PdfPageText, pageIndex: number): Line[] {
     ...mergePiecesIntoLines(right, pageIndex, 1),
     ...mergePiecesIntoLines(spanning.filter((p) => p.y >= columnTop), pageIndex, -1),
   ];
+}
+
+// ───────────────────────────── Page layouts (the pages view) ─────────────────────────────
+
+/** One line of text on a PDF page, in page units (the page is `width` × `height`, y grows downwards). */
+export interface PdfLineBox {
+  x0: number;
+  x1: number;
+  /** Baseline. */
+  y: number;
+  /** Font size: the line's box is taken to reach from y − 0.8 × size to y + 0.25 × size. */
+  size: number;
+  text: string;
+}
+
+/** What the pages view needs to know about one page besides its picture. */
+export interface PdfPageLayout {
+  width: number;
+  height: number;
+  /**
+   * The page is set in two columns. Its `lines` are in reading order (heading, left column, right
+   * column, foot), but lines of the two columns share heights, so they can't be followed as one
+   * top-to-bottom sequence: the pages view leaves such a page to the keyboard and to gestures.
+   */
+  columns: boolean;
+  lines: PdfLineBox[];
+}
+
+/** The original file and its pages' line boxes: kept beside the extracted text so the pages can be shown as they are. */
+export interface PdfSource {
+  bytes: ArrayBuffer;
+  pages: PdfPageLayout[];
+}
+
+/** PDFs larger than this are not kept for the pages view (browser storage is limited). */
+export const MAX_PDF_SOURCE_BYTES = 64 * 1024 * 1024;
+/** At most this many characters of a line are kept (a line box only needs to be found, not read from here). */
+const MAX_LINE_TEXT = 400;
+
+/** Line boxes of every page, in reading order. Pure: the same grouping the text reconstruction uses. */
+export function layoutPdfPages(pages: readonly PdfPageText[]): PdfPageLayout[] {
+  return pages.map((page, index) => {
+    const width = Number.isFinite(page.width) && page.width > 0 ? page.width : 0;
+    const height = Number.isFinite(page.height) && page.height > 0 ? page.height : 0;
+    if (!width || !height) return { width: width || 1, height: height || 1, columns: false, lines: [] };
+    const columns = findGutter(pagePieces(page), width) !== null;
+    const lines: PdfLineBox[] = [];
+    for (const l of pageLines(page, index)) {
+      // Inside the page, and wide enough to be a line rather than a stray mark.
+      if (!(l.x1 > l.x0) || l.y <= 0 || l.y - l.size > height || l.x1 <= 0 || l.x0 >= width) continue;
+      lines.push({ x0: Math.max(0, l.x0), x1: Math.min(width, l.x1), y: l.y, size: l.size, text: l.text.slice(0, MAX_LINE_TEXT) });
+    }
+    return { width, height, columns, lines };
+  });
+}
+
+/** Sources of PDFs parsed in this page load, until whoever opens the book collects them (by the parsed book's id). */
+const pendingSources = new Map<string, PdfSource>();
+const MAX_PENDING_SOURCES = 2;
+
+/**
+ * The source of a PDF that parsePdf produced a book with this id from, once: the caller stores it
+ * with the book (library.savePdfSource). Null for anything else, or when the file was too large.
+ */
+export function takePdfSource(bookId: string): PdfSource | null {
+  const source = pendingSources.get(bookId) ?? null;
+  pendingSources.delete(bookId);
+  return source;
+}
+
+function rememberSource(bookId: string, source: PdfSource): void {
+  pendingSources.delete(bookId);
+  pendingSources.set(bookId, source);
+  // Books that were parsed and never opened (a newer request won) don't pile up.
+  while (pendingSources.size > MAX_PENDING_SOURCES) pendingSources.delete(pendingSources.keys().next().value as string);
 }
 
 /**
@@ -505,14 +636,16 @@ export async function parsePdf(data: ArrayBuffer, opts: ParseOptions = {}): Prom
     if (chars < 40 || blocks.length === 0) {
       throw new BookLoadError(
         'empty',
-        'This PDF has no selectable text — it’s probably scanned page images. Try a text-based version, or run it through OCR first.',
+        chars === 0
+          ? 'This PDF has no selectable text — it’s probably scanned page images. Try a text-based version, or run it through OCR first.'
+          : 'This PDF has almost no selectable text (a few words at most), so there is nothing to read as a book. If its pages are scanned images, run it through OCR first.',
       );
     }
 
     const meta = await doc.getMetadata().catch(() => null);
     const infoTitle = metadataString(meta?.info, 'Title');
     const firstHeading = blocks.find((b) => b.kind === 'heading')?.text ?? null;
-    return finalizeBook(
+    const book = finalizeBook(
       {
         title: infoTitle && !JUNK_TITLE.test(infoTitle) ? infoTitle : firstHeading ? tameShouting(firstHeading) : null,
         author: metadataString(meta?.info, 'Author'),
@@ -521,9 +654,92 @@ export async function parsePdf(data: ArrayBuffer, opts: ParseOptions = {}): Prom
       },
       blocksToDrafts(blocks),
     );
+    // pdf.js was handed a copy, so `data` is still whole: keep it for the pages view. (Not in the
+    // Artifact frame, whose content policy doesn't let pdf.js load a document's embedded fonts.)
+    if (!IS_ARTIFACT && data.byteLength > 0 && data.byteLength <= MAX_PDF_SOURCE_BYTES) {
+      rememberSource(book.id, { bytes: data, pages: layoutPdfPages(pages) });
+    }
+    return book;
   } catch (err) {
     throw err instanceof BookLoadError ? err : pdfError(err);
   } finally {
     void task.destroy();
   }
+}
+
+// ─────────────────────────────── Page pictures ───────────────────────────────
+
+/** An open PDF that draws its pages (the pages view). */
+export interface PdfDocumentHandle {
+  readonly pageCount: number;
+  /**
+   * Draws page `index` (0-based) into `canvas`, `cssWidth` CSS px wide at `pixelRatio` device px
+   * per CSS px (the canvas is resized to fit). Resolves true when the page was drawn, false when
+   * the drawing was cancelled (by `cancel`, a newer render into the same canvas, or `destroy`).
+   */
+  render(index: number, canvas: HTMLCanvasElement, cssWidth: number, pixelRatio: number): Promise<boolean>;
+  /** Stops the drawing into `canvas`, if one is running. */
+  cancel(canvas: HTMLCanvasElement): void;
+  destroy(): void;
+}
+
+/** A page is never drawn larger than this many device px (a canvas that size is ≈ 64 MB). */
+const MAX_PAGE_PIXELS = 16_000_000;
+
+/** Opens a PDF for drawing. Rejects with a BookLoadError when it can't be read. */
+export async function openPdfDocument(bytes: ArrayBuffer): Promise<PdfDocumentHandle> {
+  const pdfjs = await loadPdfJs();
+  // pdf.js detaches the buffer it is given: hand it a copy, the caller keeps theirs.
+  const task = pdfjs.getDocument({ data: new Uint8Array(bytes.slice(0)), verbosity: 0, stopAtErrors: false });
+  let doc: Awaited<typeof task.promise>;
+  try {
+    doc = await task.promise;
+  } catch (err) {
+    void task.destroy();
+    throw pdfError(err);
+  }
+  let destroyed = false;
+  const running = new Map<HTMLCanvasElement, { cancel(): void }>();
+  return {
+    pageCount: doc.numPages,
+    async render(index, canvas, cssWidth, pixelRatio) {
+      if (destroyed || !(cssWidth > 0) || index < 0 || index >= doc.numPages) return false;
+      running.get(canvas)?.cancel();
+      const page = await doc.getPage(index + 1);
+      if (destroyed) return false;
+      const base = page.getViewport({ scale: 1 });
+      let scale = (cssWidth / base.width) * (pixelRatio > 0 ? pixelRatio : 1);
+      const pixels = base.width * base.height * scale * scale;
+      if (pixels > MAX_PAGE_PIXELS) scale *= Math.sqrt(MAX_PAGE_PIXELS / pixels);
+      const viewport = page.getViewport({ scale });
+      canvas.width = Math.max(1, Math.floor(viewport.width));
+      canvas.height = Math.max(1, Math.floor(viewport.height));
+      // Pictures only: no link or form annotations are drawn, and nothing in the file is run.
+      const task = page.render({ canvas, viewport, annotationMode: pdfjs.AnnotationMode.DISABLE });
+      const entry = { cancel: () => task.cancel() };
+      running.set(canvas, entry);
+      try {
+        await task.promise;
+        return !destroyed;
+      } catch (err) {
+        const name = err && typeof err === 'object' && 'name' in err ? String((err as { name: unknown }).name) : '';
+        if (name === 'RenderingCancelledException') return false;
+        throw err;
+      } finally {
+        if (running.get(canvas) === entry) running.delete(canvas);
+        page.cleanup();
+      }
+    },
+    cancel(canvas) {
+      running.get(canvas)?.cancel();
+      running.delete(canvas);
+    },
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      for (const r of running.values()) r.cancel();
+      running.clear();
+      void task.destroy();
+    },
+  };
 }

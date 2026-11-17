@@ -6,9 +6,10 @@
   "type": "module",
   "scripts": {
     "copy-wasm": "node scripts/copy-mediapipe-wasm.mjs public/mediapipe/wasm",
-    "predev": "npm run copy-wasm",
+    "fetch-model": "node scripts/fetch-face-model.mjs public/mediapipe/models",
+    "predev": "npm run copy-wasm && npm run fetch-model",
     "dev": "vite",
-    "prebuild": "npm run copy-wasm",
+    "prebuild": "npm run copy-wasm && npm run fetch-model -- --required",
     "build": "vite build",
     "preview": "vite preview",
     "build:ext": "node scripts/build-extension.mjs",
@@ -22,7 +23,7 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@mediapipe/tasks-vision": "^1.0.1",
+    "@mediapipe/tasks-vision": "1.0.1",
     "jszip": "^3.10.2",
     "pdfjs-dist": "^6.3.289"
   },
