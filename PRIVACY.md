@@ -46,13 +46,18 @@ requests they make.
 **Web app** (in your browser's storage for the site, on your computer):
 
 - your library: books you open or paste, their text and your reading positions (IndexedDB);
+- for a scanned PDF, the text recognized from its pages (OCR), which is done by your browser on
+  your device: the recognition engine and its language data are part of the app, and neither the
+  pages nor the text are sent anywhere;
 - for PDFs you open from a file, the file itself and where the lines are on its pages (IndexedDB,
   a database named `gazeReaderPdf`), so the app can show the PDF's own pages. It is removed when
   you remove the book. Which view you last chose for a PDF is kept with your settings;
 - your settings and your calibration (`localStorage`), together with a few small markers: that
   you have seen the introduction, when the "please calibrate once more" note was shown, which view
   you chose for each PDF, and that the pages view was pointed out for it. A calibration is a small
-  set of numbers that map eye measurements to screen positions. It also keeps a short summary of
+  set of numbers that map eye measurements to screen positions, including, after its
+  head-movement step, a few numbers for how your head's position changes that mapping (no
+  recording of the movement itself is kept). It also keeps a short summary of
   the conditions while you calibrated: a few lighting ratios (such as the whites of your eyes
   against the background, or one side of your face against the other) and how open your eyes
   were, so the app can tell later when the light has changed. The summary is made of ratios and
