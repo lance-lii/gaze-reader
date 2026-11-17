@@ -65,6 +65,31 @@ describe('LibraryScreen', () => {
     expect(error.textContent).toBe('');
   });
 
+  it('offers Cancel beside the busy note for work that can be stopped, and only then', () => {
+    let cancelled = 0;
+    // As the app does: cancelling gives the library back (the buttons it had disabled) at once.
+    screen = new LibraryScreen({
+      ...options(),
+      onCancelOpen: () => {
+        cancelled++;
+        screen.setBusy(null);
+      },
+    });
+    screen.mount(document.body);
+    const cancel = screen.el.querySelector<HTMLButtonElement>('.gr-drop__busy-cancel')!;
+    const label = screen.el.querySelector<HTMLElement>('.gr-drop__busy-label')!;
+    screen.setBusy('Preparing your text…');
+    expect(cancel.hidden).toBe(true);
+    screen.setBusy('This PDF is scanned pages: reading their text, page 3 of 40…', true);
+    expect(cancel.hidden).toBe(false);
+    expect(cancel.disabled).toBe(false); // the other buttons are; this one is how to get out
+    expect(label.textContent).toMatch(/page 3 of 40/);
+    cancel.click();
+    expect(cancelled).toBe(1);
+    expect(cancel.hidden).toBe(true);
+    expect(document.activeElement).toBe(screen.el.querySelector('.gr-lib-choose')); // not dropped with the hidden button
+  });
+
   it('marks the paste box invalid and resetForms clears every error', () => {
     const s = mount();
     s.showOpenError('paste', 'Nothing readable in there.');

@@ -304,7 +304,7 @@ export class AppController {
   /** The open book is a PDF whose original file is kept: it can be shown as pages or as text. */
   private pdfAvailable = false;
   /** Stops the "Open from URL" download in flight, if any. */
-  private urlAbort: AbortController | null = null;
+  private openAbort: AbortController | null = null;
   /** Date.now() of the last heartbeat with a book open (the eye-break timer's wall clock). */
   private lastHeartbeatWall: number | null = null;
   /** The pinch-zoom notice has been shown for the pinch in progress. */
@@ -552,8 +552,8 @@ export class AppController {
     this.savePositionNow();
     this.destroyed = true;
     this.store.dispose?.();
-    this.urlAbort?.abort();
-    this.urlAbort = null;
+    this.openAbort?.abort();
+    this.openAbort = null;
     this.sourceGen++;
     this.teardownSource();
     this.recorder.discard();
@@ -715,7 +715,13 @@ export class AppController {
   }
 
   private openFromFile(file: File): Promise<boolean> {
-    return this.openWith(`Opening “${file.name}”…`, () => loadBookFromFile(file), 'file');
+    // Cancellable: a scanned PDF's text recognition can take minutes.
+    this.openAbort?.abort();
+    const abort = new AbortController();
+    this.openAbort = abort;
+    return this.openWith(`Opening “${file.name}”…`, (onProgress) => loadBookFromFile(file, { signal: abort.signal, onProgress }), 'file').finally(() => {
+      if (this.openAbort === abort) this.openAbort = null;
+    });
   }
 
   private openFromText(text: string, title: string | null): Promise<boolean> {
@@ -734,19 +740,19 @@ export class AppController {
     } catch {
       /* keep the raw text */
     }
-    this.urlAbort?.abort();
+    this.openAbort?.abort();
     const abort = new AbortController();
-    this.urlAbort = abort;
-    return this.openWith(`Fetching from ${host}…`, () => loadBookFromUrl(url, { signal: abort.signal }), 'url').finally(() => {
-      if (this.urlAbort === abort) this.urlAbort = null;
+    this.openAbort = abort;
+    return this.openWith(`Fetching from ${host}…`, (onProgress) => loadBookFromUrl(url, { signal: abort.signal, onProgress }), 'url').finally(() => {
+      if (this.openAbort === abort) this.openAbort = null;
     });
   }
 
-  /** Cancel in the library's URL form: stop the download and give the library back. */
+  /** Cancel in the library (the URL form, or beside the busy note): stop the download or the text recognition and give the library back. */
   private cancelOpen(): void {
-    const abort = this.urlAbort;
+    const abort = this.openAbort;
     if (!abort) return;
-    this.urlAbort = null;
+    this.openAbort = null;
     this.openSeq++; // whatever that request still returns is no longer wanted
     abort.abort();
     this.library.setBusy(null);
@@ -769,13 +775,20 @@ export class AppController {
    * library control that started it, so a failure is explained right there (and stays) instead
    * of in a toast far from the form.
    */
-  private async openWith(label: string, load: () => Promise<Book>, origin?: 'url' | 'paste' | 'file'): Promise<boolean> {
+  private async openWith(label: string, load: (onProgress: (message: string) => void) => Promise<Book>, origin?: 'url' | 'paste' | 'file'): Promise<boolean> {
     const seq = ++this.openSeq;
     const fromLibrary = this.screen === 'library';
-    this.library.setBusy(label);
-    const busyToast = this.screen === 'reader' ? this.toasts.show({ id: 'opening', message: label, durationMs: 0 }) : null;
+    const cancellable = origin === 'url' || origin === 'file';
+    this.library.setBusy(label, cancellable);
+    let busyToast = this.screen === 'reader' ? this.toasts.show({ id: 'opening', message: label, durationMs: 0 }) : null;
+    // What a long load says it is doing (reading a scanned PDF's pages) replaces the label.
+    const onProgress = (message: string): void => {
+      if (seq !== this.openSeq || this.destroyed) return;
+      this.library.setBusy(message, cancellable);
+      if (busyToast) busyToast = this.toasts.show({ id: 'opening', message, durationMs: 0 });
+    };
     try {
-      const book = await load();
+      const book = await load(onProgress);
       if (seq !== this.openSeq || this.destroyed) return false;
       await this.openBook(book, seq);
       this.library.resetForms();
@@ -868,7 +881,8 @@ export class AppController {
       throw err;
     }
     this.startSession(book, position);
-    if (pdfAvailable && !pages) this.offerPdfPages(book);
+    if (freshPdf?.recognized && !pages) this.explainRecognizedPdf(freshPdf.recognized, pdfAvailable);
+    else if (pdfAvailable && !pages) this.offerPdfPages(book);
   }
 
   /** Puts the book on screen: a PDF's own pages when they were asked for and could be opened, its text otherwise. */
@@ -916,6 +930,17 @@ export class AppController {
   }
 
   /** Once per book: a PDF opens as text (the best page turning); say that its own pages are a key away. */
+  /** A scanned PDF whose text was just read off its pictures: say so (it will have mistakes), and where the pictures are. */
+  private explainRecognizedPdf(pages: number, pdfAvailable: boolean): void {
+    writeJSON(`${PDF_VIEW_OFFERED_PREFIX}${this.session?.book.id ?? ''}`, 1); // this says it; not the general note as well, next time
+    this.toasts.show({
+      id: 'pdf-pages',
+      message: `This PDF is scanned pages. Its text was read off the ${pages === 1 ? 'picture' : `${pages} pictures`} on this device, so expect the odd wrong letter.${pdfAvailable ? ' The pages themselves are one key away: V.' : ''}`,
+      ...(pdfAvailable ? { actions: [{ label: 'Show the pages', primary: true, run: () => void this.togglePdfView() }] } : {}),
+      durationMs: 14_000,
+    });
+  }
+
   private offerPdfPages(book: Book): void {
     const key = `${PDF_VIEW_OFFERED_PREFIX}${book.id}`;
     if (readJSON<unknown>(key, null) !== null) return;
