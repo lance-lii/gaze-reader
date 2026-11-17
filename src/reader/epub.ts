@@ -125,7 +125,12 @@ export function resolveZipPath(baseDir: string, href: string): string {
  * MAX_BOOK_BYTES limits the ZIP; a 2 MB EPUB can still inflate to 500 MB (deflate reaches
  * ~1000:1), which would freeze and then crash the tab. These cap what is unpacked instead.
  */
-export const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
+/**
+ * One document of a book (a chapter, the table of contents): each is decoded to a string and
+ * handed to the HTML parser whole, where 60 MB of "<p>a</p>" is nine million elements and a frozen
+ * tab. 16 MB is two million words in one chapter, more than any book has in all of them.
+ */
+export const MAX_ENTRY_BYTES = 16 * 1024 * 1024;
 export const MAX_INFLATED_BYTES = 256 * 1024 * 1024;
 
 /** Public JSZip API (async() is built on it) that jszip's index.d.ts leaves out. */

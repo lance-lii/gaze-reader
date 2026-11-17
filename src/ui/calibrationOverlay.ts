@@ -104,6 +104,12 @@ export interface CalibrationOverlayOptions {
   timing?: Partial<CalibrationTiming>;
   /** Target-order randomness (tests). Default Math.random. */
   random?: () => number;
+  /**
+   * Which key presses count. On someone else's web page (the extension) only real ones do: the
+   * page's own scripts can dispatch a fake Escape to cancel every calibration, or Space to pause
+   * one. Default: every key press (the app's own page, and tests).
+   */
+  isTrustedKey?: (e: KeyboardEvent) => boolean;
 }
 
 export interface CalibrationResult {
@@ -185,7 +191,16 @@ export interface CalibrationTiming {
   startAnywayMs: number;
   /** Minimum time the "learning" screen stays up (it reads as work, not a glitch). */
   minTrainingMs: number;
+  /**
+   * After a "once more" or "the dots start over" notice, the next dot waits this long (the notice
+   * is on screen for as long). Someone reading the notice is looking at it, half a screen from the
+   * dot, and without the wait most of the dot's samples were collected meanwhile.
+   */
+  noticeMs: number;
 }
+
+/** How long a notice (toast) stays on screen, ms. */
+const NOTICE_MS = 1800;
 
 export const DEFAULT_CALIBRATION_TIMING: Readonly<CalibrationTiming> = Object.freeze({
   appearMs: 500,
@@ -200,6 +215,7 @@ export const DEFAULT_CALIBRATION_TIMING: Readonly<CalibrationTiming> = Object.fr
   readyHoldMs: 500,
   startAnywayMs: 8000,
   minTrainingMs: 700,
+  noticeMs: NOTICE_MS,
 });
 
 /** Target positions as fractions of the viewport. */
@@ -788,8 +804,10 @@ export class CalibrationOverlay implements Mountable {
     let restart = false;
     for (;;) {
       this.runMode = mode;
-      if (restart) this.showToast('The window changed, so the dots start over.');
-      else await this.positioning(signal, mode);
+      if (restart) {
+        this.showToast('The window changed, so the dots start over.');
+        await this.sleep(this.timing.noticeMs, signal); // read it first, then follow the dots
+      } else await this.positioning(signal, mode);
       restart = false;
       // The saved model can't read today's features: only a full calibration helps.
       if (mode !== 'standard' && base && this.lastFeatureLength !== null && this.lastFeatureLength !== base.featureLength) {
@@ -1069,6 +1087,11 @@ export class CalibrationOverlay implements Mountable {
           if (announce) {
             this.emit({ phase: kind, index, total, ...(attempts > 0 ? { message: 'retry' } : {}) });
             announce = false;
+            if (attempts > 0) {
+              // The "once more" notice is up: let the reader finish it before the dot counts again.
+              await this.sleep(this.timing.noticeMs, signal);
+              continue; // paused or resized meanwhile? check again, then show the dot
+            }
           }
           const got = await this.presentTarget(fractions[index], appear, signal);
           appear = false;
@@ -1209,6 +1232,7 @@ export class CalibrationOverlay implements Mountable {
     if (win && !this.listening) {
       win.addEventListener('keydown', this.handleKeydown, true);
       win.addEventListener('resize', this.handleResize);
+      root.ownerDocument.addEventListener('visibilitychange', this.handleVisibility);
       this.listening = true;
     }
     root.focus({ preventScroll: true });
@@ -1224,6 +1248,7 @@ export class CalibrationOverlay implements Mountable {
     if (this.listening && win) {
       win.removeEventListener('keydown', this.handleKeydown, true);
       win.removeEventListener('resize', this.handleResize);
+      this.root?.ownerDocument.removeEventListener('visibilitychange', this.handleVisibility);
     }
     this.listening = false;
     for (const id of this.intervals) clearInterval(id);
@@ -1282,6 +1307,7 @@ export class CalibrationOverlay implements Mountable {
   private readonly handleKeydown = (e: KeyboardEvent): void => {
     const root = this.root;
     if (!root || root.hidden || this.phase === 'idle') return;
+    if (this.opts.isTrustedKey && !this.opts.isTrustedKey(e)) return;
     // The overlay is modal: shortcuts of the page behind (Space = next page…) must not fire.
     e.stopPropagation();
     if (e.key === 'Escape' || e.key === 'Esc') {
@@ -1351,6 +1377,18 @@ export class CalibrationOverlay implements Mountable {
       default:
         break;
     }
+  };
+
+  /**
+   * The tab was hidden in the middle of the dots: pause, and let the reader continue when they are
+   * back. A hidden tab still gets a camera frame a second, enough to keep the "face lost" pause
+   * away and far too few for a dot, so each dot used up its attempts and was skipped: a calibration
+   * trained on nine dots of thirteen, without a word.
+   */
+  private readonly handleVisibility = (): void => {
+    const doc = this.root?.ownerDocument;
+    if (!doc || doc.visibilityState !== 'hidden') return;
+    if ((this.phase === 'targets' || this.phase === 'validating') && !this.paused) this.pause('user');
   };
 
   /** Without a keyboard (tablets) a tap is the only way to reach Pause/Cancel mid-run. */
@@ -1748,7 +1786,7 @@ export class CalibrationOverlay implements Mountable {
     this.toastTimer = setTimeout(() => {
       this.toastTimer = null;
       this.dom?.toast.classList.remove('is-on');
-    }, 1800);
+    }, NOTICE_MS);
   }
 
   // ──────────────────────────────── Results ──────────────────────────────────

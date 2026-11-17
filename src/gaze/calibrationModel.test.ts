@@ -653,17 +653,146 @@ describe('gaze-excluded features (the lids)', () => {
     expect(custom.diagnostics.excludedFeatures).toEqual([2]);
   });
 
-  it('covers exactly the lid-driven entries of FEATURE_NAMES and head yaw/pitch, never the 5-point iris, eyeLook, roll or head position', () => {
+  it('covers exactly the lid-driven entries of FEATURE_NAMES and the head pose, never the 5-point iris or eyeLook', () => {
     const all: readonly string[] = FEATURE_NAMES;
     for (const name of GAZE_EXCLUDED_FEATURES) expect(all).toContain(name);
     expect([...GAZE_EXCLUDED_FEATURES].sort()).toEqual(
-      ['eyeBlinkLeft', 'eyeBlinkRight', 'rightOpen', 'leftOpen', 'rightLidY', 'leftLidY', 'rightV', 'leftV', 'meanV', 'rightU', 'leftU', 'meanU', 'yaw', 'pitch'].sort(),
+      [
+        'eyeBlinkLeft', 'eyeBlinkRight', 'rightOpen', 'leftOpen', 'rightLidY', 'leftLidY', 'rightV', 'leftV', 'meanV', 'rightU', 'leftU', 'meanU',
+        'yaw', 'pitch', 'roll', 'tx', 'ty', 'tz', 'faceScale',
+      ].sort(),
     );
     const used = FEATURE_NAMES.filter((n) => !GAZE_EXCLUDED_FEATURES.has(n));
-    expect(used).toEqual(
-      expect.arrayContaining(['rightU5', 'rightVc5', 'leftU5', 'leftVc5', 'meanU5', 'meanVc5', 'eyeLookUpLeft', 'eyeLookDownRight', 'eyeLookInLeft', 'eyeLookOutRight', 'roll', 'tx', 'ty', 'tz', 'faceScale']),
+    expect([...used].sort()).toEqual(
+      [
+        'rightU5', 'rightVc5', 'leftU5', 'leftVc5', 'meanU5', 'meanVc5',
+        'eyeLookUpLeft', 'eyeLookUpRight', 'eyeLookDownLeft', 'eyeLookDownRight', 'eyeLookInLeft', 'eyeLookInRight', 'eyeLookOutLeft', 'eyeLookOutRight',
+      ].sort(),
     );
-    expect(used).toHaveLength(19);
+  });
+});
+
+describe('distance compensation', () => {
+  // The synthetic eye's feature 6 is the head's distance; here feature 7 plays faceScale (0.1 at
+  // calibration, with a little noise) and feature 5 head yaw.
+  const names = Array.from({ length: FEATURE_COUNT }, (_, i) => (i === 7 ? 'faceScale' : i === 5 ? 'yaw' : `f${i}`));
+  const withScale = (s: CalibrationSample, r: () => number): CalibrationSample => ({
+    ...s,
+    features: { ...s.features, vector: s.features.vector.map((v, i) => (i === 7 ? 0.1 + 0.0005 * gaussian(r) : v)) },
+  });
+  const samples = (seed: number): CalibrationSample[] => {
+    const r = rng(seed + 1000);
+    return collect(GRID, 25, seed).map((s) => withScale(s, r));
+  };
+  const CAMERA = { x: VIEWPORT.width / 2, y: -100 };
+  const at = (scale: number, yaw = 0): EyeFeatures => {
+    const f = eyeFeatures(GRID[10], rng(162), { noise: 0 });
+    return { ...f, vector: f.vector.map((v, i) => (i === 7 ? scale : i === 5 ? yaw : v)) };
+  };
+
+  it('scales the prediction about the camera by the change of distance read from the face size', () => {
+    const { model } = trainGazeModel(samples(161), { viewport: VIEWPORT, featureNames: names, excludedFeatures: ['faceScale', 'yaw'], camera: CAMERA });
+    const dc = model.depthCompensation!;
+    expect(dc.ref).toBeCloseTo(0.1, 3);
+    expect(dc.camera).toEqual(CAMERA);
+    expect(dc.scaleIndex).toBe(7);
+    expect(dc.yawIndex).toBe(5);
+
+    const same = model.predict(at(dc.ref))!;
+    // Leaning in: the face is 10 % larger, so the reader is at 1/1.1 of the distance and looks at a
+    // point that much nearer the camera.
+    const near = model.predict(at(dc.ref * 1.1))!;
+    expect(near.x - CAMERA.x).toBeCloseTo((same.x - CAMERA.x) / 1.1, 6);
+    expect(near.y - CAMERA.y).toBeCloseTo((same.y - CAMERA.y) / 1.1, 6);
+    const far = model.predict(at(dc.ref / 1.2))!;
+    expect(far.y - CAMERA.y).toBeCloseTo((same.y - CAMERA.y) * 1.2, 6);
+    // A turned head looks narrower without being further away.
+    const turned = model.predict(at(dc.ref * Math.cos(0.3), 0.3))!;
+    expect(turned.y).toBeCloseTo(same.y, 6);
+    // Bounded: a face size that makes no sense (a tracking glitch, another face) moves it only so far.
+    const tiny = model.predict(at(dc.ref / 10))!;
+    expect(tiny.y - CAMERA.y).toBeCloseTo((same.y - CAMERA.y) * 1.4, 6);
+    const huge = model.predict(at(dc.ref * 10))!;
+    expect(huge.y - CAMERA.y).toBeCloseTo((same.y - CAMERA.y) * 0.7, 6);
+    expect(model.predict(at(0))!.y).toBeCloseTo(same.y, 6);
+  });
+
+  it('applies before the quick refresh’s adjustment, and follows the window', () => {
+    const win = { screenX: 200, screenY: 100, innerWidth: VIEWPORT.width, innerHeight: VIEWPORT.height };
+    vi.stubGlobal('window', win);
+    const { model } = trainGazeModel(samples(163), { viewport: VIEWPORT, featureNames: names, excludedFeatures: ['faceScale', 'yaw'], camera: CAMERA });
+    // The camera is stored in screen space: viewport px + the window's origin at calibration.
+    expect(model.depthCompensation!.camera).toEqual({ x: CAMERA.x + 200, y: CAMERA.y + 100 });
+    const ref = model.depthCompensation!.ref;
+    const same = model.predict(at(ref))!;
+    const near = model.predict(at(ref * 1.1))!;
+    win.screenX = 260; // the window is dragged: the camera stays where it is on the screen
+    win.screenY = 75;
+    expect(model.predict(at(ref * 1.1))!.x).toBeCloseTo(near.x - 60, 6);
+    expect(model.predict(at(ref * 1.1))!.y).toBeCloseTo(near.y + 25, 6);
+    win.screenX = 200;
+    win.screenY = 100;
+
+    const shifted = model.withAdjustment({ sx: 1, ox: 30, sy: 1, oy: -20 }, { viewport: VIEWPORT, trainedAt: 5 });
+    expect(shifted.depthCompensation).toEqual(model.depthCompensation);
+    expect(shifted.predict(at(ref))!.y).toBeCloseTo(same.y - 20, 6);
+    expect(shifted.predict(at(ref * 1.1))!.y).toBeCloseTo(near.y - 20, 6);
+  });
+
+  it('is on only when the regression leaves faceScale alone, and can be forced or switched off', () => {
+    const s = samples(164);
+    // No names: the vector is opaque, so no compensation (and nothing excluded).
+    expect(trainGazeModel(s, { viewport: VIEWPORT }).model.depthCompensation).toBeNull();
+    // faceScale fitted as a feature (the older behaviour): correcting as well would count the distance twice.
+    expect(trainGazeModel(s, { viewport: VIEWPORT, featureNames: names, excludedFeatures: [] }).model.depthCompensation).toBeNull();
+    expect(trainGazeModel(s, { viewport: VIEWPORT, featureNames: names, excludedFeatures: [], depthCompensation: true }).model.depthCompensation).not.toBeNull();
+    expect(trainGazeModel(s, { viewport: VIEWPORT, featureNames: names, excludedFeatures: ['faceScale'], depthCompensation: false }).model.depthCompensation).toBeNull();
+    // Without a yaw feature: no foreshortening correction.
+    const noYaw = names.map((n) => (n === 'yaw' ? 'f5' : n));
+    expect(trainGazeModel(s, { viewport: VIEWPORT, featureNames: noYaw, excludedFeatures: ['faceScale'] }).model.depthCompensation!.yawIndex).toBe(-1);
+    // By default the camera is taken to be above the middle of the viewport's top edge when there is no window.
+    const assumed = trainGazeModel(s, { viewport: VIEWPORT, featureNames: names, excludedFeatures: ['faceScale'] }).model.depthCompensation!.camera;
+    expect(assumed.x).toBe(VIEWPORT.width / 2);
+    expect(assumed.y).toBeLessThan(0);
+    expect(assumed.y).toBeGreaterThan(-300);
+  });
+
+  it('places the camera above the middle of the screen the window is on', () => {
+    const win = {
+      screenX: 300,
+      screenY: 60,
+      innerWidth: VIEWPORT.width,
+      innerHeight: 700,
+      outerHeight: 790,
+      devicePixelRatio: 2,
+      screen: { width: 1728, availLeft: 0, availTop: 38 },
+      top: null as unknown,
+    };
+    win.top = win;
+    vi.stubGlobal('window', win);
+    const cam = trainGazeModel(samples(165), { viewport: VIEWPORT, featureNames: names, excludedFeatures: ['faceScale'] }).model.depthCompensation!.camera;
+    expect(cam.x).toBe(864);
+    // Screen top (38, below the menu bar) − the 90 px of browser chrome the model's space leaves out − the bezel.
+    expect(cam.y).toBe(38 - 90 - 36);
+    // The viewport's top is at screenY in that space: the camera is above it.
+    expect(cam.y).toBeLessThan(win.screenY);
+  });
+
+  it('round-trips through JSON, and a damaged or missing entry only switches it off', () => {
+    const { model } = trainGazeModel(samples(166), { viewport: VIEWPORT, featureNames: names, excludedFeatures: ['faceScale', 'yaw'], camera: CAMERA });
+    const json = JSON.parse(JSON.stringify(model.toJSON())) as Record<string, unknown>;
+    const restored = deserializeGazeModel(json, { featureNames: names })!;
+    expect(restored.depthCompensation).toEqual(model.depthCompensation);
+    const lean = at(model.depthCompensation!.ref * 1.15);
+    expect(restored.predict(lean)).toEqual(model.predict(lean));
+
+    const flat = model.predict(at(model.depthCompensation!.ref))!;
+    for (const depth of [undefined, null, 'x', { ref: 0, camera: CAMERA, scaleIndex: 7, yawIndex: 5 }, { ref: 0.1, camera: { x: 1 }, scaleIndex: 7, yawIndex: 5 }, { ref: 0.1, camera: CAMERA, scaleIndex: 99, yawIndex: 5 }, { ref: 0.1, camera: CAMERA, scaleIndex: 7, yawIndex: -2 }, { ref: 0.1, camera: CAMERA, scaleIndex: 7.5, yawIndex: 5 }]) {
+      const damaged = deserializeGazeModel({ ...json, depth }, { featureNames: names });
+      expect(damaged, JSON.stringify(depth)).not.toBeNull();
+      expect(damaged!.depthCompensation).toBeNull();
+      expect(damaged!.predict(lean)!.y).toBeCloseTo(flat.y, 6);
+    }
   });
 });
 

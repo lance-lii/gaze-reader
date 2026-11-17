@@ -170,7 +170,9 @@ async function main(): Promise<void> {
     ui.enabled.disabled = busy || restricted !== null || tabId === undefined;
     const [tone, text] = describePage(page, restricted !== null);
     ui.status.dataset.tone = tone;
-    ui.status.textContent = text;
+    // A live region: written only when it says something new, or a screen reader repeats it at
+    // every poll (and the frame rate, rounded to fives, doesn't change it every second).
+    if (ui.status.textContent !== text) ui.status.textContent = text;
 
     ui.notice.hidden = notice === null;
     ui.notice.textContent = notice?.text ?? '';
@@ -216,7 +218,7 @@ async function main(): Promise<void> {
     }
     const advice = l ? lightingAdvice(l.flags) : null;
     ui.light.dataset.tone = 'info';
-    ui.light.textContent = advice ?? '';
+    if (ui.light.textContent !== (advice ?? '')) ui.light.textContent = advice ?? '';
     ui.light.hidden = advice === null;
   }
 
@@ -353,7 +355,7 @@ function describePage(page: PageState, restricted: boolean): ['ok' | 'warn' | 'e
       // Page mode: no text lines to follow here, so the bottom edge turns the page.
       if (page.pageMode) return ['ok', mouse ? 'Following your mouse · page mode' : 'Reading along · page mode'];
       if (mouse) return ['ok', 'Following your mouse'];
-      return ['ok', page.fps ? `Reading along · ${Math.round(page.fps)} fps` : 'Reading along'];
+      return ['ok', page.fps ? `Reading along · ${Math.round(page.fps / 5) * 5 || Math.round(page.fps)} fps` : 'Reading along'];
     case 'no-face':
       return ['warn', mouse ? 'Point at the page' : "Can't see your eyes"];
     case 'poor':

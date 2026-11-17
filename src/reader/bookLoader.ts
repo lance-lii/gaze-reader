@@ -26,6 +26,12 @@ export class BookLoadError extends Error {
 
 /** Books above this size are refused before we try to parse them. */
 export const MAX_BOOK_BYTES = 200 * 1024 * 1024;
+/**
+ * Text, Markdown and web pages are parsed whole, in one go, on the page's own thread: a 200 MB
+ * file of them freezes the tab or runs it out of memory (a PDF or an EPUB of that size is mostly
+ * pictures and is read piece by piece). The longest novels are 3–7 MB as plain text.
+ */
+export const MAX_TEXT_BYTES = 32 * 1024 * 1024;
 const DEFAULT_URL_TIMEOUT_MS = 20_000;
 
 /** What every format parser produces; loaders stamp `source` and `addedAt` on top. */
@@ -835,6 +841,19 @@ function parsePlainText(raw: string): ParsedText {
     }
   }
 
+  // A book that numbers its chapters ("CHAPTER I", "Chapter 2", "III") marks them that way: a line
+  // in the running text that merely looks like a heading (a sign in capitals, "NO TRESPASSING"; a
+  // telegram; a short line after a scene break) is part of the story, not a chapter of its own.
+  // Titles that follow a heading directly stay ("CHAPTER I" / "THE ARRIVAL").
+  const numbered = units.filter((u) => u.kind === 'heading' && (u.keyword === 'chapter' || u.keyword === 'numeral')).length;
+  if (numbered >= 2) {
+    units = units.map((u, i) => {
+      const prev = units[i - 1];
+      if (u.kind !== 'heading' || u.keyword || i === 0 || prev?.kind === 'heading' || prev?.kind === 'title' || prev?.kind === 'byline') return u;
+      return { kind: 'para', text: u.lines.map((l) => l.trim()).join(' ') };
+    });
+  }
+
   const headings = units.filter((u): u is HeadingUnit => u.kind === 'heading');
   const hasChapters = headings.some((h) => h.keyword === 'chapter' || h.keyword === 'numeral');
   const partsExist = hasChapters && headings.some((h) => /^(book|part|volume|vol)$/.test(h.keyword ?? ''));
@@ -1246,6 +1265,30 @@ function hintOf(el: Element): string {
   return `${el.getAttribute('class') ?? ''} ${el.getAttribute('id') ?? ''}`;
 }
 
+const textLength = (el: Element): number => collapseWhitespace(el.textContent ?? '').length;
+
+/**
+ * A `form` or an `aria-hidden` block is page furniture (a search box, a closed dialog) unless it
+ * holds most of the text: ASP.NET pages wrap their whole body in one form, and a page saved with a
+ * dialog open has `aria-hidden` on everything behind it. Those are the page, not furniture.
+ */
+const WRAPPER_SHARE = 0.5;
+const isFormOrHidden = (el: Element): boolean => el.localName === 'form' || el.getAttribute('aria-hidden') === 'true';
+
+/**
+ * Running text: a few real paragraphs and few links. A block like that whose *id* happens to
+ * contain "related", "social", "sharing" or "comments" is a section of the document ("Related
+ * work", "Social impact": generated ids are slugs of headings), not a widget.
+ */
+function looksLikeProse(el: Element): boolean {
+  if (textLength(el) < 400 || linkDensity(el) > 0.25) return false;
+  let paragraphs = 0;
+  for (const p of Array.from(el.querySelectorAll('p'))) {
+    if (textLength(p) >= 80 && ++paragraphs >= 2) return true;
+  }
+  return false;
+}
+
 function linkDensity(el: Element): number {
   const total = collapseWhitespace(el.textContent ?? '').length;
   if (!total) return 0;
@@ -1263,8 +1306,19 @@ function linkDensity(el: Element): number {
 export function extractMainContent(doc: Document): Element {
   const body = doc.body ?? doc.documentElement;
   const scores = new Map<Element, number>();
+  const bodyText = textLength(body);
+  const wrappers = new Map<Element, boolean>();
+  const wrapsThePage = (el: Element): boolean => {
+    let known = wrappers.get(el);
+    if (known === undefined) {
+      known = isFormOrHidden(el) && textLength(el) > bodyText * WRAPPER_SHARE;
+      wrappers.set(el, known);
+    }
+    return known;
+  };
   for (const p of Array.from(body.querySelectorAll(PARAGRAPH_SELECTOR))) {
-    if (p.closest('nav, aside, footer, form, [role="navigation"], [role="complementary"], [aria-hidden="true"]')) continue;
+    const furniture = p.closest('nav, aside, footer, form, [role="navigation"], [role="complementary"], [aria-hidden="true"]');
+    if (furniture && !wrapsThePage(furniture)) continue;
     const text = collapseWhitespace(p.textContent ?? '');
     if (text.length < 25) continue;
     const score = 1 + (text.match(/[,，、]/g)?.length ?? 0) + Math.min(3, Math.floor(text.length / 100));
@@ -1308,12 +1362,21 @@ function stripBoilerplate(root: Element): void {
     'nav, aside, form, [role="navigation"], [role="complementary"], [role="search"], [aria-hidden="true"], [hidden], ' +
       '#pg-header, #pg-footer, .pg-boilerplate',
   );
-  for (const el of Array.from(junk)) el.remove();
+  const wholeText = textLength(root);
+  for (const el of Array.from(junk)) {
+    if (!root.contains(el)) continue; // already removed with an ancestor
+    if (isFormOrHidden(el) && textLength(el) > wholeText * WRAPPER_SHARE) continue; // the page itself, wrapped
+    el.remove();
+  }
   const rootText = collapseWhitespace(root.textContent ?? '').length;
   for (const el of Array.from(root.querySelectorAll('[class], [id]'))) {
     if (!root.contains(el)) continue; // already removed with an ancestor
     const hint = hintOf(el);
     if (!NEGATIVE_HINT.test(hint) || POSITIVE_HINT.test(hint)) continue;
+    // A heading's id is a slug of its words ("#comments", "#modal-verbs"): never a widget.
+    if (/^h[1-6]$/.test(el.localName)) continue;
+    // Named by its id alone, and it reads as a section of the text: "Related work", not "related posts".
+    if (!NEGATIVE_HINT.test(el.getAttribute('class') ?? '') && looksLikeProse(el)) continue;
     // A class name is only a hint: never throw away a large share of the text because of it.
     if (collapseWhitespace(el.textContent ?? '').length > rootText * 0.3) continue;
     el.remove();
@@ -1403,7 +1466,18 @@ export function decodeText(bytes: Uint8Array, charsetHint?: string | null): stri
   try {
     return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
   } catch {
-    /* not UTF-8 */
+    /* not strictly UTF-8 */
+  }
+  // UTF-8 with a damaged byte or two (a file cut mid-character, one bad paste) is still UTF-8:
+  // read as windows-1252, every accented letter and curly quote in it turned into "Ã©" and "â€™".
+  // In real windows-1252 text nearly every high byte is an invalid sequence; in damaged UTF-8 few are.
+  let high = 0;
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] >= 0x80) high++;
+  if (high > 0) {
+    const lenient = new TextDecoder('utf-8').decode(bytes);
+    let replaced = 0;
+    for (let i = lenient.indexOf('\ufffd'); i >= 0; i = lenient.indexOf('\ufffd', i + 1)) replaced++;
+    if (replaced * 10 < high) return lenient;
   }
   const hint = charsetHint?.trim().toLowerCase();
   if (hint && !/^utf-?8$/.test(hint)) {
@@ -1589,6 +1663,12 @@ async function parseBytes(
   if (kind === 'pdf') {
     const { parsePdf } = await import('./pdf');
     return parsePdf(toArrayBuffer(bytes), { fallbackTitle: opts.fallbackTitle });
+  }
+  if (bytes.length > MAX_TEXT_BYTES) {
+    throw new BookLoadError(
+      'too-large',
+      `That is too much text to open as one book (${Math.round(bytes.length / (1024 * 1024))} MB). Gaze Reader reads text and web pages up to ${MAX_TEXT_BYTES / (1024 * 1024)} MB; a long novel is about 5.`,
+    );
   }
   const charset = opts.charset ?? (kind === 'html' ? sniffHtmlCharset(bytes) : null);
   const text = decodeText(bytes, charset);

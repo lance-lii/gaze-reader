@@ -4,9 +4,13 @@ Gaze Reader is a browser app (plus a Chrome extension) that watches your eyes th
 the webcam while you read and **turns the page — scrolls — when you reach the bottom**.
 **Dewey**, a tiny nerd avatar, sits in the corner reading along with you.
 
-Everything runs locally. Video never leaves the device. The only network fetch is the
-MediaPipe face-landmarker model file (data, ~3.6 MB, cached by the browser; the web app has no
-offline mode, so the webcam needs a connection the first time it starts in a tab).
+Everything runs locally. Video never leaves the device. The MediaPipe face-landmarker model file
+(data, ~3.8 MB) ships with the app and the extension: `scripts/fetch-face-model.mjs` downloads it
+at build time into `public/mediapipe/models/` and refuses a file whose SHA-256 isn't the pinned
+one, and `faceTracker.ts` loads it from the app's own origin (`FACE_LANDMARKER_MODEL_PATH`),
+falling back to Google's storage only when that copy is missing. The built web app carries a
+Content-Security-Policy meta tag (vite.config.ts): scripts from the app's own files, WebAssembly
+and the hashed inline theme script only.
 
 ```
  camera ─► FaceLandmarker ─► EyeFeatures ─► GazeModel (ridge regression, calibrated)
@@ -163,8 +167,8 @@ features are now corner-referenced iris features with a 5-point iris centre (mea
 (`rightU5, rightVc5, leftU5, leftVc5, meanU5, meanVc5`, appended to FEATURE_NAMES). The lid-driven
 or superseded features (`eyeBlinkLeft/Right, rightOpen, leftOpen, rightLidY, leftLidY, rightV,
 leftV, meanV, rightU, leftU, meanU`, `GAZE_EXCLUDED_FEATURES`) are still extracted (blink gating,
-the eyelid monitor, diagnostics) but get exactly zero weight. `eyeLook*`, head roll and head position
-(`tx, ty, tz, faceScale`) stay; head yaw and pitch are excluded too (see *Head rotation* below). A 10 %
+the eyelid monitor, diagnostics) but get exactly zero weight. `eyeLook*` stay; the head's pose (`yaw,
+pitch, roll, tx, ty, tz, faceScale`) is excluded too (see *Head pose* below). A 10 %
 squint now moves the gaze 0.2–1.1 lines with the simulator's default 60/40 lower/upper-lid split.
 When the upper lid alone drops (the typical light response above), it moves 0.5–2.8 lines (1.0:
 1.7–5.5). The residual comes from the `eyeLook*` scores' lid coupling, and the reading layer's
@@ -181,10 +185,37 @@ reader who later sat with their chin 4° lower read 1.5–2.3 lines low; a 4° t
 70–122 px. `yaw` and `pitch` are therefore in `GAZE_EXCLUDED_FEATURES`: the same chin drop now
 moves the gaze 0.9–1.4 lines, the turn ≈ 43 px, and cross-validated calibration error is equal or
 better in all five worlds (bench/lighting/posture.bench.test.ts; guards in
-tests/lightingRobustness.test.ts). Roll stays (the features are measured in a face-aligned frame,
-which rolls with the head), and so does head position: leaning in or back changes the angle to the
-screen. Posture features enter linearly and stay clamped at ±6 calibration SDs; unclamped, the
-position weights extrapolate worse.
+tests/lightingRobustness.test.ts).
+
+**Head pose is not a gaze feature at all, and distance is corrected by geometry** (revised again
+after that). The same argument holds for roll and head position (`tx, ty, tz, faceScale`): the
+reader keeps still while calibrating, so their weights were fitted to millimetres of movement and
+then applied to centimetres. Sitting 3 cm to one side moved the gaze 0.8–1.1 lines; leaning 6 cm in
+or back 0.6–1.2, 10 cm about 2. They are all in
+`GAZE_EXCLUDED_FEATURES` now, and the one posture change whose effect is known is applied after the
+regression (`DepthCompensation` in calibrationModel.ts). The eye features are normalized by the
+eye's width, so they measure an angle (between where the eyes point and the line from the eye to
+the camera) that doesn't depend on distance; with the camera in the screen's plane the point looked
+at is distance × that angle away from the camera. The ridge maps learn that product at the
+calibration distance, so
+
+    gaze = camera + (distance now / distance at calibration) × (ridge prediction − camera)
+
+with the ratio read from `faceScale / cos(yaw)` (calibration's median over the current frame's,
+clamped to 0.7–1.4) and the camera taken to be 36 px above the middle of the top edge of the screen
+the window is on (`screen.availLeft/availTop/width`, less the browser chrome, which the model's
+screen space leaves out; above the middle of the viewport when there is no usable screen). A
+sideways or vertical move needs no correction: the reference line moves with the head. In
+simulation the 6 cm lean now moves the gaze 0.14–0.28 lines, 10 cm 0.13–0.19, 3 cm sideways
+0.17–0.24, a 4° tilt 0.16–0.23 (0.5–0.7), and cross-validated calibration error fell in all five
+worlds (1.14–1.48 → 1.07–1.24 lines); with the camera assumed 4 cm from where it is, the leans
+still cost only 0.3–0.7. End to end (`npm run eval`, Balanced, 33 simulated hours) unintended
+turns fell from 4.3 to 1.6 an hour, missed pages from 16.4 % to 13.2 %, and fixations on the
+reader's line rose from 74.9 % to 83.3 %. Not corrected: head pitch and yaw (a 4° chin drop still
+moves the gaze about a line, through the small depth offset between the eye corners and the
+eyeball's centre, which differs between people and can't be learned from a still head), and a
+camera that isn't near the top of the screen being read. Models saved before this carry no `depth`
+entry and keep predicting as they did until the reader recalibrates.
 
 MediaPipe 1.0.1 facts (verified in `node_modules/@mediapipe/tasks-vision/vision.d.ts`):
 `FilesetResolver.forVisionTasks(basePath)`, `FaceLandmarker.createFromOptions(fileset,
@@ -197,6 +228,22 @@ The WASM loader is injected with a `<script>` tag on the main thread (so it cann
 extension content script — the extension uses an offscreen document). Drive the loop with
 `video.requestVideoFrameCallback` when available, else `requestAnimationFrame`; skip frames when
 the video time hasn't advanced.
+
+**Head gestures** (`src/gaze/headGestures.ts`, setting `headGestures`, off by default). A pure
+`HeadGestureDetector.update({ t, features })` is fed every camera frame by the controller
+(`watchHeadGestures`, only while reading: not during calibration, under a dialog or in a hidden
+tab) and returns `'turn-right' | 'turn-left' | 'brows-up' | null`, which the controller runs as
+`page-forward`, `page-back` and `toggle-autoscroll`, with a toast naming what it understood. It
+reads `EyeFeatures.headPose` and the optional `EyeFeatures.browRaise` (mean of MediaPipe's
+browInnerUp / browOuterUp scores, never a gaze-model input). A turn is yaw leaving a running
+resting pose by ≥ 12° within 450 ms and returning (to 5°, or 35 % of its peak) within 1 s, with
+pitch and roll under 70 % of the yaw peak, the face's centre and size steady (a tracker hopping to
+another face moves both), at least two frames well out, 300 ms of rest before and 700 ms since the
+last gesture; it is reported 150 ms after the return, unless the head swings on to the other side
+(a shake). Eyebrows: 0.3 above their running resting level for 600 ms. Negative yaw is the
+reader's right (headPose.ts). Thresholds come from synthetic gestures and from the simulated
+readers of bench/endtoend (tests/headGestures.test.ts: no gesture in any scenario); they have not
+been tuned on recordings of people. The extension doesn't feed it yet.
 
 ### B · Calibration — `src/gaze/{ridge,calibrationModel}.ts`, `src/ui/calibrationOverlay.ts`
 
@@ -215,8 +262,9 @@ export function qualityFromError(errorPx: number, viewportHeight: number, linePi
 ```
 Model: standardize features (z-score from training data), neutralize `GAZE_EXCLUDED_FEATURES`
 (standardized value forced to 0 in training and prediction), expand with degree-2 terms for the
-strongest gaze features (iris `u5`/`vc5`, lookUp/Down) plus linear head pose, then two independent
-ridge regressions (x, y). The model kind is `gr-ridge-poly2-iris5`; 1.0 models are rejected on
+strongest gaze features (iris `u5`/`vc5`, lookUp/Down), then two independent
+ridge regressions (x, y), then the distance compensation (scale about the camera, see *Head pose*
+above) and the quick refresh's affine adjustment, both in screen space. The model kind is `gr-ridge-poly2-iris5`; 1.0 models are rejected on
 load and `calibrationUpgradeNeeded(json)` / `savedCalibrationNeedsUpgrade()` tell the app to ask
 for one recalibration. Every model stores a `CalibrationEnvironment`: the lighting signature built
 while the dots were shown, and an eyelid `AppearanceBaseline` (openness as a Theil–Sen line in the
@@ -226,7 +274,7 @@ is the accuracy check's measurement (mean signed prediction − target over the 
 drop samples with blink > 0.5 and per-target outliers (> 2.5 MAD) before fitting. `predict`
 returns viewport px compensated for window moves since calibration (store `window.screenX/Y` at
 train time; subtract the delta). Serialize everything needed (means, stds, weights, feature-length,
-viewport, screen offset, trainedAt). Reject deserialization when the feature length changed.
+viewport, screen offset, trainedAt, `depth`: reference face scale, camera point, feature indices). Reject deserialization when the feature length changed.
 
 ```ts
 // calibrationOverlay.ts
@@ -578,6 +626,32 @@ Rendering: a centered column (`max-width: <columnWidthCh>ch`), chapter headings,
 `c{chapter}-p{n}`, generous bottom padding (≈ 60 % of the viewport) so the last lines of the book can
 still be scrolled to the top, and an "End of book" marker. Reading typography CSS lives in
 `src/reader/reader.css.ts` (exported string, injected once).
+
+**The pages view of a PDF** (`pdf.ts`, `pdfStore.ts`, `ReaderView.openPages`). A PDF's text is
+still extracted into a Book (the text view, and what the library stores). Beside it, `parsePdf`
+keeps a `PdfSource`: the file's bytes and, per page, `PdfPageLayout { width, height, columns,
+lines: PdfLineBox[] }` from the same row and column grouping the text reconstruction uses
+(`layoutPdfPages`, pure). The loader hands it out once by the parsed book's id (`takePdfSource`);
+the controller stores it under the library's id in a database of its own (`pdfStore.ts`,
+`gazeReaderPdf`: megabytes per book, and no schema upgrade of the library's data; validated on
+read; kept in memory for the session when IndexedDB is missing or full; at most 64 MB per file).
+
+`ReaderView.openPages(book, source, position)` renders one `section.gr-pdf-page` per page (its
+aspect ratio from the page size): a `<canvas>` that `PdfDocumentHandle.render` draws when an
+IntersectionObserver sees the page within 1.5 view heights (one page at a time, at most 6 kept,
+redrawn 180 ms after the width changes, annotations and scripts off), and over it one absolutely
+positioned `div.gr-pdf-line` per line, in page-relative percentages, its font size in container
+query units and its text stretched to the line's width. The text is transparent, never
+`opacity: 0` or `visibility: hidden`, because **the line elements are what `measureLines`
+measures**: the reading pipeline is unchanged and follows a PDF page's lines as it follows any
+DOM text, and positions are anchored to them (`pg3-l12`) like paragraphs. Pages with
+`columns: true` or no lines get no line elements (lines of two columns share heights, which the
+line model's top-to-bottom order can't represent): nothing fires there by itself, and a badge in
+the page's corner says to use a key or a gesture. The controller chooses the view per book
+(`localStorage` `pdfView.<id>`, default text), switches with the `toggle-pdf-view` command (V, a
+top-bar button shown only when a source is kept) by rendering the other view at the same fraction
+and starting the session over, and closes the pdf.js document with the session. Not in the
+Artifact build (its content policy blocks a document's embedded fonts).
 
 ### E · Dewey the buddy — `src/buddy/{buddy,avatar,quips,styles}.ts`
 

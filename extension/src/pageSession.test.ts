@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppEvents, AppSettings, EventBus, EventName, LayoutChangeReason } from '../../src/types';
 import { DEFAULT_SETTINGS } from '../../src/core/settings';
 import { LineTracker } from '../../src/reading/lineTracker';
+import { FixationDetector } from '../../src/signal/fixations';
 import { KEYS } from './extStorage';
 import { PORT_TAB, type HubToTab } from './messages';
 import { PagePill } from './pagePill';
@@ -288,6 +289,43 @@ describe('PageSession', () => {
     vi.unstubAllGlobals();
   });
 
+  it('keeps the reading model out while the reader scrolls the page, until it settles', async () => {
+    document.body.innerHTML = `<div id="app" style="overflow-y: auto"><article>${'<p>Some reading text that goes on for a while.</p>'.repeat(30)}</article></div>`;
+    const app = document.getElementById('app')!;
+    let top = 0;
+    Object.defineProperty(app, 'scrollHeight', { configurable: true, value: 6000 });
+    Object.defineProperty(app, 'clientHeight', { configurable: true, value: 800 });
+    Object.defineProperty(app, 'scrollTop', { configurable: true, get: () => top, set: (v: number) => (top = v) });
+    const t = setup({ gazeSource: 'mouse' });
+    const session = await PageSession.start(t.deps);
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      // Only the session's reading pipeline feeds the line tracker (the debug overlay has a fixation detector of its own).
+      const fed = vi.spyOn(LineTracker.prototype, 'onSample'); // calls through
+      const fresh = vi.spyOn(FixationDetector.prototype, 'reset');
+      await vi.advanceTimersByTimeAsync(300);
+      expect(fed.mock.calls.length).toBeGreaterThan(3); // gaze samples reach the reading model while the page is still
+
+      // The reader scrolls by hand for half a second (a wheel or trackpad: events keep coming).
+      fed.mockClear();
+      for (let i = 0; i < 10; i++) {
+        top += 30;
+        app.dispatchEvent(new Event('scroll'));
+        await vi.advanceTimersByTimeAsync(50);
+      }
+      // The lines are no longer where they were measured: nothing was scored against them.
+      expect(fed).not.toHaveBeenCalled();
+
+      // It settles (the lines are measured again): reading starts on a fresh fixation.
+      fresh.mockClear();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(fresh).toHaveBeenCalled();
+      expect(fed.mock.calls.length).toBeGreaterThan(3);
+    } finally {
+      session.destroy();
+    }
+  });
+
   it('forgets undo history when the window width changes (the text reflows), not on height-only resizes', async () => {
     document.body.innerHTML = `<div id="app" style="overflow-y: auto"><article>${'<p>Some reading text that goes on for a while.</p>'.repeat(30)}</article></div>`;
     const app = document.getElementById('app')!;
@@ -367,6 +405,34 @@ describe('PageSession', () => {
       if (dpr) Object.defineProperty(window, 'devicePixelRatio', dpr);
       else Reflect.deleteProperty(window, 'devicePixelRatio');
     }
+  });
+
+  it('says when the page sits elsewhere in the window than at calibration (fullscreen, a toolbar), once per change', async () => {
+    const notify = vi.spyOn(PagePill.prototype, 'notify'); // calls through
+    const moved = (): number => notify.mock.calls.filter(([n]) => n && /higher or lower in the window/.test(n.text)).length;
+    const t = setup({ gazeSource: 'webcam' });
+    // Calibrated with 90 px of browser chrome above the page; jsdom's window has none (as in fullscreen).
+    t.storage.data.set(KEYS.calibration, { ...(storedModel() as object), chromeTop: 90, dprAtCalibration: 1 });
+    const session = await PageSession.start(t.deps);
+    await flush();
+    t.hubSend({ type: 'camera-status', status: { state: 'running' } });
+    await flush(10);
+    expect(moved()).toBe(1);
+    window.dispatchEvent(new Event('resize'));
+    await vi.advanceTimersByTimeAsync(400);
+    expect(moved()).toBe(1); // still the same change: not said again
+    session.destroy();
+
+    // A calibration made in this window layout says nothing.
+    notify.mockClear();
+    const same = setup({ gazeSource: 'webcam' });
+    same.storage.data.set(KEYS.calibration, { ...(storedModel() as object), chromeTop: window.outerHeight - window.innerHeight, dprAtCalibration: 1 });
+    const second = await PageSession.start(same.deps);
+    await flush();
+    same.hubSend({ type: 'camera-status', status: { state: 'running' } });
+    await flush(10);
+    expect(moved()).toBe(0);
+    second.destroy();
   });
 
   it('treats changing page content as a reflow, keeping what the line tracker has learned', async () => {
@@ -449,6 +515,48 @@ describe('PageSession', () => {
     await vi.advanceTimersByTimeAsync(5_000);
     expect(states.map((s) => s.state)).not.toContain('no-face');
     session.destroy();
+  });
+
+  it('a page that shadows document.visibilityState can’t keep the camera on behind other tabs (regression)', async () => {
+    const t = setup({ gazeSource: 'webcam' });
+    t.storage.data.set(KEYS.calibration, storedModel());
+    const session = await PageSession.start(t.deps);
+    await flush();
+    t.hubSend({ type: 'camera-status', status: { state: 'running' } });
+    await flush(10);
+    // What this tab told the camera hub (the tab's end of each port).
+    const sent = (): string[] => t.hubEnds.flatMap((p) => (p.peer?.sent ?? []).map((m) => (m as { type: string }).type));
+    const before = sent().filter((type) => type === 'unsubscribe').length;
+    // What `<img name="visibilityState">` does: the document's own property never says "hidden"…
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => ({ toString: () => 'visible' }) });
+    // …while the tab really is.
+    const real = vi.spyOn(Document.prototype, 'visibilityState', 'get').mockReturnValue('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(sent().filter((type) => type === 'unsubscribe').length).toBeGreaterThan(before);
+    real.mockRestore();
+    session.destroy();
+  });
+
+  it('finds the article when it arrives after the page did (a single-page app), and puts its own element back if the page removes it', async () => {
+    document.body.innerHTML = '<div id="app"><div class="spinner"></div></div>';
+    const t = setup({ gazeSource: 'mouse' });
+    const session = await PageSession.start(t.deps);
+    await vi.advanceTimersByTimeAsync(1_500);
+    const setLayout = vi.spyOn(LineTracker.prototype, 'setLayout'); // calls through
+    // The app renders its article a moment later; the address doesn't change again.
+    document.getElementById('app')!.innerHTML = `<nav><a href="/">Home</a><a href="/about">About</a></nav><article>${'<p>Reading is a sequence of fixations and saccades, with a return sweep at the end of every line of the text.</p>'.repeat(12)}</article>`;
+    await vi.advanceTimersByTimeAsync(2_500);
+    // Found anew, as new content (not as a reflow of "the whole body").
+    expect(setLayout.mock.calls.map(([, reason]) => reason)).toContain('content');
+
+    const host = document.querySelector(HOST_TAG)!;
+    host.remove(); // the page's own script, or a framework re-rendering <html>
+    expect(document.querySelector(HOST_TAG)).toBeNull();
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(document.querySelector(HOST_TAG)).toBe(host);
+    session.destroy();
+    expect(document.querySelector(HOST_TAG)).toBeNull();
   });
 
   it("Dewey's menu offers Resume while this tab is paused", async () => {

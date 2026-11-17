@@ -196,16 +196,36 @@ class Measurer {
     let lo = 0;
     let hi = n - 1;
     let start = n;
+    const probed: { index: number; top: number }[] = [];
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
       const p = probe(mid);
       if (!p) return [0, n]; // no positional information here: scan everything
+      probed.push({ index: p.index, top: p.rect.top });
       if (p.rect.bottom >= band.top) {
         start = Math.min(start, p.index);
         hi = mid - 1;
       } else {
         lo = p.index + 1;
       }
+    }
+    // The search took the children to be in vertical order. One that isn't (positioned out of the
+    // flow: a floating toolbar, a pinned header inside the article) sends it the wrong way, and the
+    // range it ends on can hold none of the lines on screen. If the probes themselves are out of
+    // order, scan everything instead.
+    probed.sort((a, b) => a.index - b.index);
+    for (let i = 1; i < probed.length; i++) {
+      if (probed[i]!.top < probed[i - 1]!.top - 1) return [0, n];
+    }
+    // Nor can the probes always tell: a child pinned above the others looks like one more item
+    // above the band. What gives it away is the answer: the first item "at or below the band" is
+    // entirely below it (or there is none), so nothing found touches the band at all. That is also
+    // what a real gap taller than the view looks like (rare: a full-screen picture), and then a
+    // scan of everything finds the same nothing, at the cost of one pass.
+    if (start >= n) return [0, n];
+    if (start > 0) {
+      const first = rectAt(start);
+      if (!isZeroSize(first) && first.top > band.bottom) return [0, n];
     }
     const from = Math.max(0, start - 1);
 

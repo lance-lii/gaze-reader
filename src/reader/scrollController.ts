@@ -157,7 +157,8 @@ export class ScrollController {
       const ke = e as KeyboardEvent;
       if (!this.anim || !NAVIGATION_KEYS.has(ke.key)) return;
       // The key whose handler *started* this animation must not cancel it.
-      if (eventTime(ke) >= this.anim.start) this.stop();
+      // Strictly later: on a clock with 1 ms steps that key's own time can equal the start.
+      if (eventTime(ke) > this.anim.start) this.stop();
     };
     this.listen(this.port.inputTarget, 'wheel', cancelOnInput);
     this.listen(this.port.inputTarget, 'touchstart', cancelOnInput);
@@ -250,6 +251,17 @@ export class ScrollController {
    */
   clearHistory(): void {
     this.undoStack.length = 0;
+  }
+
+  /**
+   * The reader scrolled by hand and came to rest at `top`. Undo means "take back the page turn I
+   * just saw": once they have moved more than a screen away from where that turn left them, U
+   * would jump to a place they left long ago, so the history is dropped.
+   */
+  noteManualScroll(top: number): void {
+    const last = this.undoStack[this.undoStack.length - 1];
+    if (!last || !Number.isFinite(top)) return;
+    if (Math.abs(top - last.to) > Math.max(1, this.port.getClientHeight())) this.undoStack.length = 0;
   }
 
   /**

@@ -8,7 +8,7 @@
  * progress · pipeline · page turning · layout · sources · calibration ·
  * tracking state · commands & settings · DOM events.
  */
-import { CSS_PREFIX } from '../core/constants';
+import { CSS_PREFIX, pinchZoomed } from '../core/constants';
 import { createEventBus } from '../core/events';
 import { createSettingsStore, type SettingsStore } from '../core/settings';
 import { readJSON, removeKey, writeJSON } from '../core/storage';
@@ -56,7 +56,10 @@ import { WebcamGazeSource } from '../gaze/webcamGazeSource';
 import { isTrackedLineEstimate } from '../reading/lineTracker';
 import { LineConfidenceWatch } from '../reading/lineConfidence';
 import { listSampleBooks, loadBookFromFile, loadBookFromText, loadBookFromUrl, loadSampleBook, type SampleBookInfo } from '../reader/bookLoader';
-import { deleteBook, findLibraryBook, getBook, getProgress, listBooks, saveBook, saveProgress } from '../reader/library';
+import { LibraryError, deleteBook, findLibraryBook, getBook, getProgress, listBooks, saveBook, saveProgress } from '../reader/library';
+import type { PdfDocumentHandle, PdfSource } from '../reader/pdf';
+import { deletePdfSource, getPdfSource, hasPdfSource, savePdfSource } from '../reader/pdfStore';
+import type { PagesSource } from '../reader/readerView';
 import { ReaderView } from '../reader/readerView';
 import { ScrollController } from '../reader/scrollController';
 import { LineTracker } from '../reading/lineTracker';
@@ -73,6 +76,7 @@ import { LibraryScreen } from '../ui/libraryScreen';
 import { Onboarding, hasCompletedOnboarding } from '../ui/onboarding';
 import { SettingsPanel } from '../ui/settingsPanel';
 import { Toaster, type ToastAction } from '../ui/toast';
+import { HeadGestureDetector, type HeadGesture } from '../gaze/headGestures';
 import { Topbar } from '../ui/topbar';
 import {
   AppearanceChangeFilter,
@@ -181,6 +185,20 @@ const APPEARANCE_DEBUG_MS = 250;
 const UPGRADE_EXPLAINED_KEY = 'calibrationUpgradeExplained.v1';
 /** The browser's id for the camera the saved calibration was made with, and others the reader chose to read with: `{ deviceId, accepted? }`. */
 const CALIBRATION_CAMERA_KEY = 'calibrationCamera.v1';
+/** Per book (the id follows): which view of a PDF the reader chose, and that the pages view was pointed out once. */
+const PDF_VIEW_PREFIX = 'pdfView.';
+const PDF_VIEW_OFFERED_PREFIX = 'pdfViewOffered.';
+
+/** The view this reader last chose for a PDF: its text unless they asked for its pages. */
+function pdfViewOf(bookId: string): 'pages' | 'text' {
+  return readJSON<unknown>(`${PDF_VIEW_PREFIX}${bookId}`, null) === 'pages' ? 'pages' : 'text';
+}
+
+/** An opened PDF: what the pages view shows, and the file handle to close afterwards. */
+interface OpenPdfPages {
+  handle: PdfDocumentHandle;
+  source: PagesSource;
+}
 /** What the status pill says while page turns wait for the reader's choice after a camera switch. */
 const CAMERA_HOLD_REASON = 'Page turns wait: this isn’t the camera you calibrated with. Press C to recalibrate, or P for the choices.';
 
@@ -281,6 +299,16 @@ export class AppController {
   private scroll: ScrollController | null = null;
   private layout: LineLayout | null = null;
   private session: ReadingSession | null = null;
+  /** The open PDF's file, while its own pages are shown (the pages view draws from it). */
+  private pdfDoc: PdfDocumentHandle | null = null;
+  /** The open book is a PDF whose original file is kept: it can be shown as pages or as text. */
+  private pdfAvailable = false;
+  /** Stops the "Open from URL" download in flight, if any. */
+  private urlAbort: AbortController | null = null;
+  /** Date.now() of the last heartbeat with a book open (the eye-break timer's wall clock). */
+  private lastHeartbeatWall: number | null = null;
+  /** The pinch-zoom notice has been shown for the pinch in progress. */
+  private pinchExplained = false;
   private openSeq = 0;
   private samples: readonly SampleBookInfo[] | null = null;
   private hasRecent = false;
@@ -305,6 +333,8 @@ export class AppController {
   private offCameraError: Unsubscribe | null = null;
   /** performance.now() of the last camera frame (with or without a face); the stall watch reads it. */
   private lastCameraFrameAt = Number.NEGATIVE_INFINITY;
+  /** A camera frame has arrived since the 'calibrating' phase began (see watchCamera). */
+  private cameraFrameSeen = false;
   /** When the camera was restarted on its own, in the last CAMERA_RESTART_WINDOW_MS. */
   private cameraRestarts: number[] = [];
   private slowCameraSince: number | null = null;
@@ -355,6 +385,7 @@ export class AppController {
   // Lighting & eyelid appearance (webcam only), and the guidance they lead to
   private readonly lightingWatch = new LightingWatch();
   private readonly appearance = new AppearanceMonitor(null);
+  private readonly headGestures = new HeadGestureDetector();
   private offCameraFrames: Unsubscribe | null = null;
   private lightingState: AppEvents['lighting-state'] | null = null;
   private lastAppearanceDebugAt = Number.NEGATIVE_INFINITY;
@@ -410,6 +441,7 @@ export class AppController {
       onOpenFile: (file) => void this.openFromFile(file),
       onOpenText: (text, title) => void this.openFromText(text, title),
       onOpenUrl: (url) => void this.openFromUrl(url),
+      onCancelOpen: () => this.cancelOpen(),
       onOpenSample: (id) => void this.openSample(id),
       onOpenBook: (id) => void this.openSaved(id),
       onDeleteBook: (id, title) => void this.removeBook(id, title),
@@ -421,7 +453,12 @@ export class AppController {
     this.readerScreen = document.createElement('div');
     this.readerScreen.className = 'gr-reader-screen';
     this.readerScreen.hidden = true;
-    this.topbar = new Topbar({ bus: this.bus, getSettings, onSelectSource: (kind) => this.selectSource(kind) });
+    this.topbar = new Topbar({
+      bus: this.bus,
+      getSettings,
+      onSelectSource: (kind) => this.selectSource(kind),
+      onExplainStatus: (text) => this.toasts.show({ id: 'status', message: text, durationMs: 6000 }),
+    });
     this.topbar.mount(this.readerScreen);
     const stage = document.createElement('div');
     stage.className = 'gr-reader-stage';
@@ -514,6 +551,9 @@ export class AppController {
     if (this.destroyed) return;
     this.savePositionNow();
     this.destroyed = true;
+    this.store.dispose?.();
+    this.urlAbort?.abort();
+    this.urlAbort = null;
     this.sourceGen++;
     this.teardownSource();
     this.recorder.discard();
@@ -694,7 +734,22 @@ export class AppController {
     } catch {
       /* keep the raw text */
     }
-    return this.openWith(`Fetching from ${host}…`, () => loadBookFromUrl(url), 'url');
+    this.urlAbort?.abort();
+    const abort = new AbortController();
+    this.urlAbort = abort;
+    return this.openWith(`Fetching from ${host}…`, () => loadBookFromUrl(url, { signal: abort.signal }), 'url').finally(() => {
+      if (this.urlAbort === abort) this.urlAbort = null;
+    });
+  }
+
+  /** Cancel in the library's URL form: stop the download and give the library back. */
+  private cancelOpen(): void {
+    const abort = this.urlAbort;
+    if (!abort) return;
+    this.urlAbort = null;
+    this.openSeq++; // whatever that request still returns is no longer wanted
+    abort.abort();
+    this.library.setBusy(null);
   }
 
   private openSample(id: string): Promise<boolean> {
@@ -742,6 +797,9 @@ export class AppController {
   }
 
   private async openBook(book: Book, seq: number): Promise<void> {
+    // A PDF that was just read from a file: its original, for the pages view (collected under the
+    // id the parser gave the book, before that id may change below).
+    const freshPdf = book.format === 'pdf' ? await this.collectPdfSource(book.id) : null;
     // Opened before, maybe rendered differently by an earlier version (a new id): keep that entry
     // and its reading position instead of adding a second copy.
     try {
@@ -759,6 +817,13 @@ export class AppController {
       await saveBook(book);
     } catch (err) {
       console.warn('[app] could not save the book to the library', err);
+      // Reading goes on, but say so: otherwise the book is simply missing from the library next time.
+      this.toasts.show({
+        id: 'library-save',
+        tone: 'warn',
+        message: `${err instanceof LibraryError ? err.message : 'This book couldn’t be saved to your library.'} You can read it now, but it won’t be in your library next time.`,
+        durationMs: 12_000,
+      });
     }
     let position: ReadingPosition | null = null;
     try {
@@ -766,14 +831,27 @@ export class AppController {
     } catch {
       position = null;
     }
-    if (seq !== this.openSeq || this.destroyed) return;
+    // A PDF's own pages: kept with a book just read, or from an earlier visit; shown when this
+    // reader chose the pages view for this book.
+    let pdfAvailable = false;
+    let pages: OpenPdfPages | null = null;
+    if (book.format === 'pdf') {
+      if (freshPdf) await savePdfSource(book.id, freshPdf).catch(() => false);
+      pdfAvailable = freshPdf !== null || (await hasPdfSource(book.id).catch(() => false));
+      if (pdfAvailable && pdfViewOf(book.id) === 'pages') pages = await this.loadPdfPages(book.id, freshPdf);
+    }
+    if (seq !== this.openSeq || this.destroyed) {
+      pages?.handle.destroy();
+      return;
+    }
 
     this.endSession();
     this.closePanels();
     // Show the reader before rendering: position restore needs a laid-out scroller.
     this.showScreen('reader');
     try {
-      this.reader.open(book, position);
+      this.renderBook(book, position, pages);
+      this.pdfAvailable = pdfAvailable;
     } catch (err) {
       try {
         this.reader.close();
@@ -790,6 +868,105 @@ export class AppController {
       throw err;
     }
     this.startSession(book, position);
+    if (pdfAvailable && !pages) this.offerPdfPages(book);
+  }
+
+  /** Puts the book on screen: a PDF's own pages when they were asked for and could be opened, its text otherwise. */
+  private renderBook(book: Book, position: ReadingPosition | null, pages: OpenPdfPages | null): void {
+    if (!pages) {
+      this.reader.open(book, position);
+      return;
+    }
+    this.pdfDoc = pages.handle;
+    try {
+      this.reader.openPages(book, pages.source, position);
+    } catch (err) {
+      this.pdfDoc = null;
+      pages.handle.destroy();
+      throw err;
+    }
+  }
+
+  /** The original of a PDF the loader has just parsed (pdf.js and its helpers load only for PDFs). */
+  private async collectPdfSource(bookId: string): Promise<PdfSource | null> {
+    try {
+      const { takePdfSource } = await import('../reader/pdf');
+      return takePdfSource(bookId);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Opens the kept original of a PDF for drawing its pages; null (with a message) when that fails. */
+  private async loadPdfPages(bookId: string, fresh: PdfSource | null = null): Promise<OpenPdfPages | null> {
+    try {
+      const source = fresh ?? (await getPdfSource(bookId));
+      if (!source) return null;
+      const { openPdfDocument } = await import('../reader/pdf');
+      const handle = await openPdfDocument(source.bytes);
+      return {
+        handle,
+        source: { pages: source.pages, render: (i, canvas, width, ratio) => handle.render(i, canvas, width, ratio), cancel: (canvas) => handle.cancel(canvas) },
+      };
+    } catch (err) {
+      console.warn('[app] could not open the PDF’s pages', err);
+      this.toasts.show({ id: 'pdf-pages', tone: 'warn', message: 'This PDF’s original pages couldn’t be opened, so here is its text.' });
+      return null;
+    }
+  }
+
+  /** Once per book: a PDF opens as text (the best page turning); say that its own pages are a key away. */
+  private offerPdfPages(book: Book): void {
+    const key = `${PDF_VIEW_OFFERED_PREFIX}${book.id}`;
+    if (readJSON<unknown>(key, null) !== null) return;
+    writeJSON(key, 1);
+    this.toasts.show({
+      id: 'pdf-pages',
+      message: 'This PDF is shown as plain text, which the eye tracker follows best. Its original pages, with figures and layout, are one key away: V.',
+      actions: [{ label: 'Show the pages', primary: true, run: () => void this.togglePdfView() }],
+      durationMs: 12_000,
+    });
+  }
+
+  /** V, or the top bar's button: the open PDF as its own pages, or back to its text. The reader keeps their place. */
+  private async togglePdfView(): Promise<void> {
+    const session = this.session;
+    if (!session || this.calibration || this.turning) return;
+    const book = session.book;
+    if (book.format !== 'pdf' || !this.pdfAvailable) {
+      this.toasts.show({
+        id: 'pdf-pages',
+        message:
+          book.format === 'pdf'
+            ? 'The original pages of this PDF aren’t kept on this device. Open the file again to see them.'
+            : 'Only PDFs have original pages to switch to.',
+      });
+      return;
+    }
+    const next = this.reader.view === 'pages' ? 'text' : 'pages';
+    const seq = ++this.openSeq;
+    const pages = next === 'pages' ? await this.loadPdfPages(book.id) : null;
+    if (seq !== this.openSeq || this.destroyed || this.session !== session) {
+      pages?.handle.destroy();
+      return;
+    }
+    if (next === 'pages' && !pages) return; // loadPdfPages said why
+    // The same place in the other view: by how far through the book it is (the two views have
+    // different paragraphs to anchor to).
+    const at = this.reader.getPosition();
+    const position: ReadingPosition | null = at ? { bookId: book.id, fraction: at.fraction, updatedAt: Date.now() } : null;
+    writeJSON(`${PDF_VIEW_PREFIX}${book.id}`, next);
+    this.toasts.dismiss('pdf-pages');
+    this.endSession();
+    try {
+      this.renderBook(book, position, pages);
+    } catch (err) {
+      console.warn('[app] could not switch the PDF’s view', err);
+      this.reader.open(book, position);
+    }
+    this.pdfAvailable = true;
+    this.startSession(book, position);
+    if (position) void saveProgress(position).catch(() => undefined);
   }
 
   private closeBook(): void {
@@ -817,9 +994,15 @@ export class AppController {
     const index = Math.max(0, cards.findIndex((c) => c.contains(document.activeElement)));
     let book: Book | null = null;
     let progress: ReadingPosition | null = null;
+    let pdf: PdfSource | null = null;
     try {
       [book, progress] = await Promise.all([getBook(id), getProgress(id)]);
+      // A PDF's original goes with the book, and comes back with Undo.
+      if (book?.format === 'pdf') pdf = await getPdfSource(id).catch(() => null);
       await deleteBook(id);
+      await deletePdfSource(id);
+      removeKey(`${PDF_VIEW_PREFIX}${id}`);
+      removeKey(`${PDF_VIEW_OFFERED_PREFIX}${id}`);
     } catch (err) {
       console.warn('[app] could not remove the book', err);
       this.toasts.show({ tone: 'error', message: `Couldn’t remove “${title}”.` });
@@ -831,16 +1014,17 @@ export class AppController {
     this.toasts.show({
       id: `removed:${id}`,
       message: `Removed “${title}” from this device.`,
-      actions: saved ? [{ label: 'Undo', primary: true, run: () => void this.restoreBook(saved, progress) }] : [],
+      actions: saved ? [{ label: 'Undo', primary: true, run: () => void this.restoreBook(saved, progress, pdf) }] : [],
       // Long enough for a keyboard or screen-reader user to reach Undo (WCAG 2.2.1).
       durationMs: 20_000,
     });
   }
 
-  private async restoreBook(book: Book, progress: ReadingPosition | null): Promise<void> {
+  private async restoreBook(book: Book, progress: ReadingPosition | null, pdf: PdfSource | null = null): Promise<void> {
     try {
       await saveBook(book);
       if (progress) await saveProgress(progress);
+      if (pdf) await savePdfSource(book.id, pdf);
     } catch (err) {
       console.warn('[app] could not restore the book', err);
       this.toasts.show({ tone: 'error', message: `Couldn’t restore “${book.title}”.` });
@@ -869,6 +1053,7 @@ export class AppController {
     this.pendingOffer = null;
     this.pendingCoach = null;
     this.topbar.setBook(book);
+    this.topbar.setPdfView(this.pdfAvailable ? this.reader.view : null);
     document.title = `${book.title} · Gaze Reader`;
     this.focusReader();
     this.bus.emit('book-opened', {
@@ -906,6 +1091,10 @@ export class AppController {
     this.pendingUndo = false;
     this.scrollSettling = false;
     this.reader.close();
+    this.pdfDoc?.destroy();
+    this.pdfDoc = null;
+    this.pdfAvailable = false;
+    this.topbar.setPdfView(null);
     this.layout = null;
     // The line tracker keeps its drift for the next book (startSession decides whether it fits).
     this.resetPipeline('none');
@@ -920,6 +1109,7 @@ export class AppController {
   }
 
   private startHeartbeat(): void {
+    this.lastHeartbeatWall = null;
     if (this.heartbeatId === null) this.heartbeatId = setInterval(this.heartbeat, HEARTBEAT_MS);
   }
 
@@ -945,7 +1135,11 @@ export class AppController {
     const active = this.isActivelyReading(now);
     const dt = session.clock.tick(now, active);
     session.meter.update(this.reader.progress(), session.clock.minutes);
-    if (session.breaks.tick(dt, active, s.breakIntervalMin, s.breakReminders)) this.breakDue(session);
+    // By the wall clock (Date.now keeps running while the machine sleeps; performance.now may not).
+    const wall = Date.now();
+    const elapsed = this.lastHeartbeatWall === null ? dt : wall - this.lastHeartbeatWall;
+    this.lastHeartbeatWall = wall;
+    if (session.breaks.tick(dt, active, s.breakIntervalMin, s.breakReminders, elapsed)) this.breakDue(session);
     if (now - session.lastProgressEmitAt >= PROGRESS_EVERY_MS) this.emitProgress(now);
     if (++this.heartbeatCount % 4 === 0) this.updateProgressUi();
   };
@@ -959,7 +1153,7 @@ export class AppController {
     const session = this.session;
     if (!session) return;
     session.lastProgressEmitAt = now;
-    const fraction = Math.min(1, Math.max(0, this.reader.progress() || 0));
+    const fraction = Math.min(1, Math.max(0, this.progressNow() || 0));
     const minutes = session.clock.minutes;
     this.bus.emit('book-progress', {
       fraction,
@@ -981,10 +1175,22 @@ export class AppController {
   private updateProgressUi(): void {
     const session = this.session;
     if (!session) return;
-    const fraction = this.reader.progress();
+    const fraction = this.progressNow();
     const wpm = computeWpm(session.meter.wordsAdvanced, session.meter.minutesAtLastAdvance) ?? TYPICAL_WPM;
     const left = formatMinutes(minutesLeft(fraction, session.book.wordCount, wpm));
     this.topbar.setProgress(fraction, formatPercent(fraction), fraction >= 0.995 || !left ? '' : `${left} left`);
+  }
+
+  /**
+   * How far through the book the reader is. A book that has been read to its end is at 100 % while
+   * its end is on screen, wherever the scroller happens to be: the last page of a book can't
+   * scroll to the bottom (the text ends, the page doesn't), and a book that fits on one screen
+   * can't scroll at all, so by scroll position alone a finished book read "0 %" or "94 %" and came
+   * back in the library as one to continue.
+   */
+  private progressNow(): number {
+    const fraction = this.reader.progress();
+    return this.session?.finished && this.onLastPage(this.layout) ? 1 : fraction;
   }
 
   private breakDue(session: ReadingSession): void {
@@ -1011,6 +1217,7 @@ export class AppController {
     });
     this.savePositionNow();
     this.emitProgress(performance.now());
+    this.updateProgressUi();
     this.toasts.show({
       id: 'finished',
       tone: 'success',
@@ -1030,6 +1237,7 @@ export class AppController {
     let pos: ReadingPosition | null = null;
     try {
       pos = this.reader.getPosition();
+      if (pos) pos = { ...pos, fraction: Math.max(pos.fraction, this.progressNow()) };
     } catch {
       pos = null;
     }
@@ -1105,8 +1313,24 @@ export class AppController {
       this.scrollSettling ||
       (this.scroll?.animating ?? false) ||
       this.calibration !== null ||
-      this.modalOpen()
+      this.modalOpen() ||
+      this.pinchBlocked()
     );
+  }
+
+  /** Pinch-zoomed: the reading model waits (see pinchZoomed), and the reader is told why, once per pinch. */
+  private pinchBlocked(): boolean {
+    const zoomed = pinchZoomed();
+    if (zoomed && !this.pinchExplained && this.sourceKind !== null) {
+      this.toasts.show({
+        id: 'pinch-zoom',
+        tone: 'warn',
+        message: 'The page is pinch-zoomed, so what you look at isn’t where the text was measured. Pages won’t turn by themselves until you pinch back out.',
+        durationMs: 9000,
+      });
+    }
+    this.pinchExplained = zoomed;
+    return zoomed;
   }
 
   /**
@@ -1162,11 +1386,15 @@ export class AppController {
     this.recordInput({ k: 'fixations-reset', t: performance.now(), unblock });
   }
 
-  /** Starts the page-end detector's cooldown (every scroll, automatic or not). */
-  private notifyScrolled(): void {
+  /**
+   * Starts the page-end detector's cooldown (every scroll, automatic or not). `undone`: the scroll
+   * took back a page turn, and the reader may now finish the page without looking up it first.
+   */
+  private notifyScrolled(undone = false, resumeBottom?: number): void {
     const t = performance.now();
-    this.pageEnd.notifyScrolled(t);
-    this.recordInput({ k: 'scrolled', t });
+    if (undone) this.pageEnd.notifyUndone(t);
+    else this.pageEnd.notifyScrolled(t, resumeBottom);
+    this.recordInput(undone ? { k: 'scrolled', t, undone: true } : resumeBottom !== undefined ? { k: 'scrolled', t, resumeBottom } : { k: 'scrolled', t });
   }
 
   private recordInput(entry: PipelineControl): void {
@@ -1324,14 +1552,16 @@ export class AppController {
     this.timers.clear('scroll-settle');
     this.scrollSettling = false;
     const layout = this.measure(kind === 'undo' ? 'scroll' : 'page-turn');
+    let resumeBottom: number | undefined;
     if (layout && kind !== 'undo') {
       const resume = kind === 'turn' ? resumeLineIndex(layout.lines, oldDocTop, layout.linePitch) : firstFullyVisibleIndex(layout.lines);
       if (resume >= 0) {
         this.lineTracker.afterPageTurn(resume);
         this.recordInput({ k: 'resume', t: performance.now(), line: resume });
+        if (kind === 'turn') resumeBottom = layout.lines[resume]?.bottom;
       }
     }
-    this.notifyScrolled();
+    this.notifyScrolled(kind === 'undo', resumeBottom);
     this.resetFixations(false);
     this.updateProgressUi();
     this.scheduleSavePosition();
@@ -1411,6 +1641,7 @@ export class AppController {
       () => {
         this.scrollSettling = false;
         if (!this.session) return;
+        this.scroll?.noteManualScroll(this.reader.scroller.scrollTop);
         this.measure('scroll');
         this.resetFixations(false);
         this.scheduleSavePosition();
@@ -1636,12 +1867,19 @@ export class AppController {
   /** Frames stopped arriving while the camera runs and the tab is visible: it froze (often after the laptop slept). */
   private watchCamera(now: number): void {
     const camera = this.camera;
-    if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !camera?.running) {
+    if (this.sourceKind !== 'webcam' || (this.phase !== 'running' && this.phase !== 'calibrating') || !camera?.running) {
       this.slowCameraSince = null;
       return;
     }
+    // Also in the middle of a calibration: a camera that froze there (the laptop woke up) left the
+    // dots on "I lost sight of your eyes" until Esc. The restart opens the calibration again.
+    if (this.phase === 'calibrating' && !this.cameraFrameSeen) return;
     if (now - this.lastCameraFrameAt >= CAMERA_STALL_MS) {
       this.recoverCamera(new Error('The camera stopped sending pictures.'));
+      return;
+    }
+    if (this.calibration || this.phase !== 'running') {
+      this.slowCameraSince = null;
       return;
     }
     // Frames still come, but too few to follow the lines (an overloaded or throttled machine).
@@ -2191,6 +2429,7 @@ export class AppController {
 
   private readonly onCameraFrame = (frame: FeatureFrame): void => {
     this.lastCameraFrameAt = performance.now();
+    this.cameraFrameSeen = true;
     this.recorder.frame(frame);
     if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !this.session || document.hidden) return;
     this.lightingWatch.onFrame(frame);
@@ -2207,6 +2446,7 @@ export class AppController {
       // The model reads no lid features, so its y is a fair "where the eyes look" for the lid baseline.
       if (p && Number.isFinite(p.y)) gazeYNorm = p.y / model.viewport.height;
     }
+    this.watchHeadGestures(frame.t, f);
     const change = this.appearance.update({ t: frame.t, features: f, quality: frame.quality, gazeYNorm });
     if (change) this.cameraChange(change.t, 'lids', `${change.direction} eyes (${change.channel}, z ${change.z.toFixed(1)})`, frame.t);
     if (this.debug.visible && frame.t - this.lastAppearanceDebugAt >= APPEARANCE_DEBUG_MS) {
@@ -2220,8 +2460,44 @@ export class AppController {
     }
   };
 
+  /**
+   * Head gestures (Settings → Page turning): a quick head turn pages forward or back, eyebrows held
+   * up pause or resume. Only while the reader is reading: not under a dialog, where a turn of the
+   * head toward someone shouldn't do anything behind it.
+   */
+  private watchHeadGestures(t: number, features: FeatureFrame['features']): void {
+    if (!this.store.get().headGestures || this.modalOpen()) {
+      this.headGestures.reset();
+      return;
+    }
+    const gesture = this.headGestures.update({ t, features });
+    if (gesture) this.onHeadGesture(gesture);
+  }
+
+  private onHeadGesture(gesture: HeadGesture): void {
+    let message: string;
+    switch (gesture) {
+      case 'turn-right':
+        message = 'Head turn: next page';
+        this.runCommand('page-forward');
+        break;
+      case 'turn-left':
+        message = 'Head turn: previous page';
+        this.runCommand('page-back');
+        break;
+      case 'brows-up': {
+        this.runCommand('toggle-autoscroll');
+        message = this.store.get().autoScroll ? 'Eyebrows: page turning resumed' : 'Eyebrows: page turning paused';
+        break;
+      }
+    }
+    // Say what was understood: a gesture nobody meant to make shouldn't be a mystery.
+    this.toasts.show({ id: 'head-gesture', message, durationMs: 1800 });
+  }
+
   /** The camera stopped: forget this session's lighting window and eyelid history. */
   private stopConditionWatch(): void {
+    this.headGestures.reset();
     this.lightingWatch.reset();
     this.appearance.reset();
     this.sustainedFlags.reset();
@@ -2409,6 +2685,9 @@ export class AppController {
       this.lineConfidence.reset();
       this.lastCameraFrameAt = now;
     }
+    // A first calibration starts while the tracker is still warming up (its first frame can take
+    // seconds): the stall watch there waits until frames have been seen to stop.
+    if (phase === 'calibrating') this.cameraFrameSeen = false;
     this.refreshTracking(now);
     this.updateOverlays();
   }
@@ -2557,6 +2836,9 @@ export class AppController {
       case 'check-accuracy':
         this.checkAccuracy();
         break;
+      case 'toggle-pdf-view':
+        void this.togglePdfView();
+        break;
     }
   }
 
@@ -2599,6 +2881,9 @@ export class AppController {
       this.syncSource();
     }
     if (any(OVERLAY_KEYS)) this.updateOverlays();
+    // On a narrow window Dewey's corner makes room for him by moving the reading area: the lines
+    // are then somewhere else on screen, and nothing else (no scroll, no resize) says so.
+    if (any(['buddyCorner', 'buddyEnabled'])) this.scheduleMeasure('resize', 80);
     if (changed.includes('buddyEnabled') && !s.buddyEnabled && !this.settingsPanel.isOpen) this.deweyHidden();
   }
 

@@ -32,6 +32,12 @@
  * calibration. Quick recalibration stacks a per-axis affine correction in the
  * same screen space, so it also survives window moves.
  *
+ * Distance: the eye features say where the eyes point relative to the camera, as an angle, and
+ * that angle is the same at any distance from the screen. A reader who leans in after calibrating
+ * therefore looks at points nearer the camera than the ridge maps say, by the ratio of the
+ * distances. The prediction is scaled about the camera by that ratio, read from the size of the
+ * face in the image (see {@link DepthCompensation}).
+ *
  * Every model carries a CalibrationEnvironment: the lighting signature the
  * caller measured during calibration and an eyelid-appearance baseline
  * computed here from the samples, so the app can tell when the conditions
@@ -121,10 +127,16 @@ const POSTURE_FEATURES: ReadonlySet<string> = new Set<FeatureName>(['yaw', 'pitc
  *   the weights fitted to yaw and pitch were mostly noise, and a reader who later sat with their
  *   chin 4° lower read 1.5–2.3 lines low (bench/lighting/posture.bench.test.ts). Without them the
  *   same 4° moves the gaze 1.0–1.4 lines (and a 4° turn 43 px instead of 70–120 px), and the
- *   cross-validated calibration error is equal or better in every world. Roll stays: the features
- *   are measured in a face-aligned frame, which rolls with the head. Head translation (tx, ty, tz,
- *   faceScale) stays too: leaning in or back changes the angle to the screen, and those weights
- *   halve the shift it causes.
+ *   cross-validated calibration error is equal or better in every world.
+ * - roll, tx/ty/tz, faceScale: the rest of the head's pose. The same argument holds for them: the
+ *   reader is asked to keep still while calibrating, so nothing in the samples says what a change
+ *   of posture does to the gaze, and the weights a regression fits to a few millimetres of head
+ *   movement are noise. They were then applied to centimetres: sitting 3 cm to one side moved the
+ *   gaze 0.8–1.1 lines, and without those weights 0.2 (bench/lighting/posture.bench.test.ts). What
+ *   a change of distance does is known from geometry instead, and is applied after the regression
+ *   ({@link DepthCompensation}): leaning 6 cm in or back moved the gaze 0.6–1.2 lines (10 cm: 2)
+ *   and now moves it 0.1–0.3. A sideways or up-and-down move needs no correction: the eye features
+ *   measure the gaze against the line from the eye to the camera, which moves with the head.
  */
 export const GAZE_EXCLUDED_FEATURES: ReadonlySet<string> = new Set<FeatureName>([
   'eyeBlinkLeft',
@@ -141,7 +153,56 @@ export const GAZE_EXCLUDED_FEATURES: ReadonlySet<string> = new Set<FeatureName>(
   'meanU',
   'yaw',
   'pitch',
+  'roll',
+  'tx',
+  'ty',
+  'tz',
+  'faceScale',
 ]);
+
+/**
+ * Distance compensation. The eye features (iris position between the eye corners, in eye widths)
+ * measure the angle between where the eyes point and the line from the eye to the camera, and
+ * don't change with the size of the face in the image. With the camera in the plane of the screen,
+ * the point looked at is (distance to the screen) × that angle away from the camera. The ridge maps
+ * learn that product at the calibration distance; at another distance the same features mean a
+ * point nearer to or further from the camera by the ratio of the distances:
+ *
+ *     gaze = camera + (distance now / distance at calibration) × (ridge prediction − camera)
+ *
+ * The ratio comes from `faceScale` (the distance between the eyes in the image, inversely
+ * proportional to the distance from the camera), divided by cos(yaw) because a turned head looks
+ * narrower. The camera's place on the screen can't be measured from a web page; it is taken to be
+ * just above the middle of the top edge of the screen the window is on, where laptops and most
+ * monitor-mounted webcams have it. That guess doesn't need to be good: with the camera 4 cm from
+ * where it is assumed, a 6 cm lean still moves the gaze 0.3–0.5 lines instead of 0.6–1.2. With a
+ * camera somewhere else entirely (a laptop's, while reading on a second monitor) the correction is
+ * about as wrong as having none.
+ */
+export interface DepthCompensation {
+  /** faceScale / cos(yaw) the calibration was made at (the median over its samples). */
+  ref: number;
+  /** Where the camera is taken to be, in the model's screen space (viewport px + window origin at calibration). */
+  camera: Point;
+  /** Indices into the feature vector of faceScale and of head yaw (−1: no yaw correction). */
+  scaleIndex: number;
+  yawIndex: number;
+}
+/** The distance ratio is clamped to this range: beyond it the reader has moved too far for the calibration anyway. */
+const DEPTH_RATIO_MIN = 0.7;
+const DEPTH_RATIO_MAX = 1.4;
+/** |yaw| used for the foreshortening correction is capped (≈ 40°; frameQuality gives up at 35°). */
+const DEPTH_MAX_YAW = 0.7;
+/** The camera lens above the top edge of the screen (the bezel), CSS px: ≈ 8 mm. */
+const CAMERA_ABOVE_SCREEN_PX = 36;
+/** Browser chrome above the viewport when it can't be measured (an iframe, no window), CSS px. */
+const ASSUMED_CHROME_TOP_PX = 100;
+/**
+ * The measured chrome height counts for at most this much, CSS px. Real toolbars are shorter; a
+ * larger value is a zoomed page (browsers report the window's outer size in unzoomed px and the
+ * viewport in zoomed ones, so at 150 % the difference reads as hundreds of px) or docked tools.
+ */
+const MAX_CHROME_TOP_PX = 200;
 const MAD_TO_SD = 1.4826;
 /** Leys et al. (2013) call 2.5 robust SDs "moderately conservative" — our default. */
 const MAD_THRESHOLD = 2.5;
@@ -194,6 +255,14 @@ export interface TrainOptions {
   excludedFeatures?: Iterable<string>;
   /** Conditions during calibration, stored with the model (see {@link CalibrationEnvironment}). */
   environment?: EnvironmentInput;
+  /**
+   * Scale predictions about the camera by the change of distance since calibration (see
+   * {@link DepthCompensation}). Default: on when `featureNames` has `faceScale` and the regression
+   * doesn't use it (it is excluded); a model that fits its own weight to faceScale gets none.
+   */
+  depthCompensation?: boolean;
+  /** Where the camera is, in viewport px (default: just above the middle of the screen's top edge). */
+  camera?: Point;
 }
 
 /** What the caller measured about the calibration conditions; the eyelid baseline is computed here. */
@@ -308,6 +377,8 @@ export interface GazeModelParams {
   trainedAt: number;
   /** Lighting and eyelid appearance at calibration (or the last quick refresh); null when unknown. */
   environment?: CalibrationEnvironment | null;
+  /** Distance compensation, applied to the ridge prediction before `adjust`; null/absent: none (older models). */
+  depth?: DepthCompensation | null;
 }
 
 const IDENTITY: Readonly<AxisAffine> = Object.freeze({ sx: 1, ox: 0, sy: 1, oy: 0 });
@@ -328,6 +399,8 @@ export class RidgeGazeModel implements GazeModel {
   readonly excludedFeatures: readonly number[];
   /** Lighting and eyelid appearance at calibration (or the last quick refresh); null when unknown. */
   readonly environment: CalibrationEnvironment | null;
+  /** Distance compensation in use, or null (see {@link DepthCompensation}). */
+  readonly depthCompensation: Readonly<DepthCompensation> | null;
   private readonly params: GazeModelParams;
   private readonly glitchCheck: readonly number[];
   // Scratch buffers: predict runs at camera rate, so avoid per-call allocation.
@@ -347,6 +420,7 @@ export class RidgeGazeModel implements GazeModel {
     this.glitchCheck = Object.freeze([...(params.glitchCheck ?? params.quad)]);
     this.excludedFeatures = Object.freeze([...(params.excluded ?? [])]);
     this.environment = params.environment ? cloneEnvironment(params.environment) : null;
+    this.depthCompensation = params.depth ? Object.freeze({ ...params.depth, camera: { ...params.depth.camera } }) : null;
     this.zBuf = new Float64Array(params.featureLength);
     this.phiBuf = new Float64Array(params.expMean.length);
   }
@@ -386,8 +460,14 @@ export class RidgeGazeModel implements GazeModel {
     expandInto(z, P.quad, phi);
     for (let k = 0; k < phi.length; k++) phi[k] = (phi[k] - P.expMean[k]) / P.expStd[k];
 
-    const sx = P.bx + dot(P.wx, phi) + P.origin.x;
-    const sy = P.by + dot(P.wy, phi) + P.origin.y;
+    let sx = P.bx + dot(P.wx, phi) + P.origin.x;
+    let sy = P.by + dot(P.wy, phi) + P.origin.y;
+    const depth = this.depthCompensation;
+    if (depth) {
+      const k = depthRatio(depth, v);
+      sx = depth.camera.x + k * (sx - depth.camera.x);
+      sy = depth.camera.y + k * (sy - depth.camera.y);
+    }
     const x = P.adjust.sx * sx + P.adjust.ox;
     const y = P.adjust.sy * sy + P.adjust.oy;
     return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
@@ -441,8 +521,23 @@ export class RidgeGazeModel implements GazeModel {
       adjust: { ...P.adjust },
       trainedAt: P.trainedAt,
       environment: this.environment ? cloneEnvironment(this.environment) : null,
+      depth: this.depthCompensation ? { ...this.depthCompensation, camera: { ...this.depthCompensation.camera } } : null,
     };
   }
+}
+
+/** Distance now / distance at calibration, from the face's size in the image; 1 when it can't be read. */
+function depthRatio(depth: Readonly<DepthCompensation>, v: ArrayLike<number>): number {
+  const scale = effectiveFaceScale(v, depth.scaleIndex, depth.yawIndex);
+  return scale > 0 ? clamp(depth.ref / scale, DEPTH_RATIO_MIN, DEPTH_RATIO_MAX) : 1;
+}
+
+/** faceScale with the foreshortening of a turned head taken out; NaN when unusable. */
+function effectiveFaceScale(v: ArrayLike<number>, scaleIndex: number, yawIndex: number): number {
+  const s = v[scaleIndex];
+  if (!(s > 0) || !Number.isFinite(s)) return NaN;
+  const yaw = yawIndex >= 0 ? v[yawIndex] : 0;
+  return Number.isFinite(yaw) ? s / Math.cos(clamp(yaw, -DEPTH_MAX_YAW, DEPTH_MAX_YAW)) : s;
 }
 
 // ──────────────────────────────── Training ───────────────────────────────────
@@ -558,6 +653,7 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
   const viewport = resolveViewport(opts.viewport, rows);
   const trainedAt = Date.now();
   const excludedIndices = maskIndices(excluded);
+  const origin = currentScreenOrigin();
   const model = new RidgeGazeModel({
     featureLength: p,
     featureSignature: opts.featureNames ? featureSignature(opts.featureNames) : null,
@@ -574,11 +670,12 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     by: final.bias[1],
     lambda,
     viewport,
-    origin: currentScreenOrigin(),
+    origin,
     chromeTop: currentChromeTop(),
     dprAtCalibration: currentDevicePixelRatio(),
     adjust: { ...IDENTITY },
     trainedAt,
+    depth: depthCompensationFor(rows, excluded, viewport, origin, opts),
     environment: {
       lighting: sanitizeLightingSignature(opts.environment?.lighting ?? null),
       // From the samples the model was fitted on (blinks and glances away already dropped).
@@ -927,6 +1024,7 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
       trainedAt,
       // Unknown, missing or damaged conditions never cost the reader their calibration.
       environment: sanitizeEnvironment(json.environment),
+      depth: sanitizeDepth(json.depth, featureLength),
     });
   } catch {
     return null;
@@ -1010,6 +1108,58 @@ export function currentChromeTop(): number | null {
   }
   const d = window.outerHeight - window.innerHeight;
   return Number.isFinite(d) && d >= 0 ? d : null;
+}
+
+/**
+ * Where the camera is taken to be, in the model's screen space (viewport px + `origin`): just above
+ * the middle of the top edge of the screen the window is on. The model's space puts the viewport's
+ * top at `origin.y` (the window's top), so the chrome height is taken off as well. Without a
+ * window (tests, benches) or a usable screen: above the middle of the viewport.
+ */
+function assumedCameraPoint(viewport: { width: number; height: number }, origin: Point): Point {
+  const fallback = { x: origin.x + viewport.width / 2, y: origin.y - ASSUMED_CHROME_TOP_PX - CAMERA_ABOVE_SCREEN_PX };
+  if (typeof window === 'undefined' || !window) return fallback;
+  const sc: Partial<Pick<Screen, 'width'>> & { availLeft?: number; availTop?: number } = window.screen ?? {};
+  const chrome = currentChromeTop();
+  return {
+    x: isPositive(sc.width) ? firstFinite(sc.availLeft) + sc.width / 2 : fallback.x,
+    y: chrome !== null ? firstFinite(sc.availTop) - Math.min(chrome, MAX_CHROME_TOP_PX) - CAMERA_ABOVE_SCREEN_PX : fallback.y,
+  };
+}
+
+/** The distance compensation a freshly trained model gets, or null (see TrainOptions.depthCompensation). */
+function depthCompensationFor(
+  rows: readonly Row[],
+  excluded: Uint8Array,
+  viewport: { width: number; height: number },
+  origin: Point,
+  opts: TrainOptions,
+): DepthCompensation | null {
+  const names = opts.featureNames;
+  if (!names || opts.depthCompensation === false) return null;
+  const scaleIndex = names.indexOf('faceScale');
+  // A regression that fits its own weight to faceScale would be corrected twice.
+  if (scaleIndex < 0 || (!excluded[scaleIndex] && opts.depthCompensation !== true)) return null;
+  const yawIndex = names.indexOf('yaw');
+  const scales: number[] = [];
+  for (const r of rows) {
+    const s = effectiveFaceScale(r.x, scaleIndex, yawIndex);
+    if (s > 0) scales.push(s);
+  }
+  const ref = median(scales);
+  if (!isPositive(ref)) return null;
+  const c = opts.camera;
+  const camera = c && isFinitePoint(c) ? { x: c.x + origin.x, y: c.y + origin.y } : assumedCameraPoint(viewport, origin);
+  return { ref, camera, scaleIndex, yawIndex };
+}
+
+/** A validated copy of a stored distance compensation; null when absent or damaged (never a reason to drop the model). */
+function sanitizeDepth(v: unknown, featureLength: number): DepthCompensation | null {
+  if (!isRecord(v) || !isPositive(v.ref) || !isFinitePoint(v.camera)) return null;
+  const { scaleIndex, yawIndex } = v;
+  if (typeof scaleIndex !== 'number' || !Number.isInteger(scaleIndex) || scaleIndex < 0 || scaleIndex >= featureLength) return null;
+  if (typeof yawIndex !== 'number' || !Number.isInteger(yawIndex) || yawIndex < -1 || yawIndex >= featureLength) return null;
+  return { ref: v.ref, camera: { x: v.camera.x, y: v.camera.y }, scaleIndex, yawIndex };
 }
 
 function currentDevicePixelRatio(): number | null {
