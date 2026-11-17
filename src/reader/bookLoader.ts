@@ -26,6 +26,12 @@ export class BookLoadError extends Error {
 
 /** Books above this size are refused before we try to parse them. */
 export const MAX_BOOK_BYTES = 200 * 1024 * 1024;
+/**
+ * Text, Markdown and web pages are parsed whole, in one go, on the page's own thread: a 200 MB
+ * file of them freezes the tab or runs it out of memory (a PDF or an EPUB of that size is mostly
+ * pictures and is read piece by piece). The longest novels are 3–7 MB as plain text.
+ */
+export const MAX_TEXT_BYTES = 32 * 1024 * 1024;
 const DEFAULT_URL_TIMEOUT_MS = 20_000;
 
 /** What every format parser produces; loaders stamp `source` and `addedAt` on top. */
@@ -1657,6 +1663,12 @@ async function parseBytes(
   if (kind === 'pdf') {
     const { parsePdf } = await import('./pdf');
     return parsePdf(toArrayBuffer(bytes), { fallbackTitle: opts.fallbackTitle });
+  }
+  if (bytes.length > MAX_TEXT_BYTES) {
+    throw new BookLoadError(
+      'too-large',
+      `That is too much text to open as one book (${Math.round(bytes.length / (1024 * 1024))} MB). Gaze Reader reads text and web pages up to ${MAX_TEXT_BYTES / (1024 * 1024)} MB; a long novel is about 5.`,
+    );
   }
   const charset = opts.charset ?? (kind === 'html' ? sniffHtmlCharset(bytes) : null);
   const text = decodeText(bytes, charset);

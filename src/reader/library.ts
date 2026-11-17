@@ -96,7 +96,10 @@ function transact<T>(
       return;
     }
     tx.oncomplete = () => resolve(result());
-    tx.onerror = () => reject(tx.error ?? new Error('IndexedDB request failed'));
+    // A request's error reaches the transaction as an event before the transaction has one of its
+    // own (`tx.error` is still null here): read it off the request, or "storage is full" is
+    // reported as "couldn't be read or saved right now".
+    tx.onerror = (e) => reject((e?.target as IDBRequest | null | undefined)?.error ?? tx.error ?? new Error('IndexedDB request failed'));
     tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
   });
 }

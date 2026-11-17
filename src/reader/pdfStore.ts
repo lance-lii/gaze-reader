@@ -102,7 +102,7 @@ function run<T>(db: IDBDatabase, mode: IDBTransactionMode, work: (store: IDBObje
       return;
     }
     tx.oncomplete = () => resolve(request ? (request.result ?? null) : null);
-    tx.onerror = () => reject(tx.error ?? new Error('IndexedDB request failed'));
+    tx.onerror = (e) => reject((e?.target as IDBRequest | null | undefined)?.error ?? tx.error ?? new Error('IndexedDB request failed'));
     tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
   });
 }
