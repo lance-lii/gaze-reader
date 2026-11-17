@@ -99,6 +99,7 @@ export class LibraryScreen implements Mountable {
     fileError: HTMLElement;
     busy: HTMLElement;
     busyLabel: HTMLElement;
+    busyCancel: HTMLButtonElement;
     recentSection: HTMLElement;
     recentList: HTMLElement;
     samplesList: HTMLElement;
@@ -144,7 +145,7 @@ export class LibraryScreen implements Mountable {
               <button type="button" class="gr-btn gr-btn--soft gr-lib-url-toggle" aria-expanded="false" aria-controls="${uid}-url">${icon('link')}<span>Open from URL</span></button>
             </div>
             <input type="file" class="gr-sr-only" tabindex="-1" aria-hidden="true" accept="${ACCEPT}" />
-            <div class="gr-drop__busy" hidden><span class="gr-spinner" aria-hidden="true"></span><span class="gr-drop__busy-label" role="status" aria-live="polite"></span></div>
+            <div class="gr-drop__busy" hidden><span class="gr-spinner" aria-hidden="true"></span><span class="gr-drop__busy-label" role="status" aria-live="polite"></span><button type="button" class="gr-btn gr-btn--ghost gr-drop__busy-cancel" hidden>Cancel</button></div>
             <p class="gr-field__error gr-drop__error" id="${uid}-file-error" role="alert"></p>
           </div>
 
@@ -219,6 +220,7 @@ export class LibraryScreen implements Mountable {
       fileError: q('.gr-drop__error'),
       busy: q('.gr-drop__busy'),
       busyLabel: q('.gr-drop__busy-label'),
+      busyCancel: q<HTMLButtonElement>('.gr-drop__busy-cancel'),
       recentSection: shelves[0]!,
       recentList: q('.gr-cards--recent'),
       samplesList: q('.gr-cards--samples'),
@@ -275,11 +277,14 @@ export class LibraryScreen implements Mountable {
     field.setAttribute('aria-describedby', error.id);
   }
 
-  setBusy(label: string | null): void {
+  /** `cancellable`: the work can be stopped (a download, a scanned PDF being read), so offer Cancel beside the note. */
+  setBusy(label: string | null, cancellable = false): void {
     const busy = label !== null;
     if (busy) this.ui.fileError.textContent = '';
     this.ui.busy.hidden = !busy;
-    this.ui.busyLabel.textContent = label ?? '';
+    // Only on a change: a progress note rewritten with the same words would be announced again.
+    if (this.ui.busyLabel.textContent !== (label ?? '')) this.ui.busyLabel.textContent = label ?? '';
+    this.ui.busyCancel.hidden = !(busy && cancellable);
     this.el.toggleAttribute('aria-busy', busy);
     for (const b of this.el.querySelectorAll<HTMLButtonElement>('.gr-drop__actions button, .gr-inline-form button[type="submit"], .gr-card__main')) {
       b.disabled = busy;
@@ -412,6 +417,14 @@ export class LibraryScreen implements Mountable {
     );
 
     ui.choose.addEventListener('click', () => ui.fileInput.click(), { signal });
+    ui.busyCancel.addEventListener(
+      'click',
+      () => {
+        this.opts.onCancelOpen?.();
+        ui.choose.focus({ preventScroll: true }); // the button is about to be hidden: don't drop the focus
+      },
+      { signal },
+    );
     ui.fileInput.addEventListener(
       'change',
       () => {

@@ -274,7 +274,27 @@ is the accuracy check's measurement (mean signed prediction − target over the 
 drop samples with blink > 0.5 and per-target outliers (> 2.5 MAD) before fitting. `predict`
 returns viewport px compensated for window moves since calibration (store `window.screenX/Y` at
 train time; subtract the delta). Serialize everything needed (means, stds, weights, feature-length,
-viewport, screen offset, trainedAt, `depth`: reference face scale, camera point, feature indices). Reject deserialization when the feature length changed.
+viewport, screen offset, trainedAt, `depth`: reference face scale, camera point, feature indices; `pose`: see below). Reject deserialization when the feature length changed.
+
+**Head-pose compensation** (`PoseCompensation`, `fitPoseCompensation`, `headPose.cameraAnglesInHead`).
+The eye features measure the iris against the eye corners, and the corners sit a few millimetres
+in front of the eyeball's centre of rotation: when the head turns or moves across the camera's
+view with the eyes on the same word, the corners shift against the eyeball as the camera sees
+them, and the iris seems to have moved. The effect is linear in the direction of the camera as
+seen from the head (two angles, from the pose matrix as camera = −Rᵀt, so one quantity covers a
+turn of the head and a move of it), and its size depends on the face, so it is measured: in the
+overlay's head-movement step the reader keeps their eyes on one dot and nods, turns and tilts.
+`fitPoseCompensation(model, samples)` fits, by least squares with one free constant per target and
+axis, a 2×2 gain (px per radian of those two angles, applied to the ridge output before the
+distance scaling) and a roll gain (a tilt rotates the measured gaze about the camera; undone by
+rotating back). A direction is learned only if the head moved at least 1.5° in it (half the
+10th–90th percentile range), frames that don't fit are dropped once (2.5 MAD), and the fit is kept
+only if it explains a fifth of what the prediction did, measured on quarter-second means so
+tracker noise doesn't hide it. The correction follows the pose to 1.5× the largest movement it
+was fitted on (20° at most) and holds beyond. A fresh model carries the reference pose with zero
+gains; `refineGazeModel` keeps the gains. Nothing checks that the eyes stayed on the dot: a
+reader whose eyes travel with the head teaches a wrong gain, which is why the step can be
+skipped and the README says how to undo it.
 
 ```ts
 // calibrationOverlay.ts
@@ -293,6 +313,12 @@ export class CalibrationOverlay implements Mountable {
   destroy(): void;
 }
 ```
+Head-movement step (standard mode, after training and before validation; `headStep: false`
+leaves it out, **S** or its button skips it): `headMovement()` runs as a 'targets' phase so pause,
+face-lost, Esc and a changed window behave as for the dots; three movements of `headMoveMs` each
+with `headSettleMs` discarded at the start, the instruction placed just under the dot.
+`CalibrationResult.headStep` says what was learned or why not.
+
 Flow: (1) positioning — mirrored video preview with a face-oval guide, live feedback (too far / too
 close / off-center / too dark / face not found) using `EyeFeatures.faceScale`/`faceCenter`/quality;
 "Start" enabled when good. (2) targets — standard mode uses a 3 × 4 grid (x = 10/50/90 %, y =
@@ -626,6 +652,21 @@ Rendering: a centered column (`max-width: <columnWidthCh>ch`), chapter headings,
 `c{chapter}-p{n}`, generous bottom padding (≈ 60 % of the viewport) so the last lines of the book can
 still be scrolled to the top, and an "End of book" marker. Reading typography CSS lives in
 `src/reader/reader.css.ts` (exported string, injected once).
+
+**Scanned PDFs** (`ocr.ts`, `pdf.ts: pagesToRecognize / recognizePages`). When at least half of a
+PDF's pages have no text of their own, those pages are drawn by pdf.js (about 200 dpi) and read by
+Tesseract (tesseract.js, LSTM-only core and the `best_int` English data, in up to three workers).
+All three of its files are served from the app's own origin (`scripts/copy-ocr-assets.mjs` →
+`public/ocr`), loaded only then, and allowed by the content policy as they are (a worker and
+WebAssembly from 'self'). Each recognized line becomes one `PdfTextItem`, so paragraphs, headings,
+running heads and the pages view's line boxes come from the same code as for a PDF with text. A
+crooked scan is straightened first: the page's tilt is the median slope of its long lines'
+baselines, the items are given on the straightened page (indents and line gaps are told from
+them), and `PdfPageText.skew` lets `layoutPdfPages` put the boxes back where the lines are in the
+picture. Junk at a line's ends (a page edge read as "|") is trimmed with its box, and type-size
+estimates within 14 % of the page's median are taken to be the median. `ParseOptions.onProgress`
+and `signal` carry progress to the library screen and Cancel back. Not in the Artifact build
+(its frame can't load the engine) or the extension.
 
 **The pages view of a PDF** (`pdf.ts`, `pdfStore.ts`, `ReaderView.openPages`). A PDF's text is
 still extracted into a Book (the text view, and what the library stores). Beside it, `parsePdf`

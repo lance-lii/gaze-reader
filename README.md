@@ -95,9 +95,14 @@ device on your network, serve the app over HTTPS.
 1. Open a book. The camera starts and a status pill in the top bar shows that it's on.
 2. **Positioning:** sit where you normally read and fit your face in the oval. The checklist
    (face, distance, centered, light) turns green when you're ready.
-3. **Calibration:** follow 13 dots with your eyes, then 4 check points. It takes about a minute.
-   Press Space or tap the screen to pause, or Esc to cancel. At the end you'll see your accuracy
-   in pixels and "≈ N lines at your text size". Choose **Use it** or **Redo**.
+3. **Calibration:** follow 13 dots with your eyes. Then comes the **head-movement step**: one dot
+   stays in the middle, and you keep your eyes on it while you nod slowly, turn your head a
+   little left and right, and tilt it toward each shoulder (about five seconds each). From that
+   the tracker learns what your head's own movement does to its estimate, and takes it back out
+   while you read, so shifting in your seat moves the reading position much less. **S** skips the
+   step. Then 4 check points. All of it takes about a minute and a half. Press Space or tap the
+   screen to pause, or Esc to cancel. At the end you'll see your accuracy in pixels and "≈ N lines
+   at your text size", and whether the head movement was learned. Choose **Use it** or **Redo**.
 4. Read. When you finish the last line on screen, the page turns.
 
 Tips for good tracking:
@@ -106,10 +111,13 @@ Tips for good tracking:
   common problem, because it leaves your face in shadow.
 - **Distance:** about an arm's length from the screen (50–70 cm), with your face centered in
   the camera image. Put the laptop at a height where your eyes are level with the top of the screen.
-- **Keep your head still-ish:** follow the dots with your eyes, not your head, and read in roughly
-  the posture you calibrated in. Small movements are fine. After a big change in posture or
-  seating, recalibrate (**C**; takes about a minute). Changes in the light are handled for you
-  (see [Lighting](#lighting)).
+- **Head movement:** follow the 13 dots with your eyes, not your head. In the head-movement step
+  it is the other way round: the head moves and the **eyes stay on the dot**. That is the one
+  thing the step depends on: if your eyes travel with your head, it learns the wrong correction.
+  If tracking seems worse after a calibration than before, calibrate again (**C**) and skip the
+  step with **S**. With the step done, ordinary shifting (a lowered chin, sliding down in the
+  chair, a head resting on a hand) is allowed for; after moving to another seat or screen,
+  recalibrate. Changes in the light are handled for you (see [Lighting](#lighting)).
 - **Glasses:** tilt the screen or the lamp to get rid of reflections on the lenses. Glare over
   the iris confuses the tracker.
 - **Window size:** calibration is tied to the window's size and layout. If you resize or zoom the
@@ -177,9 +185,16 @@ keep your place, and the choice is remembered for that book.
   the "Unsure of your line" state more often; resting your eyes at the bottom right of the text,
   or a glance below the page, still turns it. A wider window makes the pages, and their lines,
   larger.
-- **Two-column pages and pages without text** (scans, full-page figures) can't be followed line by
-  line. They are marked in their corner, and you turn them with Space or a head gesture. A PDF
-  that is nothing but scans has no text to open at all yet.
+- **Two-column pages and pages without text** (full-page figures) can't be followed line by
+  line. They are marked in their corner, and you turn them with Space or a head gesture.
+- **Scanned PDFs are read on your device.** A PDF whose pages are pictures (a scanned book) has
+  its text recognized when you open it (OCR), page by page, with a progress note and a Cancel
+  button: a few seconds for a handful of pages, a few minutes for a whole book, once (the result
+  is kept with the book). The text view then shows the recognized text, with the odd wrong
+  letter, and the pages view shows the scans themselves with their lines followed like any
+  other. The recognition engine and its English language data ship with the app; nothing is
+  uploaded. It reads printed English (other Latin-alphabet languages lose their accents);
+  handwriting, very faint or very small print, and two-column scans come out poorly.
 - **The original file is kept on this device** for the pages view (in the browser's storage, up
   to 64 MB per PDF), and is removed when you remove the book. See [PRIVACY.md](PRIVACY.md).
 - PDFs added before this version have no original kept: open the file again to get their pages.
@@ -416,7 +431,8 @@ src/styles/artifact.css     Extra styles for the Artifact build (layout inside t
 public/samples/             The two sample books
 extension/                  Chrome MV3 extension: service worker, offscreen tracker, content
                             script, popup, camera setup page
-scripts/                    Extension and Artifact builds, MediaPipe WASM copy, icon generator
+scripts/                    Extension and Artifact builds, copies of the MediaPipe runtime, the face
+                            model and the OCR engine into public/, icon generator
 bench/                      Slow scoreboards: lighting robustness of the gaze features, reading-layer
                             offset tolerance, replay of diagnostics recordings (npm run bench), and
                             the end-to-end harness: simulated hours of reading from webcam landmarks
@@ -428,7 +444,7 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 
 | Command | What it does |
 |---|---|
-| `npm run dev` | Start the dev server at <http://localhost:5173> (copies the MediaPipe WASM first) |
+| `npm run dev` | Start the dev server at <http://localhost:5173> (copies the MediaPipe WASM, the OCR engine and the face model into `public/` first) |
 | `npm run build` | Production build of the web app into `dist/` (relative paths, so it works on any static host, e.g. GitHub Pages) |
 | `npm run preview` | Serve the production build locally |
 | `npm run build:ext` | Build the Chrome extension into `dist-extension/` and check the package |
@@ -452,9 +468,12 @@ docs/ARCHITECTURE.md        Module contracts and design notes
   the iris moves the iris-based gaze more than it moved 1.0's lid-based gaze. The lighting and
   eyelid thresholds were tuned on simulations and a synthetic face, not yet on many real webcams:
   diagnostics recordings (see [Lighting](#lighting)) are the way to check them.
-- **Posture drift.** Calibration assumes you sit roughly as you did while calibrating. Lowering or
-  raising your chin moves the gaze about a line per 4° (in simulation); the reading model learns
-  that kind of offset as you read. Leaning in or back is corrected (0.1–0.3 lines for 6–10 cm in
+- **Posture drift.** With the calibration's head-movement step done, a chin lowered or raised by
+  4° moves the gaze 0.2–0.3 lines in simulation, and sliding down in the chair 0.4–0.5 (without
+  the step: 1.0–1.4 and 2.3–3.1). That is simulation: it has not been measured on real faces, it
+  depends on your eyes having stayed on the dot during the step, and it holds only as far as you
+  moved your head then (beyond about one and a half times that, the correction stops growing).
+  Leaning in or back is corrected (0.1–0.3 lines for 6–10 cm in
   simulation, down from 1–2), but the correction assumes the camera sits just above the middle of
   the screen you're reading on, as a laptop's or a monitor-top webcam does. With the camera
   somewhere else (a laptop's camera while you read on a second monitor), leaning still shifts the
@@ -467,9 +486,10 @@ docs/ARCHITECTURE.md        Module contracts and design notes
   drift, blinks and calibration bias, not against recordings of real readers. Expect to adjust
   sensitivity to taste.
 - **Books.** Images are dropped in the text view, since only text is rendered (a PDF's pages view
-  shows them). PDFs need selectable text (there's no OCR), and PDFs using CJK/CID fonts may extract
+  shows them). Scanned PDFs are read by OCR, in English only, with the mistakes OCR makes; the
+  Artifact build and the extension don't have it. PDFs using CJK/CID fonts may extract
   poorly; in the pages view, a PDF that doesn't embed its fonts is drawn in substitutes, two-column
-  and scanned pages aren't followed line by line, and the smaller lines are tracked less surely
+  pages aren't followed line by line, and the smaller lines are tracked less surely
   than the text view's. DRM-protected EPUBs can't be opened, and the parts of an EPUB its
   publisher marks as outside the reading order (`linear="no"`: some footnote and answer pages)
   are left out. Text, Markdown and web pages over 32 MB aren't opened.
@@ -482,3 +502,8 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 ## License
 
 [MIT](LICENSE) © 2026 Lance Li
+
+The built web app also serves, unmodified, the components it needs at run time, under their own
+licenses: MediaPipe Tasks Vision and its face model (Apache-2.0), pdf.js (Apache-2.0), JSZip (MIT),
+and for scanned PDFs tesseract.js with its WebAssembly build of Tesseract and the English
+`tessdata` model (Apache-2.0).

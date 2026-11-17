@@ -99,3 +99,40 @@ export function tryHeadPoseFromMatrix(m: ArrayLike<number> | null | undefined): 
 export function headPoseFromMatrix(m: readonly number[]): HeadPose {
   return tryHeadPoseFromMatrix(m) ?? { ...NEUTRAL_HEAD_POSE };
 }
+
+/**
+ * Where the camera is as seen from the head: the direction from the head to the camera, in the
+ * head's own frame, as two angles (radians). `a` grows as the camera moves toward the head's +x,
+ * `b` toward its +y; both are 0 for a head that faces the camera squarely.
+ *
+ * This is what the eye features can't tell apart from a movement of the eyes. They measure the
+ * iris against the eye corners, and the corners sit a few millimetres in front of the eyeball's
+ * centre of rotation: seen from a little higher or lower (the chin dropped, or the whole head
+ * moved down), the corners shift against the eyeball and the iris seems to have moved. It is one
+ * quantity for a turn of the head and for a move of the head across the camera's view, with no
+ * convention to get wrong: it uses the matrix only as the rigid transform it is (camera = −Rᵀt).
+ *
+ * Null when the pose isn't usable (no translation: the neutral pose, a face behind the camera).
+ */
+export function cameraAnglesInHead(pose: Readonly<HeadPose>): { a: number; b: number } | null {
+  const { yaw, pitch, roll, tx, ty, tz } = pose;
+  if (![yaw, pitch, roll, tx, ty, tz].every(Number.isFinite)) return null;
+  // p = −Rᵀ·t with R = Ry(yaw)·Rx(pitch)·Rz(roll), so Rᵀ = Rz(−roll)·Rx(−pitch)·Ry(−yaw).
+  const cy = Math.cos(yaw);
+  const sy = Math.sin(yaw);
+  const x1 = cy * tx - sy * tz;
+  const z1 = sy * tx + cy * tz;
+  const cp = Math.cos(pitch);
+  const sp = Math.sin(pitch);
+  const y2 = cp * ty + sp * z1;
+  const z2 = -sp * ty + cp * z1;
+  const cr = Math.cos(roll);
+  const sr = Math.sin(roll);
+  const x3 = cr * x1 + sr * y2;
+  const y3 = -sr * x1 + cr * y2;
+  const px = -x3;
+  const py = -y3;
+  const pz = -z2;
+  if (!(pz > 1e-6)) return null;
+  return { a: Math.atan2(px, pz), b: Math.atan2(py, pz) };
+}

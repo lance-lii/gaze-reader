@@ -10,7 +10,7 @@
 import { describe, expect, it } from 'vitest';
 import { SLOW_MS, gateReport, gateSession, gateTitle, type Gate } from './endToEndGates';
 
-const GATE: Gate = { scenario: 'dim, 15 fps', minutes: 20, seeds: [1, 2, 3], maxFalse: 7, maxMissed: 33 };
+const GATE: Gate = { scenario: 'dim, 15 fps', minutes: 20, seeds: [1, 2, 3], maxFalse: 6, maxMissed: 33 };
 
 describe('end-to-end gate: dim light, 15 fps (simulated reader, fixed seed)', () => {
   it(gateTitle(GATE), { timeout: SLOW_MS }, () => {

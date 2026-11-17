@@ -14,6 +14,8 @@ import {
 } from './bookLoader';
 import { sanitizeToElement } from './sanitize';
 
+import type { PdfOcrSession } from './ocr';
+
 // ───────────────────────────── Pure reconstruction ─────────────────────────────
 
 /** One positioned run of text, in page coordinates with y growing downwards. */
@@ -32,6 +34,13 @@ export interface PdfPageText {
   width: number;
   height: number;
   items: PdfTextItem[];
+  /**
+   * A scanned page that was read crooked: the tangent of the angle its lines run at (clockwise
+   * positive). The items are given straightened about the page's centre, which is what paragraphs
+   * and indents are told from; {@link layoutPdfPages} puts the line boxes back where the lines are
+   * in the picture.
+   */
+  skew?: number;
 }
 
 export type PdfBlock = { kind: 'heading'; level: 2 | 3; text: string } | { kind: 'paragraph'; text: string };
@@ -296,6 +305,8 @@ export interface PdfPageLayout {
 export interface PdfSource {
   bytes: ArrayBuffer;
   pages: PdfPageLayout[];
+  /** How many pages' text was read off their pictures (OCR) when the file was opened. Not stored. */
+  recognized?: number;
 }
 
 /** PDFs larger than this are not kept for the pages view (browser storage is limited). */
@@ -311,7 +322,17 @@ export function layoutPdfPages(pages: readonly PdfPageText[]): PdfPageLayout[] {
     if (!width || !height) return { width: width || 1, height: height || 1, columns: false, lines: [] };
     const columns = findGutter(pagePieces(page), width) !== null;
     const lines: PdfLineBox[] = [];
-    for (const l of pageLines(page, index)) {
+    const skew = typeof page.skew === 'number' && Number.isFinite(page.skew) ? page.skew : 0;
+    for (const straight of pageLines(page, index)) {
+      // A crooked scan: back from the straightened page to where the line is in the picture (its
+      // middle; the box itself stays level, which at a degree or two is within the line's height).
+      let l = straight;
+      if (skew !== 0) {
+        const mid = (straight.x0 + straight.x1) / 2;
+        const y = straight.y + (mid - width / 2) * skew;
+        const dx = -(y - height / 2) * skew;
+        l = { ...straight, x0: straight.x0 + dx, x1: straight.x1 + dx, y };
+      }
       // Inside the page, and wide enough to be a line rather than a stray mark.
       if (!(l.x1 > l.x0) || l.y <= 0 || l.y - l.size > height || l.x1 <= 0 || l.x0 >= width) continue;
       lines.push({ x0: Math.max(0, l.x0), x1: Math.min(width, l.x1), y: l.y, size: l.size, text: l.text.slice(0, MAX_LINE_TEXT) });
@@ -599,6 +620,122 @@ function blocksToDrafts(blocks: PdfBlock[]): ChapterDraft[] {
   return merged.map((c) => draftFromElement(sanitizeToElement(c.html.join('\n')), c.title));
 }
 
+/** A page with fewer characters of its own than this is a picture of a page, if it is anything. */
+const TEXTLESS_PAGE_CHARS = 20;
+
+const pageChars = (page: PdfPageText): number => page.items.reduce((n, item) => n + item.str.replace(/\s+/g, '').length, 0);
+
+/**
+ * The pages (0-based) whose text has to be read off their picture: the pages without text, when
+ * they are at least half of the document. That is a scanned book, or one scanned in part. In a PDF
+ * that is mostly real text, a page without any is a figure, a plate or a blank, and is left alone
+ * (reading it would put the lettering of a diagram into the book as a paragraph).
+ */
+export function pagesToRecognize(pages: readonly PdfPageText[]): number[] {
+  const textless: number[] = [];
+  pages.forEach((page, i) => {
+    if (pageChars(page) < TEXTLESS_PAGE_CHARS) textless.push(i);
+  });
+  return textless.length > 0 && textless.length * 2 >= pages.length ? textless : [];
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw (signal.reason as unknown) ?? new DOMException('Aborted', 'AbortError');
+}
+
+const isAbort = (err: unknown): boolean => !!err && typeof err === 'object' && (err as { name?: unknown }).name === 'AbortError';
+
+/** The built-in OCR, where it can run. */
+function defaultOcr(): ParseOptions['ocr'] {
+  if (IS_ARTIFACT || typeof Worker === 'undefined' || typeof document === 'undefined') return null;
+  return async (pages) => (await import('./ocr')).openOcrSession(pages);
+}
+
+/**
+ * Reads the pages in `indices` off their pictures and puts what was found in `pages`. Rejects
+ * with an AbortError when `opts.signal` fires, and with a BookLoadError when the engine can't run.
+ */
+export async function recognizePages(
+  pdfjs: Pick<PdfJs, 'AnnotationMode'>,
+  doc: { getPage(n: number): Promise<Pick<import('pdfjs-dist').PDFPageProxy, 'getViewport' | 'render' | 'cleanup'>> },
+  pages: PdfPageText[],
+  indices: readonly number[],
+  open: NonNullable<ParseOptions['ocr']>,
+  opts: ParseOptions,
+): Promise<void> {
+  const total = indices.length;
+  const progress = (done: number): void =>
+    opts.onProgress?.(
+      total === 1
+        ? 'This PDF is a scanned page: reading its text…'
+        : `This PDF is scanned pages: reading their text, page ${Math.min(total, done + 1)} of ${total}…`,
+    );
+  opts.onProgress?.('This PDF is scanned pages: getting the text reader ready…');
+  let session: PdfOcrSession;
+  try {
+    session = await open(total);
+  } catch (err) {
+    throw new BookLoadError(
+      'parse',
+      'This PDF is scanned page images, and the text reader that would read them couldn’t be loaded. Check your connection and try again.',
+      { cause: err },
+    );
+  }
+  let next = 0;
+  let done = 0;
+  let failed: unknown = null;
+  const onAbort = (): void => {
+    // Stops the workers: recognitions in flight reject, and the runners below end.
+    void session.close();
+  };
+  opts.signal?.addEventListener('abort', onAbort, { once: true });
+  const run = async (): Promise<void> => {
+    while (next < indices.length && failed === null) {
+      throwIfAborted(opts.signal);
+      const index = indices[next++];
+      const page = await doc.getPage(index + 1);
+      try {
+        const base = page.getViewport({ scale: 1 });
+        const read = await session.read({
+          index,
+          width: base.width,
+          height: base.height,
+          draw: async (canvas, scale) => {
+            const viewport = page.getViewport({ scale });
+            canvas.width = Math.max(1, Math.floor(viewport.width));
+            canvas.height = Math.max(1, Math.floor(viewport.height));
+            // Pictures only, as in the pages view: no annotations are drawn, nothing in the file is run.
+            await page.render({ canvas, viewport, annotationMode: pdfjs.AnnotationMode.DISABLE }).promise;
+          },
+        });
+        throwIfAborted(opts.signal);
+        pages[index] = { width: base.width, height: base.height, items: read.items, ...(read.skew ? { skew: read.skew } : {}) };
+      } finally {
+        page.cleanup();
+      }
+      done++;
+      if (done < total) progress(done);
+    }
+  };
+  progress(0);
+  try {
+    await Promise.all(
+      Array.from({ length: Math.max(1, Math.min(session.concurrency, total)) }, () =>
+        run().catch((err: unknown) => {
+          failed ??= err;
+        }),
+      ),
+    );
+    if (failed !== null) {
+      throwIfAborted(opts.signal); // a recognition that died because the reader cancelled
+      throw failed;
+    }
+  } finally {
+    opts.signal?.removeEventListener('abort', onAbort);
+    await session.close().catch(() => undefined);
+  }
+}
+
 /** Extracts the text of a PDF into paragraphs. pdf.js is loaded on first use only. */
 export async function parsePdf(data: ArrayBuffer, opts: ParseOptions = {}): Promise<ParsedBook> {
   const pdfjs = await loadPdfJs();
@@ -632,13 +769,25 @@ export async function parsePdf(data: ArrayBuffer, opts: ParseOptions = {}): Prom
       page.cleanup();
     }
 
+    // Scanned pages: read their text off the pictures.
+    const scanned = pagesToRecognize(pages);
+    const ocr = opts.ocr === undefined ? defaultOcr() : opts.ocr;
+    let recognized = false;
+    if (scanned.length > 0 && ocr) {
+      await recognizePages(pdfjs, doc, pages, scanned, ocr, opts);
+      recognized = true;
+      chars = pages.reduce((n, page) => n + pageChars(page), 0);
+    }
+
     const blocks = reconstructBlocks(pages);
     if (chars < 40 || blocks.length === 0) {
       throw new BookLoadError(
         'empty',
-        chars === 0
-          ? 'This PDF has no selectable text — it’s probably scanned page images. Try a text-based version, or run it through OCR first.'
-          : 'This PDF has almost no selectable text (a few words at most), so there is nothing to read as a book. If its pages are scanned images, run it through OCR first.',
+        recognized
+          ? 'This PDF is scanned page images, and no text could be read off them (too faint, too small, handwriting, or not English).'
+          : chars === 0
+            ? 'This PDF has no selectable text — it’s probably scanned page images, which this version of Gaze Reader can’t read. Try a text-based version, or run it through OCR first.'
+            : 'This PDF has almost no selectable text (a few words at most), so there is nothing to read as a book. If its pages are scanned images, run it through OCR first.',
       );
     }
 
@@ -657,10 +806,11 @@ export async function parsePdf(data: ArrayBuffer, opts: ParseOptions = {}): Prom
     // pdf.js was handed a copy, so `data` is still whole: keep it for the pages view. (Not in the
     // Artifact frame, whose content policy doesn't let pdf.js load a document's embedded fonts.)
     if (!IS_ARTIFACT && data.byteLength > 0 && data.byteLength <= MAX_PDF_SOURCE_BYTES) {
-      rememberSource(book.id, { bytes: data, pages: layoutPdfPages(pages) });
+      rememberSource(book.id, { bytes: data, pages: layoutPdfPages(pages), ...(recognized ? { recognized: scanned.length } : {}) });
     }
     return book;
   } catch (err) {
+    if (isAbort(err)) throw err; // the reader cancelled: not a broken PDF
     throw err instanceof BookLoadError ? err : pdfError(err);
   } finally {
     void task.destroy();
