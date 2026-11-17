@@ -8,7 +8,7 @@
  * progress · pipeline · page turning · layout · sources · calibration ·
  * tracking state · commands & settings · DOM events.
  */
-import { CSS_PREFIX } from '../core/constants';
+import { CSS_PREFIX, pinchZoomed } from '../core/constants';
 import { createEventBus } from '../core/events';
 import { createSettingsStore, type SettingsStore } from '../core/settings';
 import { readJSON, removeKey, writeJSON } from '../core/storage';
@@ -307,6 +307,8 @@ export class AppController {
   private urlAbort: AbortController | null = null;
   /** Date.now() of the last heartbeat with a book open (the eye-break timer's wall clock). */
   private lastHeartbeatWall: number | null = null;
+  /** The pinch-zoom notice has been shown for the pinch in progress. */
+  private pinchExplained = false;
   private openSeq = 0;
   private samples: readonly SampleBookInfo[] | null = null;
   private hasRecent = false;
@@ -331,6 +333,8 @@ export class AppController {
   private offCameraError: Unsubscribe | null = null;
   /** performance.now() of the last camera frame (with or without a face); the stall watch reads it. */
   private lastCameraFrameAt = Number.NEGATIVE_INFINITY;
+  /** A camera frame has arrived since the 'calibrating' phase began (see watchCamera). */
+  private cameraFrameSeen = false;
   /** When the camera was restarted on its own, in the last CAMERA_RESTART_WINDOW_MS. */
   private cameraRestarts: number[] = [];
   private slowCameraSince: number | null = null;
@@ -1309,8 +1313,24 @@ export class AppController {
       this.scrollSettling ||
       (this.scroll?.animating ?? false) ||
       this.calibration !== null ||
-      this.modalOpen()
+      this.modalOpen() ||
+      this.pinchBlocked()
     );
+  }
+
+  /** Pinch-zoomed: the reading model waits (see pinchZoomed), and the reader is told why, once per pinch. */
+  private pinchBlocked(): boolean {
+    const zoomed = pinchZoomed();
+    if (zoomed && !this.pinchExplained && this.sourceKind !== null) {
+      this.toasts.show({
+        id: 'pinch-zoom',
+        tone: 'warn',
+        message: 'The page is pinch-zoomed, so what you look at isn’t where the text was measured. Pages won’t turn by themselves until you pinch back out.',
+        durationMs: 9000,
+      });
+    }
+    this.pinchExplained = zoomed;
+    return zoomed;
   }
 
   /**
@@ -1853,6 +1873,7 @@ export class AppController {
     }
     // Also in the middle of a calibration: a camera that froze there (the laptop woke up) left the
     // dots on "I lost sight of your eyes" until Esc. The restart opens the calibration again.
+    if (this.phase === 'calibrating' && !this.cameraFrameSeen) return;
     if (now - this.lastCameraFrameAt >= CAMERA_STALL_MS) {
       this.recoverCamera(new Error('The camera stopped sending pictures.'));
       return;
@@ -2408,6 +2429,7 @@ export class AppController {
 
   private readonly onCameraFrame = (frame: FeatureFrame): void => {
     this.lastCameraFrameAt = performance.now();
+    this.cameraFrameSeen = true;
     this.recorder.frame(frame);
     if (this.sourceKind !== 'webcam' || this.phase !== 'running' || this.calibration || !this.session || document.hidden) return;
     this.lightingWatch.onFrame(frame);
@@ -2663,6 +2685,9 @@ export class AppController {
       this.lineConfidence.reset();
       this.lastCameraFrameAt = now;
     }
+    // A first calibration starts while the tracker is still warming up (its first frame can take
+    // seconds): the stall watch there waits until frames have been seen to stop.
+    if (phase === 'calibrating') this.cameraFrameSeen = false;
     this.refreshTracking(now);
     this.updateOverlays();
   }

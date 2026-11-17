@@ -13,7 +13,7 @@ brings the same page turning (and Dewey) to articles and online books on any web
 - **Web app: <https://lance-lii.github.io/gaze-reader/>.** Nothing to install. The site is served
   over HTTPS, so the webcam works there in a recent Chrome, Edge, Firefox or Safari. The first run
   asks how you'd like to read: **webcam**, **mouse** or **demo**. With the webcam, the browser asks
-  for camera access and the app downloads the face model (about 3.6 MB) once. Without one, pick
+  for camera access and the app loads its face model (about 3.8 MB) once. Without one, pick
   **Demo** and watch a simulated reader turn the pages, or **Mouse** and point at the line you're
   reading. For private documents, read the note on the shared origin under [Privacy](#privacy).
 - **claude.ai Artifact preview.** The same reader, built to run inside a claude.ai Artifact
@@ -80,9 +80,10 @@ Open <http://localhost:5173>. The first run walks you through a short intro and 
 like to read: **webcam**, **mouse** or **demo**.
 
 `npm run dev` first copies the MediaPipe WASM runtime from `node_modules` into
-`public/mediapipe/wasm/`, so it's served from your own origin. The face model (about 3.6 MB) is
-downloaded from Google's model storage and cached by the browser, but the web app has no offline
-mode: the webcam needs a connection the first time it starts in a tab.
+`public/mediapipe/wasm/`, and downloads the face model (about 3.8 MB) once into
+`public/mediapipe/models/`, checking it against a pinned hash, so both are served from your own
+origin and the webcam needs no connection to anyone else. (Started offline before the model was
+ever fetched, the dev server still works: the app then gets the model from Google's storage.)
 
 Browsers only allow camera access in a secure context. `localhost` counts as one. To use another
 device on your network, serve the app over HTTPS.
@@ -316,8 +317,9 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
    detector waits for your eyes to come back up the page, so a resting gaze or mouse can't page
    through the book on its own.
 6. **Scrolling** puts the next unread line near the top (keeping 2 lines of context by default)
-   with an eased animation, or instantly if you prefer reduced motion. Scrolling or pressing a key
-   during the animation cancels it.
+   with an eased animation, or instantly if you prefer reduced motion. Scrolling (wheel, touch or
+   the scrollbar) or pressing a navigation key (arrows, Page Up/Down, Home, End, Space) during
+   the animation cancels it.
 
 ## Privacy
 
@@ -335,9 +337,12 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
   documents, run it locally (`npm run dev` / `npm run preview`) or host it on its own origin, and
   prefer "Allow this time" for the camera on the hosted demo. Forks deployed to
   `<you>.github.io` have the same property.
-- There are no analytics, no telemetry and no remote logging. The only network requests are the
-  face-landmark model file and any book URL you ask the reader to open. MediaPipe's built-in
-  usage logging to Google (`odml.pa.googleapis.com`) is blocked before it can send anything.
+- There are no analytics, no telemetry and no remote logging. The face model and the MediaPipe
+  runtime ship with the app, so the only requests to other servers are for a book URL you ask the
+  reader to open. MediaPipe's built-in usage logging to Google (`odml.pa.googleapis.com`) is
+  blocked before it can send anything, and a test fails if an upgrade of the library would reach
+  the network any other way. The built app carries a content security policy: only its own
+  scripts run.
 
 ## Chrome extension
 
@@ -453,10 +458,11 @@ docs/ARCHITECTURE.md        Module contracts and design notes
   simulation, down from 1–2), but the correction assumes the camera sits just above the middle of
   the screen you're reading on, as a laptop's or a monitor-top webcam does. With the camera
   somewhere else (a laptop's camera while you read on a second monitor), leaning still shifts the
-  gaze, and it's best to calibrate where you'll sit. The model also
-  compensates for window moves, but after a big change in posture it's best to recalibrate. The web app doesn't compensate for page zoom, fullscreen or toolbar
-  changes; it notices them and offers a quick 5-dot refresh instead (the extension compensates for
-  zoom).
+  gaze, and it's best to calibrate where you'll sit. The model also compensates for window moves,
+  but after a big change in posture it's best to recalibrate. The web app doesn't compensate for
+  page zoom, fullscreen or toolbar changes; it notices them and offers a quick 5-dot refresh
+  instead (the extension compensates for zoom). A pinch-zoomed page can't be followed at all: page
+  turning waits until you pinch back out.
 - **Not validated at scale.** The page-end rules were tuned against a simulated reader with noise,
   drift, blinks and calibration bias, not against recordings of real readers. Expect to adjust
   sensitivity to taste.
@@ -464,7 +470,9 @@ docs/ARCHITECTURE.md        Module contracts and design notes
   shows them). PDFs need selectable text (there's no OCR), and PDFs using CJK/CID fonts may extract
   poorly; in the pages view, a PDF that doesn't embed its fonts is drawn in substitutes, two-column
   and scanned pages aren't followed line by line, and the smaller lines are tracked less surely
-  than the text view's. DRM-protected EPUBs can't be opened.
+  than the text view's. DRM-protected EPUBs can't be opened, and the parts of an EPUB its
+  publisher marks as outside the reading order (`linear="no"`: some footnote and answer pages)
+  are left out. Text, Markdown and web pages over 32 MB aren't opened.
 - **Extension.** It needs Chrome 116 or later. A site's main content is detected heuristically,
   so it can miss articles that single-page apps render late. Text inside frames isn't measured.
   It must be turned on again after a full page navigation. On canvas and image readers, page mode
