@@ -33,7 +33,7 @@ import type {
 } from '../../src/types';
 import { createEventBus } from '../../src/core/events';
 import { createSettingsStore, type SettingsStore } from '../../src/core/settings';
-import { IGNORE_ATTR } from '../../src/core/constants';
+import { IGNORE_ATTR, pinchZoomed } from '../../src/core/constants';
 import { WebcamGazeSource } from '../../src/gaze/webcamGazeSource';
 import { MouseGazeSource } from '../../src/gaze/mouseGazeSource';
 import { FEATURE_NAMES } from '../../src/gaze/features';
@@ -261,6 +261,8 @@ export class PageSession {
   private runWhenReady: CalibrationMode | null = null;
   /** Ticks left in which to look again for the page's main text (see relocateIfBetter). */
   private relocateTries = 0;
+  /** The pinch-zoom notice has been shown for the pinch in progress. */
+  private pinchExplained = false;
   /** The browser-chrome height a "the page moved inside the window" notice was shown for; null: none showing. */
   private chromeWarnedAt: number | null = null;
   /** Our element on the page (the shadow root's host). */
@@ -727,7 +729,21 @@ export class PageSession {
    * moved put the reader lines away from where they are, or teach the tracker a gaze offset.
    */
   private pipelineBlocked(): boolean {
-    return this.turning || this.scrollSettling || (this.scroll?.animating ?? false);
+    return this.turning || this.scrollSettling || (this.scroll?.animating ?? false) || this.pinchBlocked();
+  }
+
+  /** Pinch-zoomed: the reading model waits (see pinchZoomed), and the pill says why, once per pinch. */
+  private pinchBlocked(): boolean {
+    const zoomed = pinchZoomed();
+    if (zoomed && !this.pinchExplained) {
+      this.pill.notify({
+        text: 'The page is pinch-zoomed, so what you look at isn’t where the text was measured. Pages won’t turn by themselves until you pinch back out.',
+        tone: 'info',
+        timeoutMs: 9000,
+      });
+    }
+    this.pinchExplained = zoomed;
+    return zoomed;
   }
 
   private onScrollSettled(): void {

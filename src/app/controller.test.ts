@@ -439,6 +439,27 @@ describe('AppController', () => {
     await until(() => layouts.length > after, 'a new measurement after Dewey was shown or hidden');
   });
 
+  it('keeps the reading model out while the page is pinch-zoomed, and says why once (regression: nothing noticed a pinch)', async () => {
+    const fed = vi.spyOn(LineTracker.prototype, 'onSample'); // calls through
+    await openPastedText();
+    const layouts = record(app, 'layout');
+    await until(() => layouts.length > 0, 'the first layout');
+    moveMouse(400, 300);
+    await until(() => fed.mock.calls.length > 3, 'gaze to reach the reading model');
+    // A pinch: the visual viewport magnifies; no resize, no change of devicePixelRatio.
+    vi.stubGlobal('visualViewport', { scale: 1.6 });
+    await sleep(80);
+    fed.mockClear();
+    moveMouse(420, 320);
+    await sleep(300);
+    expect(fed).not.toHaveBeenCalled();
+    expect(toastText()).toMatch(/pinch-zoomed/);
+    vi.stubGlobal('visualViewport', { scale: 1 });
+    moveMouse(440, 300);
+    await until(() => fed.mock.calls.length > 3, 'the reading model to resume');
+    vi.unstubAllGlobals();
+  });
+
   it('keyboard: P pauses (pill says so), shortcuts wait while typing, and nothing reacts after destroy', async () => {
     const states = record(app, 'tracking-state');
     // In the library, typing an "s" into the paste box is just typing (S would open Settings).
@@ -1072,6 +1093,21 @@ describe('AppController', () => {
     await until(() => camera.starts() === before + 1, 'the camera to be restarted', 4000);
     await until(() => overlays.modes.length === 2, 'the calibration to open again', 4000);
     expect(overlays.modes).toEqual(['standard', 'standard']);
+  });
+
+  it('webcam: a first calibration isn’t restarted while the tracker is still warming up (no frame has arrived yet)', async () => {
+    const realNow = performance.now.bind(performance);
+    let skew = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() + skew);
+    overlays.run = () => new Promise(() => undefined); // the dots stay up
+    const { camera } = await readWithWebcam(null);
+    await until(() => overlays.modes.length === 1, 'the first calibration');
+    const before = camera.starts();
+    skew += 8000; // eight seconds and still no frame: the model is compiling, the camera is fine
+    await sleep(1300); // a heartbeat or two
+    expect(camera.starts()).toBe(before);
+    expect(toastText()).not.toMatch(/camera stopped/i);
+    expect(overlays.modes).toHaveLength(1);
   });
 
   it('webcam: a camera that keeps stopping a little over a minute apart is reported on the third stop (regression: restarted silently forever)', async () => {

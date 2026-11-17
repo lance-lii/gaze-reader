@@ -4,9 +4,13 @@ Gaze Reader is a browser app (plus a Chrome extension) that watches your eyes th
 the webcam while you read and **turns the page — scrolls — when you reach the bottom**.
 **Dewey**, a tiny nerd avatar, sits in the corner reading along with you.
 
-Everything runs locally. Video never leaves the device. The only network fetch is the
-MediaPipe face-landmarker model file (data, ~3.6 MB, cached by the browser; the web app has no
-offline mode, so the webcam needs a connection the first time it starts in a tab).
+Everything runs locally. Video never leaves the device. The MediaPipe face-landmarker model file
+(data, ~3.8 MB) ships with the app and the extension: `scripts/fetch-face-model.mjs` downloads it
+at build time into `public/mediapipe/models/` and refuses a file whose SHA-256 isn't the pinned
+one, and `faceTracker.ts` loads it from the app's own origin (`FACE_LANDMARKER_MODEL_PATH`),
+falling back to Google's storage only when that copy is missing. The built web app carries a
+Content-Security-Policy meta tag (vite.config.ts): scripts from the app's own files, WebAssembly
+and the hashed inline theme script only.
 
 ```
  camera ─► FaceLandmarker ─► EyeFeatures ─► GazeModel (ridge regression, calibrated)
