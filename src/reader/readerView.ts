@@ -251,14 +251,17 @@ export class ReaderView {
           const pct = (v: number): string => `${(100 * v).toFixed(4)}%`;
           el.style.left = pct(line.x0 / page.width);
           el.style.top = pct((line.y - LINE_ASCENT * line.size) / page.height);
-          el.style.width = pct((line.x1 - line.x0) / page.width);
           el.style.height = pct(((LINE_ASCENT + LINE_DESCENT) * line.size) / page.height);
           el.style.setProperty('--gr-pdf-size', (line.size / page.width).toFixed(5));
+          // The text is set in a stand-in font and stretched sideways to the width the line has on
+          // the page. The stretch is a transform of the whole element, so the element is made
+          // narrower or wider by the same factor first: stretched, it is exactly the line's width.
+          // (Setting the line's width and then stretching it left the box up to a tenth too long or
+          // too short wherever the page's type isn't as wide as the stand-in: any serif book.)
           const natural = textWidthEm(doc, line.text);
-          if (natural > 0) {
-            const stretch = (line.x1 - line.x0) / line.size / natural;
-            el.style.setProperty('--gr-pdf-stretch', clamp(stretch, MIN_STRETCH, MAX_STRETCH).toFixed(4));
-          }
+          const stretch = natural > 0 ? clamp((line.x1 - line.x0) / line.size / natural, MIN_STRETCH, MAX_STRETCH) : 1;
+          el.style.width = pct((line.x1 - line.x0) / page.width / stretch);
+          if (natural > 0) el.style.setProperty('--gr-pdf-stretch', stretch.toFixed(4));
           layer.appendChild(el);
           this.anchors.push(el);
           this.anchorById.set(el.id, el);

@@ -7,9 +7,10 @@
   "scripts": {
     "copy-wasm": "node scripts/copy-mediapipe-wasm.mjs public/mediapipe/wasm",
     "fetch-model": "node scripts/fetch-face-model.mjs public/mediapipe/models",
-    "predev": "npm run copy-wasm && npm run fetch-model",
+    "copy-ocr": "node scripts/copy-ocr-assets.mjs public/ocr",
+    "predev": "npm run copy-wasm && npm run copy-ocr && npm run fetch-model",
     "dev": "vite",
-    "prebuild": "npm run copy-wasm && npm run fetch-model -- --required",
+    "prebuild": "npm run copy-wasm && npm run copy-ocr && npm run fetch-model -- --required",
     "build": "vite build",
     "preview": "vite preview",
     "build:ext": "node scripts/build-extension.mjs",
@@ -24,8 +25,10 @@
   "license": "MIT",
   "dependencies": {
     "@mediapipe/tasks-vision": "1.0.1",
+    "@tesseract.js-data/eng": "1.0.0",
     "jszip": "^3.10.2",
-    "pdfjs-dist": "^6.3.289"
+    "pdfjs-dist": "^6.3.289",
+    "tesseract.js": "7.0.0"
   },
   "devDependencies": {
     "@types/chrome": "^0.3.0",
