@@ -12,7 +12,7 @@ import { CSS_PREFIX, pinchZoomed } from '../core/constants';
 import { createEventBus } from '../core/events';
 import { createSettingsStore, type SettingsStore } from '../core/settings';
 import { readJSON, removeKey, writeJSON } from '../core/storage';
-import { FULL_APP_URL, IS_ARTIFACT } from '../core/target';
+import { APP_VERSION, FULL_APP_URL, IS_ARTIFACT } from '../core/target';
 import type {
   AppEvents,
   AppSettings,
@@ -68,7 +68,9 @@ import { LineTracker } from '../reading/lineTracker';
 import { MIN_TRACKING_HZ, PageEndDetector } from '../reading/pageEndDetector';
 import { SimulatedReaderSource } from '../reading/simulatedReader';
 import { FixationDetector } from '../signal/fixations';
-import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationMode } from '../ui/calibrationOverlay';
+import { accuracyRecordingFileName } from '../gaze/accuracyTest';
+import { AccuracyTestOverlay } from '../ui/accuracyTestOverlay';
+import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationFrames, type CalibrationMode } from '../ui/calibrationOverlay';
 import { CameraPreview } from '../ui/cameraPreview';
 import { DEWEY_FULL_APP_LINE, FULL_APP_LABEL, WEBCAM_UNAVAILABLE_TEXT, WEBCAM_UNAVAILABLE_TITLE } from '../ui/fullApp';
 import { DebugOverlay } from '../ui/debugOverlay';
@@ -128,6 +130,7 @@ import {
   DiagnosticsRecorder,
   RECORDED_EVENTS,
   describeEnvironment,
+  downloadJson,
   downloadRecording,
   videoTrackOf,
   type PipelineControl,
@@ -347,6 +350,10 @@ export class AppController {
   private model: GazeModel | null | undefined = undefined;
   private savedCalibration = false;
   private calibration: CalibrationOverlay | null = null;
+  /** The accuracy test's rounds of dots, while they are up (after its calibration). */
+  private accuracyTest: AccuracyTestOverlay | null = null;
+  /** The frames of the last full calibration finished in this session: what the accuracy test records. */
+  private calibrationFrames: CalibrationFrames | null = null;
   /** The mode of the calibration overlay that is open (see calibrate). */
   private calibrationMode: CalibrationMode | null = null;
   /** A calibration the camera stopped in the middle of: the restart opens it again (see recoverCamera). */
@@ -492,6 +499,7 @@ export class AppController {
       onForgetCalibration: () => this.forgetCalibration(),
       onRecalibrate: () => this.recalibrate(),
       onCheckAccuracy: () => this.runCommand('check-accuracy'),
+      ...(IS_ARTIFACT ? {} : { onAccuracyTest: () => void this.runAccuracyTest() }),
       onShowHelp: () => this.runCommand('show-help'),
       onReplayIntro: () => {
         this.closePanels();
@@ -604,7 +612,7 @@ export class AppController {
   }
 
   private syncModalState(): void {
-    const blocking = this.modalOpen() || this.calibration !== null;
+    const blocking = this.modalOpen() || this.calibration !== null || this.accuracyTest !== null;
     this.screens.inert = blocking;
     // A closing dialog may have nowhere to hand focus back to (e.g. a button in
     // another dialog that just closed); keep keyboard paging working.
@@ -1791,6 +1799,7 @@ export class AppController {
     this.sourceKind = null;
     // Resolves the pending run() with null; the bring-up sees a stale generation and backs out.
     this.calibration?.cancel();
+    this.accuracyTest?.cancel();
     this.offCameraError?.();
     this.offCameraError = null;
     this.offCameraFrames?.();
@@ -2157,9 +2166,11 @@ export class AppController {
     overlay.mount(this.root);
     let result: { model: GazeModel; report: CalibrationReport } | null = null;
     let check: AccuracyCheckResult | null = null;
+    this.calibrationFrames = null;
     try {
       result = await overlay.run();
       check = overlay.lastAccuracyCheck;
+      this.calibrationFrames = overlay.lastFrames;
     } finally {
       if (this.calibration === overlay) {
         this.calibration = null;
@@ -2321,8 +2332,70 @@ export class AppController {
     void this.recalibrateInPlace('check');
   }
 
+  /**
+   * Settings → Advanced → "Run the accuracy test": a full calibration, then rounds of dots in
+   * several ways of sitting, scored for the calibration in use and its alternatives. The new
+   * calibration is kept, like any other.
+   */
+  private async runAccuracyTest(): Promise<void> {
+    if (IS_ARTIFACT) {
+      this.webcamUnavailable();
+      return;
+    }
+    if (this.phase === 'calibrating' || this.calibration || this.accuracyTest) return;
+    if (!this.session) {
+      this.toasts.show({ id: 'accuracy-test', message: 'Open a book first: the accuracy test measures in lines of the text you read.' });
+      return;
+    }
+    if (this.store.get().gazeSource !== 'webcam') {
+      this.toasts.show({
+        id: 'accuracy-test',
+        message: 'The accuracy test is for eye tracking. Switch to your eyes first.',
+        actions: [{ label: 'Use my eyes', primary: true, run: () => this.selectSource('webcam') }],
+      });
+      return;
+    }
+    if (this.sourceKind !== 'webcam' || this.phase !== 'running' || !this.source || !this.camera?.running) {
+      this.toasts.show({ id: 'accuracy-test', message: 'Eye tracking isn’t running yet. Calibrate first, then run the accuracy test.' });
+      return;
+    }
+    await this.recalibrateInPlace('standard', (outcome) => this.accuracyRounds(outcome));
+  }
+
+  /** The accuracy test after its calibration: the rounds of dots and the results. Gaze processing is still paused. */
+  private async accuracyRounds(outcome: CalibrationOutcome): Promise<void> {
+    const camera = this.camera;
+    const frames = this.calibrationFrames;
+    // Cancelled, or the reader kept the old calibration: there is nothing to test against.
+    if (outcome !== 'standard' || !frames || frames.targets.length === 0 || !camera?.running) {
+      this.toasts.show({ id: 'accuracy-test', message: 'The accuracy test needs a finished calibration, so it didn’t run.' });
+      return;
+    }
+    const overlay = new AccuracyTestOverlay({
+      features: camera,
+      calibration: frames,
+      linePitchPx: this.layout?.linePitch ?? null,
+      appVersion: APP_VERSION,
+      // Always scored, whatever the setting: the test is how to find out which one does better.
+      prior: REAL_FACE_PRIOR,
+      save: (recording) => downloadJson(recording, accuracyRecordingFileName(recording.recordedAt)),
+    });
+    this.accuracyTest = overlay;
+    this.syncModalState();
+    try {
+      await overlay.run(this.root);
+    } catch (err) {
+      console.error('[app] accuracy test failed', err);
+    } finally {
+      this.accuracyTest = null;
+      this.syncModalState();
+      overlay.destroy();
+      if (this.session && (!document.activeElement || document.activeElement === document.body)) this.focusReader();
+    }
+  }
+
   /** Recalibrates (or refreshes, or checks) without restarting the camera; gaze processing pauses meanwhile. */
-  private async recalibrateInPlace(mode: CalibrationMode): Promise<void> {
+  private async recalibrateInPlace(mode: CalibrationMode, then?: (outcome: CalibrationOutcome) => Promise<void>): Promise<void> {
     const gen = this.sourceGen;
     const source = this.source;
     // Only a live webcam session can be recalibrated in place: a stale 'Refresh now' toast
@@ -2334,6 +2407,8 @@ export class AppController {
     let outcome: CalibrationOutcome | null = null;
     try {
       outcome = await this.calibrate(mode, gen);
+      // Before gaze processing resumes, so nothing reads or turns pages under it.
+      if (outcome && then && gen === this.sourceGen && !this.destroyed) await then(outcome);
     } catch (err) {
       console.error('[app] calibration failed', err);
     }

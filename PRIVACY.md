@@ -1,6 +1,6 @@
 # Privacy policy
 
-*Gaze Reader web app and Gaze Reader browser extension. Last updated: 16 November 2026.*
+*Gaze Reader web app and Gaze Reader browser extension. Last updated: 23 November 2026.*
 
 Gaze Reader is built so that nothing about you leaves your computer. There is no account, no
 server of ours that receives your data, no analytics, no telemetry, no ads and no remote logging.
@@ -101,6 +101,24 @@ start it, and a chip in the top bar shows while it records.
   file on your computer. It is never uploaded. It reaches the developers only if you send them
   the file yourself.
 
+## Accuracy test (web app, only if you start it)
+
+**Settings → Advanced → Run the accuracy test** measures how well your eyes are followed: a full
+calibration, then five short rounds of dots while you sit in different ways. Nothing is recorded
+unless you start it.
+
+- **What is recorded,** as numbers, for the frames of the calibration and of each dot: your eye
+  measurements (the numbers described under "The camera", head angle and position, how open your
+  eyes are), where each dot was, the size and place of the window, the line spacing of the open
+  text, the app version, and the date and time.
+- **What is not:** video, images, anything about the book, your settings, or your browser and
+  camera.
+- **Where it goes:** it stays in memory while the results are on screen. **Save recording** saves
+  a JSON file on your computer; closing the results without saving discards it. It is never
+  uploaded. It reaches the developers only if you send them the file yourself.
+
+The calibration the test begins with is kept like any other calibration (see above).
+
 You can delete everything at any time. In the app, use **Settings → Forget calibration**, delete
 books from the library, or clear the site's data in your browser. For the extension, use
 **Forget calibration** in the popup (click it twice), or remove the extension (this deletes all
@@ -147,7 +165,7 @@ section of the README for what that means and how to avoid it for private docume
 ## Children
 
 Gaze Reader doesn't knowingly collect information from anyone, including children: it collects
-nothing by itself, and we only receive what you choose to send us (such as a diagnostics file).
+nothing by itself, and we only receive what you choose to send us (such as a diagnostics file or an accuracy-test recording).
 
 ## Changes and contact
 

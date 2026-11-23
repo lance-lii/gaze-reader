@@ -16,6 +16,9 @@ export const IS_ARTIFACT: boolean = typeof __GR_TARGET__ !== 'undefined' && __GR
 
 export const BUILD_TARGET: BuildTarget = IS_ARTIFACT ? 'artifact' : 'web';
 
+/** The app's version in the built web app; 'dev' in tests and in builds that don't set it. */
+export const APP_VERSION: string = typeof __GR_VERSION__ === 'string' ? __GR_VERSION__ : 'dev';
+
 /** The full app, with webcam eye tracking. */
 export const FULL_APP_URL = 'https://lance-lii.github.io/gaze-reader/';
 

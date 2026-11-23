@@ -126,6 +126,16 @@ export interface CalibrationOverlayOptions {
   prior?: GazePriorWeights | null;
 }
 
+/** The frames a finished full calibration was fitted on. The accuracy test keeps them. */
+export interface CalibrationFrames {
+  targets: CalibrationSample[];
+  /** The head-movement step's frames: empty when it was skipped or switched off. */
+  head: CalibrationSample[];
+  viewport: { width: number; height: number };
+  /** Frames with a blink value above this were left out of the fit. */
+  maxBlink: number;
+}
+
 export interface CalibrationResult {
   model: GazeModel;
   report: CalibrationReport;
@@ -734,6 +744,7 @@ export class CalibrationOverlay implements Mountable {
   private lightSampleAt = -Infinity;
   private lightSampleGapMs = LIGHT_SAMPLE_GAP_MS;
   private lastCheck: AccuracyCheckResult | null = null;
+  private frames: CalibrationFrames | null = null;
 
   private collector: Collector | null = null;
   private progress: { kind: TargetKind; index: number; total: number } | null = null;
@@ -776,6 +787,11 @@ export class CalibrationOverlay implements Mountable {
    */
   get lastAccuracyCheck(): AccuracyCheckResult | null {
     return this.lastCheck;
+  }
+
+  /** The frames behind the full calibration this run ended with, or null (cancelled, a refresh, a check). */
+  get lastFrames(): CalibrationFrames | null {
+    return this.frames;
   }
 
   mount(parent: HTMLElement | ShadowRoot): void {
@@ -928,6 +944,7 @@ export class CalibrationOverlay implements Mountable {
 
       // A full calibration then learns what the head's own movement does to the estimate.
       let headStep: HeadStepSummary | null = null;
+      let headSamples: CalibrationSample[] = [];
       if (mode === 'standard' && this.opts.headStep !== false) {
         const moved = await this.headMovement(signal);
         if (moved.restart) {
@@ -936,6 +953,7 @@ export class CalibrationOverlay implements Mountable {
         }
         if (moved.skipped) headStep = { learned: null, reason: 'skipped' };
         else {
+          headSamples = moved.samples;
           const fitted = fitPoseCompensation(trained.model, moved.samples, { maxBlink });
           if (fitted.ok) {
             trained = { model: fitted.model, report: trained.report };
@@ -981,6 +999,7 @@ export class CalibrationOverlay implements Mountable {
       if (check) this.lastCheck = check;
       const decided = await this.decide({ mode, model: trained.model, report, check, canCorrect: false, suggestFull: false, headStep }, signal);
       if (decided.choice === 'use') {
+        if (mode === 'standard') this.frames = { targets: collected.samples, head: headSamples, viewport, maxBlink };
         return { result: { model: trained.model, report, ...(decided.check ? { check: decided.check } : {}), ...(headStep ? { headStep } : {}) }, report };
       }
       if (decided.choice === 'full') mode = 'standard';
