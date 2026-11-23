@@ -14,7 +14,12 @@ npm run package:ext   # zips it to release/gaze-reader-extension-v<version>.zip
 
 The zip has `manifest.json` at its root, as the store requires. The version comes from
 `package.json`, which the build copies into the manifest. Every upload needs a higher version
-than the last one, so bump `version` in `package.json` before rebuilding.
+than the last one.
+
+Every GitHub release carries this zip, built and tested by the Release workflow, so the simplest
+thing to upload is the one attached to the [latest release](https://github.com/lance-lii/gaze-reader/releases/latest): it is the file other people
+are installing, and the release states its SHA-256. The README's
+[Releasing](../README.md#releasing) section says how a release is made.
 
 Before uploading, load `dist-extension` unpacked (see [INSTALL-EXTENSION.md](INSTALL-EXTENSION.md))
 and check: turning it on and off, the camera setup page, calibration, a few automatic page turns
@@ -43,12 +48,13 @@ manifest's):
 
 > Read long articles and online books without reaching for the scroll wheel. Gaze Reader watches
 > where you're reading through your webcam and scrolls the next page into view when you finish
-> the last line on the screen. It keeps a line of context at the top, so you never lose your place.
+> the last line on the screen. It keeps two lines of context at the top, so you never lose your place.
 >
 > HOW IT WORKS
 > • Turn it on for the page you're reading with the toolbar button or Alt+Shift+G.
-> • A one-minute calibration (follow 13 dots with your eyes) teaches it where you look. It works on
->   every site and adjusts for page zoom.
+> • A calibration of about a minute and a half (follow 13 dots with your eyes, then move your head
+>   a little while looking at one) teaches it where you look and what your head's movement does.
+>   It works on every site and adjusts for page zoom.
 > • It follows the structure of reading, not just raw eye coordinates: fixations, return sweeps to
 >   the next line, and a model of which line you're on. That makes it reliable with an ordinary
 >   webcam.
@@ -184,7 +190,8 @@ Only the account owner can do these steps. No script or agent can do them for yo
 1. **Developer account.** Sign in at <https://chrome.google.com/webstore/devconsole> with the
    Google account that will own the listing. Accept the developer agreement and pay the one-time
    US$5 registration fee. Verify the contact email address the dashboard asks for.
-2. **New item.** Click **New item** and upload `release/gaze-reader-extension-v<version>.zip`.
+2. **New item.** Click **New item** and upload `gaze-reader-extension-v<version>.zip` from the
+   latest GitHub release (or `release/` after `npm run package:ext`).
 3. **Store listing tab.** Paste the descriptions above. Set the category and language, and upload
    the icon, screenshots and promo tile.
 4. **Privacy practices tab.** Paste the single-purpose text, the permission justifications, the
@@ -196,5 +203,5 @@ Only the account owner can do these steps. No script or agent can do them for yo
 6. **Submit for review.** Reviews of extensions that use the camera can take several days. Watch
    the account's email for questions from reviewers.
 7. **After approval.** Add the store link to `README.md` and `docs/INSTALL-EXTENSION.md`. For each
-   update, bump the version, run `npm run build:ext && npm run package:ext`, and upload the new zip
-   on the item's **Package** tab.
+   update, make a release (see [Releasing](../README.md#releasing)) and upload its zip on the
+   item's **Package** tab.

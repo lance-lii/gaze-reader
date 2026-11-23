@@ -1,0 +1,119 @@
+name: Release
+
+# A release is made by merging a new version into main. When package.json there names a version
+# that has no tag yet, this workflow tests and packages the extension, tags that commit
+# v<version> and publishes a GitHub release with the zip attached and the version's section of
+# CHANGELOG.md as its text. On a pull request it does everything except publish, so the pull
+# request that raises the version shows whether the release will work.
+#
+# To release: raise "version" in package.json (npm version <x.y.z> --no-git-tag-version, and the
+# same number in extension/manifest.json), give CHANGELOG.md a "## <x.y.z> (YYYY-MM-DD)" section,
+# and merge. Nothing happens for a version that is already tagged.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - package.json
+      - CHANGELOG.md
+      - extension/manifest.json
+      - scripts/release-notes.mjs
+      - scripts/package-extension.mjs
+      - .github/workflows/release.yml
+  pull_request:
+    paths:
+      - package.json
+      - CHANGELOG.md
+      - extension/manifest.json
+      - scripts/release-notes.mjs
+      - scripts/package-extension.mjs
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Actions are pinned to commits, as in deploy.yml (see the note there on updating them).
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      new: ${{ steps.version.outputs.new }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - id: version
+        name: Is this version released already?
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "v$version is already tagged: nothing to release." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+            echo "v$version has no tag yet: packaging it." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: steps.version.outputs.new == 'true'
+        with:
+          node-version: 22
+          cache: npm
+      - name: Test and package the extension
+        if: steps.version.outputs.new == 'true'
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm audit --omit=dev
+          npm run build:ext
+          npm run package:ext
+      - name: Write the release notes
+        if: steps.version.outputs.new == 'true'
+        run: |
+          zip="release/gaze-reader-extension-v${{ steps.version.outputs.version }}.zip"
+          node scripts/release-notes.mjs --zip "$zip" --out release/notes.md
+          (cd release && sha256sum "$(basename "$zip")" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          cat release/notes.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: steps.version.outputs.new == 'true'
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    if: needs.package.outputs.new == 'true'
+    runs-on: ubuntu-latest
+    # Only the last step writes, and it runs on main alone. On a pull request this job stops after
+    # checking the package, which is what proves the hand-over between the two jobs.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release
+          path: release
+      - name: Check the package
+        working-directory: release
+        run: |
+          sha256sum --check SHA256SUMS.txt
+          test -s notes.md
+      - name: Tag and publish
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "Gaze Reader $VERSION" \
+            --notes-file notes.md \
+            "gaze-reader-extension-v$VERSION.zip" SHA256SUMS.txt
