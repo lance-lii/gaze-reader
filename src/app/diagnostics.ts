@@ -608,12 +608,17 @@ export function recordingFileName(date: Date): string {
 
 /** Saves a recording as a JSON download. Web app only (the Artifact frame has no downloads). */
 export function downloadRecording(rec: DiagnosticsRecording, doc: Document = document): boolean {
+  return downloadJson(rec, recordingFileName(new Date(Date.parse(rec.startedAt) || Date.now())), doc);
+}
+
+/** Saves any value as a JSON download; false when the browser would not. */
+export function downloadJson(value: unknown, fileName: string, doc: Document = document): boolean {
   try {
-    const blob = new Blob([JSON.stringify(rec)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify(value)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = doc.createElement('a');
     a.href = url;
-    a.download = recordingFileName(new Date(Date.parse(rec.startedAt) || Date.now()));
+    a.download = fileName;
     a.rel = 'noopener';
     a.style.display = 'none';
     doc.body.appendChild(a);
@@ -622,7 +627,7 @@ export function downloadRecording(rec: DiagnosticsRecording, doc: Document = doc
     setTimeout(() => URL.revokeObjectURL(url), 30_000);
     return true;
   } catch (err) {
-    console.warn('[diagnostics] could not save the recording', err);
+    console.warn('[app] could not save the file', err);
     return false;
   }
 }
