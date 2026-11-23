@@ -4,10 +4,16 @@ Gaze Reader isn't in the Chrome Web Store yet, so you install it from a folder o
 This takes about five minutes. You need Chrome 116 or later, or a recent Microsoft Edge, and a
 webcam. Without a webcam you can still use it with the mouse.
 
-## 1. Build the extension folder
+## 1. Get the extension folder
 
-You need [Node.js](https://nodejs.org/) 20.19+ or 22.12+. In a terminal, from the repository
-folder, run:
+**Download it (no tools needed).** Open the [latest release](https://github.com/lance-lii/gaze-reader/releases/latest) and download
+`gaze-reader-extension-v<version>.zip` from its **Assets**. Unzip it into a folder you'll keep,
+such as `Documents\gaze-reader-extension`. The browser loads the extension from that folder every
+time it starts, so don't delete or move it afterwards. That folder is what the steps below call
+`dist-extension`.
+
+**Or build it.** You need [Node.js](https://nodejs.org/) 20.19+ or 22.12+. In a terminal, from the
+repository folder, run:
 
 ```bash
 npm install
@@ -18,10 +24,8 @@ The build creates a folder called `dist-extension` inside the repository. That f
 extension: `<where you cloned gaze-reader>\dist-extension` on Windows, or
 `<where you cloned gaze-reader>/dist-extension` on macOS and Linux.
 
-If someone sent you a zip made with `npm run package:ext`
-(`gaze-reader-extension-v<version>.zip`), unzip it into a folder you'll keep, such as
-`Documents\gaze-reader-extension`. The browser loads the extension from that folder every time it
-starts, so don't delete or move it afterwards.
+The zip on the releases page is this folder, made with `npm run package:ext`. The release lists
+the zip's SHA-256, in case you want to check the download.
 
 ## 2. Load it in Chrome
 
@@ -71,15 +75,20 @@ when your mouse pointer rests at the end of the last line.
 
 ## 4. Calibrate
 
-Back on your page, calibration starts on its own. It takes about a minute.
+Back on your page, calibration starts on its own. It takes about a minute and a half.
 
 1. Sit the way you normally read, about an arm's length from the screen, in the light you
    normally read in, with your face evenly lit (not with a bright window behind you).
 2. Fit your face in the oval until the checklist turns green. The light check tells you if
    there's light behind you, reflections on your glasses, or not enough light on your eyes.
-3. Follow each dot with your **eyes**, keeping your head still. There are 13 dots, then 4 check
-   points. Press **Space** to pause or **Esc** to cancel.
-4. At the end you'll see your accuracy. Choose **Use it**, or **Redo** if it looks poor.
+3. Follow each dot with your **eyes**, keeping your head still. There are 13 dots. Press
+   **Space** to pause or **Esc** to cancel.
+4. Then comes the **head-movement step**, where it is the other way round: one dot stays in the
+   middle, and you keep your eyes on it while you nod slowly, turn your head a little left and
+   right, and tilt it toward each shoulder (about five seconds each). From that the tracker
+   learns what your head's own movement does to its estimate, so shifting in your seat moves the
+   reading position much less. **S** skips the step. Then 4 check points.
+5. At the end you'll see your accuracy. Choose **Use it**, or **Redo** if it looks poor.
 
 The calibration is saved in the extension and shared by every site. It adjusts automatically for
 each site's zoom level. It also remembers what the light and your eyes looked like, so Gaze
@@ -96,7 +105,7 @@ leaves the calibration as it is.
 ## 5. Reading
 
 - Read normally. When you finish the last line on screen, Gaze Reader scrolls the next part of the
-  page into view and keeps a line of context at the top.
+  page into view and keeps two lines of context at the top.
 - Want the next page right away? Look just below the bottom edge of the window for a moment.
 - Dewey, the small reading buddy in the corner, reads along with you. Click him for a menu, or drag
   him to another corner. The popup can hide him.
@@ -131,11 +140,12 @@ On a page where Gaze Reader is on (ignored while you type in a text field):
 Anywhere: **Alt+Shift+G** turns Gaze Reader on or off in the current tab. To change it, go to
 `chrome://extensions/shortcuts` in Chrome or `edge://extensions/shortcuts` in Edge.
 
-## Updating after a rebuild
+## Updating
 
-After you pull new code or change it:
+For a new release, or after you pull new code or change it:
 
-1. Run `npm run build:ext` again. It rebuilds `dist-extension` in the same place.
+1. Download the new release's zip and unzip it over the same folder, replacing the files. From
+   source, run `npm run build:ext` again: it rebuilds `dist-extension` in the same place.
 2. Go to `chrome://extensions` (or `edge://extensions`) and click the **reload** button (the
    circular arrow) on the Gaze Reader card.
 3. Reload any tab where Gaze Reader was on. The copy already running in an open page belongs to

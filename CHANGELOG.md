@@ -3,10 +3,15 @@
 All notable changes to Gaze Reader are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 1.2.0 (2026-11-23)
 
 Steadier tracking. Readers found the tracker "very buggy": the gaze dot trembled, the reading
 position sat a line or two off after shifting in the chair, and page turns came early or late.
+
+This is the first release published on GitHub. The web app at
+<https://lance-lii.github.io/gaze-reader/> is this version, and the packaged Chrome extension is
+attached to the release as a zip, so installing it no longer needs Node.js or a build
+([docs/INSTALL-EXTENSION.md](docs/INSTALL-EXTENSION.md)).
 
 ### New, opt-in: a calibration built on real faces (web app)
 
@@ -445,8 +450,18 @@ position sat a line or two off after shifting in the chair, and page turns came 
   cleared (Vite 8.3.8, Vitest 5.1.0). `npm run build` and `npm run build:ext` now need the network
   once, to fetch the face model (`scripts/fetch-face-model.mjs`, hash-checked, cached in
   `public/mediapipe/models/`); `npm run dev` works without it.
+- **Releases.** Merging a new version into `main` now tags it and publishes a GitHub release with
+  the packaged extension attached and this file's section for the version as its text
+  (`.github/workflows/release.yml`, `scripts/release-notes.mjs`); on a pull request the same
+  workflow packages everything and publishes nothing. A version the changelog doesn't describe,
+  or still calls unreleased, can't be released. The README's Releasing section has the steps.
+- **Extension guides.** `docs/INSTALL-EXTENSION.md` starts from the downloaded zip and describes
+  the head-movement step, which the extension's calibration has too; the Web Store text in
+  `docs/CHROME-WEB-STORE.md` says the same, and that two lines of context are kept, not one.
 
-## 1.1.0 (unreleased, 2026-09-25)
+## 1.1.0 (2026-09-25)
+
+Live on the web app from this date. It was never tagged or packaged: 1.2.0 is the first release.
 
 Lighting robustness. Beta readers found that "if there's light then it sometimes offsets where
 I am reading": switching on a lamp made pages turn early, and dim light made them turn late or not

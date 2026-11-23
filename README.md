@@ -20,9 +20,9 @@ brings the same page turning (and Dewey) to articles and online books on any web
   (`npm run build:artifact`). The Artifact frame doesn't allow camera access, so this version offers
   **Demo** and **Mouse** only, and its webcam option links to the web app above. See
   [Artifact build](#artifact-build).
-- **Chrome extension.** Page turns and Dewey on any website. It isn't in the Chrome Web Store yet;
-  [docs/INSTALL-EXTENSION.md](docs/INSTALL-EXTENSION.md) walks through building it and loading it
-  in Chrome or Edge.
+- **Chrome extension.** Page turns and Dewey on any website. It isn't in the Chrome Web Store yet:
+  download the zip from the [latest release](https://github.com/lance-lii/gaze-reader/releases/latest), unzip it and load the folder in Chrome or
+  Edge. [docs/INSTALL-EXTENSION.md](docs/INSTALL-EXTENSION.md) walks through it.
 - **Privacy.** [PRIVACY.md](PRIVACY.md) lists what the app and the extension access, what they
   store and every network request they make.
 
@@ -385,13 +385,15 @@ camera → Face Landmarker (478 landmarks, blendshapes, head pose) → eye featu
 ## Chrome extension
 
 The extension adds automatic page turns and Dewey to articles and online books on any website.
+Download `gaze-reader-extension-v<version>.zip` from the [latest release](https://github.com/lance-lii/gaze-reader/releases/latest) and unzip it
+into a folder you'll keep, or build that folder yourself:
 
 ```bash
 npm run build:ext
 ```
 
 1. Open `chrome://extensions` and switch on **Developer mode**.
-2. Click **Load unpacked** and choose the `dist-extension/` folder.
+2. Click **Load unpacked** and choose the unzipped folder (or `dist-extension/` from a build).
 3. On a page you want to read, click the Gaze Reader toolbar button and turn it on (or press
    **Alt+Shift+G**).
 4. The first time, a setup tab asks for camera access. Choose **Allow** or **Allow while visiting
@@ -478,6 +480,18 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 | `npm run check` | All of the above: typecheck, tests, app build, extension build |
 | `npm run bench` | Slow accuracy scoreboards in `bench/` (several minutes). `GR_REPLAY=file.json npm run bench -- bench/replay` replays a diagnostics recording |
 | `npm run eval` | End-to-end scoreboard (a few minutes, in parallel shards): a simulated reader with ground-truth gaze, through landmark noise, frame drops, blinks, glare, posture changes, a second face, glances at a phone or the keyboard (also right as a book opens), and pauses or re-reading after finishing a page, scored on unintended and missed page turns (with 95 % intervals), turn latency, gaze error, recalibration prompts and CPU, for the Balanced and Relaxed presets. `GR_EVAL_BASELINE=deployed` also runs the deployed page-end detector on the same seeds and prints each scenario's difference with its interval, and the missed pages per unintended turn prevented. `GR_EVAL_SEEDS`, `GR_EVAL_SEED_BASE`, `GR_EVAL_MINUTES`, `GR_EVAL_SENS`, `GR_EVAL_ONLY` and `GR_EVAL_OUT=file.json` vary it (see `bench/endtoend/eval.ts`); the per-scenario gates are `tests/endToEnd*.test.ts` |
+
+## Releasing
+
+Merging a new version into `main` releases it. Raise the version
+(`npm version <x.y.z> --no-git-tag-version`, and the same number in `extension/manifest.json`),
+head the changes in [CHANGELOG.md](CHANGELOG.md) with `## <x.y.z> (YYYY-MM-DD)`, and open a pull
+request. On the pull request, the Release workflow (`.github/workflows/release.yml`) tests and
+packages the extension and writes the release notes without publishing anything; its run summary
+shows them. Once merged, the same workflow tags the commit `v<x.y.z>` and publishes a GitHub
+release with the extension zip attached and that changelog section as its text
+(`scripts/release-notes.mjs`). The web app needs no release step: every merge to `main` deploys
+it. A version that is already tagged is never released twice.
 
 ## Known limitations
 
