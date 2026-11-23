@@ -4,3 +4,6 @@
  * the extension build don't define it; read it only through src/core/target.ts.
  */
 declare const __GR_TARGET__: 'web' | 'artifact' | undefined;
+
+/** Gaze Reader's version (package.json), set by vite.config.ts only: read it through src/core/target.ts. */
+declare const __GR_VERSION__: string | undefined;

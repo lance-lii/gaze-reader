@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createEventBus } from '../core/events';
 import { DEFAULT_SETTINGS } from '../core/settings';
 import type { AppSettings } from '../types';
-import { SettingsPanel, formatClock } from './settingsPanel';
+import { ACCURACY_TEST_TEXT, SettingsPanel, formatClock } from './settingsPanel';
 
 function setup(saved = true) {
   const bus = createEventBus();
@@ -121,6 +121,37 @@ describe('SettingsPanel', () => {
     // Hosts without a check (the extension) get no button.
     const { panel: plain } = setup();
     expect(document.querySelector('.gr-settings__check')).toBeNull();
+    plain.destroy();
+  });
+
+  it('offers the accuracy test from Advanced, saying what it keeps', () => {
+    let runs = 0;
+    const panel = new SettingsPanel({
+      bus: createEventBus(),
+      getSettings: () => DEFAULT_SETTINGS,
+      hasSavedCalibration: () => true,
+      onForgetCalibration: () => undefined,
+      onRecalibrate: () => undefined,
+      onAccuracyTest: () => runs++,
+      onShowHelp: () => undefined,
+      onReplayIntro: () => undefined,
+    });
+    panel.mount(document.body);
+    panel.open();
+    const run = document.querySelector<HTMLButtonElement>('.gr-settings__acctest')!;
+    expect(run.textContent).toBe('Run the accuracy test (about 4 minutes)');
+    const hint = document.getElementById(run.getAttribute('aria-describedby') ?? '');
+    expect(hint?.textContent).toBe(ACCURACY_TEST_TEXT);
+    expect(ACCURACY_TEST_TEXT).toContain('no video');
+    expect(ACCURACY_TEST_TEXT).toContain('nothing is uploaded');
+    run.click();
+    expect(runs).toBe(1);
+    expect(panel.isOpen).toBe(false); // the dots need the screen
+    panel.destroy();
+    // Hosts without the test (the extension) get no button.
+    const { panel: plain } = setup();
+    plain.open();
+    expect(document.querySelector('.gr-settings__acctest')).toBeNull();
     plain.destroy();
   });
 

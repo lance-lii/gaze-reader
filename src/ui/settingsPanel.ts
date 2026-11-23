@@ -17,6 +17,8 @@ export interface SettingsPanelOptions {
   onShowHelp: () => void;
   onReplayIntro: () => void;
   onClose?: () => void;
+  /** "Run the accuracy test" (Advanced): omit to hide it (the Artifact build has no camera). */
+  onAccuracyTest?: () => void;
   /** The tracking-diagnostics recorder (Advanced). Omitted where downloads don't exist (the Artifact build). */
   diagnostics?: DiagnosticsControls;
 }
@@ -45,6 +47,12 @@ export const DIAGNOSTICS_PRIVACY_TEXT =
   'Records numbers only, for up to 10 minutes: eye measurements, gaze estimates, lighting readings, ' +
   'line positions and page turns, plus your settings, your browser, and your camera’s settings and name (usually its model). ' +
   'No video, no images, no book text. It stays on this device until you download it, and nothing is uploaded.';
+
+/** What the accuracy test does and keeps. PRIVACY.md ("Accuracy test") says the same. */
+export const ACCURACY_TEST_TEXT =
+  'Measures how well your eyes are followed: a full calibration, then five short rounds of dots while you sit still, ' +
+  'turn your head, lean back, sit lower and sit up again. It compares the calibration you use with the alternatives on the same frames. ' +
+  'Numbers only (eye and head measurements), no video. Nothing is kept unless you save the recording, and nothing is uploaded.';
 
 /** "3:07" */
 export function formatClock(ms: number): string {
@@ -121,6 +129,7 @@ export class SettingsPanel implements Mountable {
         section.appendChild(this.renderControl(control, uid));
       }
       if (group.id === 'tracking') section.appendChild(IS_ARTIFACT ? artifactTrackingNote() : this.renderCalibrationActions());
+      if (group.id === 'advanced' && opts.onAccuracyTest && !IS_ARTIFACT) section.appendChild(this.renderAccuracyTest(opts.onAccuracyTest, uid));
       if (group.id === 'advanced' && opts.diagnostics && !IS_ARTIFACT) section.appendChild(this.renderDiagnostics(opts.diagnostics, uid));
       body.appendChild(section);
     }
@@ -395,6 +404,30 @@ export class SettingsPanel implements Mountable {
     } else {
       wrap.append(recal, forget, status);
     }
+    return wrap;
+  }
+
+  private renderAccuracyTest(onRun: () => void, uid: string): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'gr-set-row gr-set-acctest';
+    const title = document.createElement('p');
+    title.className = 'gr-set-row__label';
+    title.textContent = 'Accuracy test';
+    title.style.margin = '0';
+    const hint = document.createElement('small');
+    hint.className = 'gr-set-row__hint';
+    hint.id = `${uid}-acctest-hint`;
+    hint.textContent = ACCURACY_TEST_TEXT;
+    const actions = document.createElement('div');
+    actions.className = 'gr-set-actions';
+    actions.style.gridColumn = '1 / -1';
+    const run = this.button('Run the accuracy test (about 4 minutes)', 'gr-btn--soft gr-settings__acctest', () => {
+      this.close();
+      onRun();
+    }, 'sun');
+    run.setAttribute('aria-describedby', hint.id);
+    actions.append(run);
+    wrap.append(title, hint, actions);
     return wrap;
   }
 

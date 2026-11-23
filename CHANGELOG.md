@@ -3,6 +3,31 @@
 All notable changes to Gaze Reader are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### New: an accuracy test on your own face (web app)
+
+- **Settings → Advanced → Run the accuracy test (about 4 minutes).** A full calibration, then five
+  rounds of nine dots while you sit still, turn your head, lean back, sit lower and sit up again.
+  None of the test dots is a calibration dot.
+- **The results compare six calibrations on the same frames:** the default, the real-face model,
+  the default without the head-movement step, the default without the distance correction, and
+  the 1.1 and 1.0 measurements. Each is shown as the median miss in lines of your text and the
+  share of dots read on the right line, for every way of sitting. The summary calls the real-face
+  model better or worse than the default only when the difference is clear over the dots (sign
+  test p < 0.01 and at least 15% of the default's error).
+- **Why.** Until now every accuracy number came from a simulated face or from photographs taken
+  for other research, and the two disagree about which calibration is better. This measures it
+  with this app and a live camera.
+- **Numbers only, no video, nothing uploaded.** The session stays in memory until you press
+  **Save recording**, which saves a JSON file; closing the results discards it
+  ([PRIVACY.md](PRIVACY.md)).
+- **For developers:** `GR_ACCURACY=path/to/file.json npm run bench:live` scores saved recordings
+  with the current code, one by one and pooled, so a calibration change can be tried on real
+  faces without anyone sitting the test again. See
+  [docs/ACCURACY_TEST.md](docs/ACCURACY_TEST.md).
+- The extension and the Artifact build do not have it.
+
 ## 1.2.0 (2026-11-23)
 
 Steadier tracking. Readers found the tracker "very buggy": the gaze dot trembled, the reading
