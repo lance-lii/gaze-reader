@@ -1487,6 +1487,17 @@ function assumedCameraPoint(viewport: { width: number; height: number }, origin:
   };
 }
 
+/**
+ * Where a model trained in this window now takes the camera to be, in viewport px: what
+ * `TrainOptions.camera` takes. A recording keeps it, so a replay outside the window (which has no
+ * screen to look at) fits the same model.
+ */
+export function assumedCameraInViewport(viewport: { width: number; height: number }): Point {
+  const origin = currentScreenOrigin();
+  const c = assumedCameraPoint(viewport, origin);
+  return { x: c.x - origin.x, y: c.y - origin.y };
+}
+
 /** The distance compensation a freshly trained model gets, or null (see TrainOptions.depthCompensation). */
 function depthCompensationFor(
   rows: readonly Row[],
