@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppEvents, AppSettings, Book, EventBus, FeatureFrame, GazeModel, LightingSignature, LineLayout, PageEndDecision, TextLine } from '../types';
 import { REAL_FACE_PRIOR } from '../gaze/gazePrior';
-import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationResult } from '../ui/calibrationOverlay';
+import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationFrames, type CalibrationResult } from '../ui/calibrationOverlay';
 import { AppearanceMonitor } from '../gaze/appearance';
 import { GAZE_MODEL_KIND, GAZE_MODEL_VERSION, deserializeGazeModel } from '../gaze/calibrationModel';
 import { TrackerError } from '../gaze/camera';
@@ -46,6 +46,8 @@ const overlays = vi.hoisted(() => ({
   priors: [] as ({ id: string } | null | undefined)[],
   run: null as ((bus: EventBus) => Promise<CalibrationResult | null>) | null,
   check: null as AccuracyCheckResult | null,
+  /** The frames a scripted full calibration is said to have collected. */
+  frames: null as CalibrationFrames | null,
 }));
 vi.mock('../ui/calibrationOverlay', async (importOriginal) => {
   const m = await importOriginal<typeof import('../ui/calibrationOverlay')>();
@@ -62,6 +64,9 @@ vi.mock('../ui/calibrationOverlay', async (importOriginal) => {
     }
     override get lastAccuracyCheck(): AccuracyCheckResult | null {
       return overlays.check ?? super.lastAccuracyCheck;
+    }
+    override get lastFrames(): CalibrationFrames | null {
+      return overlays.frames ?? super.lastFrames;
     }
   }
   return { ...m, CalibrationOverlay: ScriptedOverlay };
@@ -233,6 +238,7 @@ describe('AppController', () => {
     overlays.priors = [];
     overlays.run = null;
     overlays.check = null;
+    overlays.frames = null;
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -1741,6 +1747,49 @@ describe('AppController', () => {
         expect(says.some((s) => backlit.test(s.text))).toBe(false);
       }
     }
+  });
+
+  it('runs the accuracy test from Settings: a full calibration first, then the rounds, and reading goes on after', async () => {
+    const runTest = (): void => {
+      app.bus.emit('command', { name: 'open-settings' });
+      document.querySelector<HTMLButtonElement>('.gr-settings__acctest')!.click();
+    };
+    await openPastedText();
+    runTest();
+    expect(toastText()).toMatch(/accuracy test is for eye tracking/);
+    expect(overlays.modes).toEqual([]);
+
+    const { camera } = await readWithWebcam(calibratedModel());
+    // The reader backs out of the calibration: no test without one.
+    overlays.run = () => Promise.resolve(null);
+    runTest();
+    await until(() => /needs a finished calibration/.test(toastText()), 'the explanation');
+    expect(overlays.modes).toEqual(['standard']);
+    expect(document.querySelector('.gr-acc')).toBeNull();
+
+    // A finished calibration: the rounds follow on its frames.
+    const fresh = calibratedModel({ trainedAt: 5000 });
+    const json = fresh.toJSON();
+    const features = webcamFrame().features!;
+    overlays.frames = {
+      targets: [{ t: performance.now(), target: { x: 300, y: 200 }, features }],
+      head: [],
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      maxBlink: 0.85,
+    };
+    overlays.run = async (bus) => {
+      bus.emit('calibration', { phase: 'start' });
+      bus.emit('calibration', { phase: 'done', report: REPORT });
+      return { model: { ...fresh, toJSON: () => ({ ...json, bx: 7 }) }, report: REPORT };
+    };
+    runTest();
+    await until(() => document.querySelector('.gr-acc') !== null, 'the accuracy test');
+    expect(overlays.modes).toEqual(['standard', 'standard']);
+    expect(document.querySelector('.gr-acc-title')!.textContent).toBe('Accuracy test');
+    const notNow = [...document.querySelectorAll<HTMLButtonElement>('.gr-acc button')].find((b) => b.textContent === 'Not now')!;
+    notNow.click();
+    await until(() => document.querySelector('.gr-acc') === null, 'the test to close');
+    await until(() => camera.running() && document.querySelector('.gr-pill')!.getAttribute('aria-label')!.includes('Camera on'), 'tracking again');
   });
 
   it('records tracking diagnostics from Settings and saves them as a JSON file (numbers only)', async () => {

@@ -1,4 +1,5 @@
 import { defineConfig, type Plugin } from 'vite';
+import pkg from './package.json';
 
 /**
  * The built web app's Content-Security-Policy, as a <meta> tag (GitHub Pages sets no headers).
@@ -59,6 +60,7 @@ export default defineConfig({
   define: {
     // See src/core/target.ts.
     __GR_TARGET__: JSON.stringify('web'),
+    __GR_VERSION__: JSON.stringify(pkg.version),
   },
   plugins: [contentSecurityPolicy()],
   build: {
