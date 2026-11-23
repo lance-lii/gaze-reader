@@ -241,8 +241,9 @@ On those photographs it is level with the normal calibration while the head stay
 6–10° away, 5.4° against 9.2° beyond 10°. See [docs/REAL_DATA.md](docs/REAL_DATA.md).
 
 It is opt-in because it has not been measured with this app and a live camera, and because this
-project's simulator disagrees with the photographs about it. If tracking is worse with it, switch
-it off and calibrate again (**C**). The setting changes nothing until your next full calibration;
+project's simulator disagrees with the photographs about it. The
+[accuracy test](docs/ACCURACY_TEST.md) scores both on your own face in about four minutes. If
+tracking is worse with it, switch it off and calibrate again (**C**). The setting changes nothing until your next full calibration;
 a quick 5-dot refresh keeps whichever kind you have. The weights are licensed for non-commercial
 use only (see [License](#license)).
 
@@ -298,6 +299,15 @@ with the developers; see [PRIVACY.md](PRIVACY.md). A chip in the top bar shows w
 with `GR_REPLAY=path/to/file.json npm run bench -- bench/replay` (PowerShell:
 `$env:GR_REPLAY='…'; npm run bench -- bench/replay`). The web app only; the Artifact build has
 no camera and no downloads.
+
+**Accuracy test.** Settings → Advanced → **Run the accuracy test (about 4 minutes)** measures the
+tracking on your own face and camera: a full calibration, then five rounds of nine dots while you
+sit still, turn your head, lean back, sit lower and sit up again. The results compare the
+calibration you use with the alternatives (the real-face model, no head-movement step, the 1.1 and
+1.0 measurements) on the same frames, in lines of your text. Numbers only, no video, and nothing
+is kept unless you press **Save recording**. Developers score saved recordings with the current
+code with `GR_ACCURACY=path/to/file.json npm run bench:live`. See
+[docs/ACCURACY_TEST.md](docs/ACCURACY_TEST.md). The web app only.
 
 ## How page-turn detection works
 
@@ -479,6 +489,7 @@ docs/ARCHITECTURE.md        Module contracts and design notes
 | `npm test` | Run the unit and integration tests (Vitest, with jsdom for DOM tests) |
 | `npm run check` | All of the above: typecheck, tests, app build, extension build |
 | `npm run bench` | Slow accuracy scoreboards in `bench/` (several minutes). `GR_REPLAY=file.json npm run bench -- bench/replay` replays a diagnostics recording |
+| `npm run bench:live` | Score accuracy-test recordings with the current code: `GR_ACCURACY=file.json npm run bench:live` (see [docs/ACCURACY_TEST.md](docs/ACCURACY_TEST.md)). Without a file it scores one simulated session |
 | `npm run eval` | End-to-end scoreboard (a few minutes, in parallel shards): a simulated reader with ground-truth gaze, through landmark noise, frame drops, blinks, glare, posture changes, a second face, glances at a phone or the keyboard (also right as a book opens), and pauses or re-reading after finishing a page, scored on unintended and missed page turns (with 95 % intervals), turn latency, gaze error, recalibration prompts and CPU, for the Balanced and Relaxed presets. `GR_EVAL_BASELINE=deployed` also runs the deployed page-end detector on the same seeds and prints each scenario's difference with its interval, and the missed pages per unintended turn prevented. `GR_EVAL_SEEDS`, `GR_EVAL_SEED_BASE`, `GR_EVAL_MINUTES`, `GR_EVAL_SENS`, `GR_EVAL_ONLY` and `GR_EVAL_OUT=file.json` vary it (see `bench/endtoend/eval.ts`); the per-scenario gates are `tests/endToEnd*.test.ts` |
 
 ## Releasing
