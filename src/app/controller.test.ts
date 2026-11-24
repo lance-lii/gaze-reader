@@ -8,7 +8,8 @@ import type { AppEvents, AppSettings, Book, EventBus, FeatureFrame, GazeModel, L
 import { REAL_FACE_PRIOR } from '../gaze/gazePrior';
 import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationFrames, type CalibrationResult } from '../ui/calibrationOverlay';
 import { AppearanceMonitor } from '../gaze/appearance';
-import { GAZE_MODEL_KIND, GAZE_MODEL_VERSION, deserializeGazeModel } from '../gaze/calibrationModel';
+import { GAZE_MODEL_KIND, GAZE_MODEL_VERSION, deserializeGazeModel, trainGazeModel } from '../gaze/calibrationModel';
+import { weights as eyeNetWeights } from '../gaze/eyeNet.fixture';
 import { TrackerError } from '../gaze/camera';
 import { CameraFeatureSource } from '../gaze/faceTracker';
 import { LightingWatch, type LightingWatchUpdate } from '../gaze/lighting';
@@ -44,6 +45,8 @@ const overlays = vi.hoisted(() => ({
   modes: [] as (string | undefined)[],
   /** The shared gaze model each overlay was told to build full calibrations on. */
   priors: [] as ({ id: string } | null | undefined)[],
+  /** The eye-picture network each overlay was told to build full calibrations on. */
+  eyeNets: [] as (string | null | undefined)[],
   run: null as ((bus: EventBus) => Promise<CalibrationResult | null>) | null,
   check: null as AccuracyCheckResult | null,
   /** The frames a scripted full calibration is said to have collected. */
@@ -57,6 +60,7 @@ vi.mock('../ui/calibrationOverlay', async (importOriginal) => {
       super(opts);
       overlays.modes.push(opts.mode);
       overlays.priors.push(opts.prior);
+      overlays.eyeNets.push(typeof opts.eyeNet === 'function' ? opts.eyeNet() : opts.eyeNet);
       this.testBus = opts.bus;
     }
     override run(): Promise<CalibrationResult | null> {
@@ -236,6 +240,7 @@ describe('AppController', () => {
     saved.model = null;
     overlays.modes = [];
     overlays.priors = [];
+    overlays.eyeNets = [];
     overlays.run = null;
     overlays.check = null;
     overlays.frames = null;
@@ -1065,6 +1070,187 @@ describe('AppController', () => {
     await until(() => camera.running() && !/A different camera/.test(toastText()), 'the offer to go');
     await sleep(100);
     expect(toastText()).not.toMatch(/A different camera/);
+  });
+
+
+  describe('the eye-picture network', () => {
+    const NET_KEY = 'gazeReader.eyeNet';
+    /** What stands in for the background thread: it says it is ready (or not) and is otherwise silent. */
+    function stubWorker(reply: { type: 'ready'; id: string } | { type: 'failed'; message: string } | null = { type: 'ready', id: 'test-net' }) {
+      const made: { messages: { type: string }[]; terminated: boolean; onmessage: ((e: { data: unknown }) => void) | null }[] = [];
+      class FakeWorker {
+        messages: { type: string }[] = [];
+        terminated = false;
+        onmessage: ((e: { data: unknown }) => void) | null = null;
+        onerror: ((e: unknown) => void) | null = null;
+        constructor() {
+          made.push(this);
+        }
+        postMessage(m: { type: string }): void {
+          this.messages.push(m);
+          if (m.type === 'load' && reply) queueMicrotask(() => this.onmessage?.({ data: reply }));
+        }
+        terminate(): void {
+          this.terminated = true;
+        }
+      }
+      vi.stubGlobal('Worker', FakeWorker);
+      return made;
+    }
+    const keepNetwork = (id = 'test-net'): void => localStorage.setItem(NET_KEY, JSON.stringify(eyeNetWeights({ id })));
+    const scriptCalibration = (model: () => GazeModel = () => calibratedModel({ trainedAt: 5000 })): void => {
+      overlays.run = async (bus) => {
+        bus.emit('calibration', { phase: 'start' });
+        bus.emit('calibration', { phase: 'done', report: REPORT });
+        return { model: model(), report: REPORT };
+      };
+    };
+    /** A calibration made on the answers of network `id`. */
+    function modelOn(id: string): GazeModel {
+      const n = FEATURE_NAMES.length;
+      const samples = [0.1, 0.5, 0.9].flatMap((fx) =>
+        [0.1, 0.5, 0.9].flatMap((fy) =>
+          Array.from({ length: 12 }, (_, i) => {
+            const jitter = Math.sin(i * 12.9898 + fx * 78.233 + fy * 37.719) * 0.003;
+            return {
+              t: i,
+              target: { x: fx * window.innerWidth, y: fy * window.innerHeight },
+              features: {
+                ...webcamFrame().features!,
+                vector: Array.from({ length: n }, (_, k) => Math.sin(i * 7.1 + k * 3.3 + fx * 5 + fy * 11) * 0.01),
+                eyeNet: { id, x: fx - 0.5 + jitter, y: fy - 0.4 - jitter },
+              },
+            };
+          }),
+        ),
+      );
+      return trainGazeModel(samples, { viewport: { width: window.innerWidth, height: window.innerHeight }, featureNames: FEATURE_NAMES, eyeNet: id }).model;
+    }
+
+    it('is not there unless a file was loaded: no background thread, calibrations as before', async () => {
+      const workers = stubWorker();
+      scriptCalibration();
+      await readWithWebcam(null);
+      await until(() => overlays.modes.length === 1, 'the first calibration');
+      expect(workers).toHaveLength(0);
+      expect(overlays.eyeNets).toEqual([null]);
+    });
+
+    it('starts with the camera and the calibration is made on its answers', async () => {
+      const workers = stubWorker();
+      const set = vi.spyOn(CameraFeatureSource.prototype, 'setEyeNet');
+      keepNetwork();
+      scriptCalibration();
+      await readWithWebcam(null);
+      await until(() => overlays.modes.length === 1, 'the first calibration');
+      expect(workers).toHaveLength(1);
+      expect(workers[0].messages[0].type).toBe('load');
+      expect(overlays.eyeNets).toEqual(['test-net']);
+      expect(set.mock.calls.some(([runner]) => runner?.id === 'test-net')).toBe(true);
+      // Back in the library the camera is off, and so is the thread.
+      app.bus.emit('command', { name: 'open-library' });
+      await until(() => workers[0].terminated, 'the background thread to stop');
+      expect(set.mock.calls.at(-1)).toEqual([null]);
+    });
+
+    it('calibrates without it when its thread cannot run the file, and says so', async () => {
+      stubWorker({ type: 'failed', message: 'This browser cannot run the eye-picture network.' });
+      keepNetwork();
+      scriptCalibration();
+      await readWithWebcam(null);
+      await until(() => overlays.modes.length === 1, 'the first calibration');
+      expect(overlays.eyeNets).toEqual([null]);
+      expect(toastText()).toContain('This browser cannot run the eye-picture network. Eye tracking continues without it.');
+    });
+
+    it('does not hold the calibration up for long when the thread never answers', async () => {
+      stubWorker(null);
+      keepNetwork();
+      scriptCalibration();
+      await readWithWebcam(null);
+      await until(() => overlays.modes.length === 1, 'the first calibration', 4000);
+      expect(overlays.eyeNets).toEqual([null]);
+    });
+
+    it('keeps a calibration made on the network that is still here, and drops one whose network is gone', async () => {
+      stubWorker();
+      keepNetwork();
+      const { camera } = await readWithWebcam(modelOn('test-net'));
+      expect(overlays.modes).toEqual([]); // reading goes on with the saved calibration
+      expect(camera.running()).toBe(true);
+
+      // Another visit, the file removed in between: that calibration has nothing to read.
+      localStorage.removeItem(NET_KEY);
+      scriptCalibration();
+      await readWithWebcam(modelOn('test-net'));
+      await until(() => overlays.modes.length === 1, 'a new calibration');
+      expect(overlays.modes).toEqual(['standard']);
+      expect(overlays.eyeNets).toEqual([null]);
+    });
+
+    it('asks for a new calibration when the network a calibration was made on stops working', async () => {
+      const workers = stubWorker();
+      keepNetwork();
+      const { camera } = await readWithWebcam(modelOn('test-net'));
+      await until(() => workers.length === 1, 'the background thread');
+      scriptCalibration();
+      workers[0].onmessage!({ data: { type: 'failed', message: 'The eye-picture network stopped working.' } });
+      expect(toastText()).toContain('Your calibration was made with it, so please calibrate again.');
+      expect(workers[0].terminated).toBe(true);
+      // Nothing to track with until then: the camera is off, and the toast offers the dots.
+      await until(() => !camera.running(), 'the camera to stop');
+      expect(document.querySelector('.gr-pill')!.getAttribute('aria-label')).toContain('Not calibrated');
+      toastButton('Calibrate now')!.click();
+      await until(() => overlays.modes.length === 1, 'the new calibration');
+      // The camera came back on for the dots, and the network is given another go with it.
+      expect(workers).toHaveLength(2);
+      expect(overlays.eyeNets).toEqual(['test-net']);
+    });
+
+    it('loads a file from Settings, starts it at once, and removing it takes the calibration made on it along', async () => {
+      const workers = stubWorker();
+      await readWithWebcam(calibratedModel());
+      app.bus.emit('command', { name: 'open-settings' });
+      const state = () => document.querySelector('.gr-settings__eyenet-state')!.textContent;
+      const input = document.querySelector<HTMLInputElement>('.gr-settings__eyenet-file')!;
+      const choose = async (text: string, expectState: RegExp): Promise<void> => {
+        Object.defineProperty(input, 'files', { configurable: true, value: [new File([text], 'weights.json', { type: 'application/json' })] });
+        input.dispatchEvent(new Event('change'));
+        await until(() => expectState.test(document.querySelector('.gr-set-eyenet')!.textContent ?? ''), `the Settings block to say ${expectState}`);
+      };
+      expect(state()).toBe('No network is loaded.');
+      await choose('{"not":"a network"}', /not an eye-picture network this version can read/);
+      expect(localStorage.getItem(NET_KEY)).toBeNull();
+      expect(workers).toHaveLength(0);
+
+      await choose(JSON.stringify(eyeNetWeights()), /used from your next full calibration/);
+      expect(JSON.parse(localStorage.getItem(NET_KEY)!).id).toBe('test-net');
+      expect(workers).toHaveLength(1); // the camera is on: it starts now
+      expect(state()).toContain('test-net');
+      expect(state()).not.toContain('Your calibration uses it');
+
+      // The next full calibration is made on it.
+      app.bus.emit('command', { name: 'close-settings' });
+      scriptCalibration(() => modelOn('test-net'));
+      app.bus.emit('command', { name: 'recalibrate' });
+      await until(() => overlays.modes.length === 1, 'the calibration');
+      expect(overlays.eyeNets).toEqual(['test-net']);
+      await until(() => document.querySelector('.gr-pill')!.getAttribute('aria-label')!.includes('Camera on'), 'tracking again');
+
+      app.bus.emit('command', { name: 'open-settings' });
+      expect(state()).toContain('Your calibration uses it');
+      const remove = document.querySelector<HTMLButtonElement>('.gr-settings__eyenet-remove')!;
+      scriptCalibration();
+      remove.click();
+      remove.click();
+      expect(localStorage.getItem(NET_KEY)).toBeNull();
+      expect(workers[0].terminated).toBe(true);
+      expect(toastText()).toContain('Your calibration was made with that network');
+      app.bus.emit('command', { name: 'close-settings' });
+      toastButton('Calibrate now')!.click();
+      await until(() => overlays.modes.length === 2, 'the calibration that replaces the one made on the network');
+      expect(overlays.eyeNets[1]).toBeNull();
+    });
   });
 
   describe('webcam: the real-face model setting', () => {
