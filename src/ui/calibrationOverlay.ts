@@ -63,6 +63,7 @@ import {
   qualityFromError,
   refineGazeModel,
   trainGazeModel,
+  type TrainOptions,
   type OffsetMeasurement,
   type PoseFit,
   type PoseFitFailure,
@@ -124,6 +125,13 @@ export interface CalibrationOverlayOptions {
    * (src/gaze/gazePrior.ts). Default: none. A quick calibration keeps whatever its base model has.
    */
   prior?: GazePriorWeights | null;
+  /**
+   * The id of the eye-picture network that is running (eyeNet.ts): a full calibration is then made
+   * on its answers instead of on `prior`. When too few frames got an answer, the calibration is
+   * made without it, as if none were running. A function is asked when the dots are done, so a
+   * network whose thread came up while they were showing is still used.
+   */
+  eyeNet?: string | null | (() => string | null);
 }
 
 /** The frames a finished full calibration was fitted on. The accuracy test keeps them. */
@@ -925,7 +933,7 @@ export class CalibrationOverlay implements Mountable {
         trained =
           mode === 'quick' && base
             ? refineGazeModel(alignCore(current, base, collected.samples), collected.samples, { viewport, maxBlink, environment })
-            : trainGazeModel(collected.samples, { viewport, maxBlink, featureNames: this.opts.featureNames, environment, prior: this.opts.prior ?? null });
+            : this.trainFull(collected.samples, { viewport, maxBlink, featureNames: this.opts.featureNames, environment });
       } catch (err) {
         if (mode === 'quick') {
           // The saved model can't explain today's eyes; retrying the refresh would fail the same way.
@@ -1099,6 +1107,23 @@ export class CalibrationOverlay implements Mountable {
       applied,
     });
     return settled;
+  }
+
+  /**
+   * A full calibration from the dots: on the eye-picture network's answers when one is running
+   * and answered enough of the frames, otherwise as without one.
+   */
+  private trainFull(samples: CalibrationSample[], opts: Omit<TrainOptions, 'prior' | 'eyeNet'>): { model: GazeModel; report: CalibrationReport } {
+    const plain = { ...opts, prior: this.opts.prior ?? null };
+    // Asked now, not when the screen opened: the network's thread may have come up during the dots.
+    const eyeNet = typeof this.opts.eyeNet === 'function' ? this.opts.eyeNet() : (this.opts.eyeNet ?? null);
+    if (!eyeNet) return trainGazeModel(samples, plain);
+    try {
+      return trainGazeModel(samples, { ...opts, eyeNet });
+    } catch (err) {
+      console.warn('[calibration] The eye-picture network could not be calibrated on; calibrating without it.', err);
+      return trainGazeModel(samples, plain);
+    }
   }
 
   /**
@@ -2618,6 +2643,8 @@ function cloneFeatures(f: EyeFeatures): EyeFeatures {
     faceCenter: { x: f.faceCenter?.x ?? Number.NaN, y: f.faceCenter?.y ?? Number.NaN },
     // The calibration's eyelid baseline (squint in bright light) is built from this.
     ...(f.squint !== undefined ? { squint: f.squint } : {}),
+    // What a calibration on an eye-picture network is made from.
+    ...(f.eyeNet ? { eyeNet: { ...f.eyeNet } } : {}),
   };
 }
 
