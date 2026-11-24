@@ -3,6 +3,7 @@ import { GAZE_EXCLUDED_FEATURES, trainGazeModel, type TrainOptions } from '../..
 import { FEATURE_NAMES } from '../../src/gaze/features';
 import { REAL_FACE_PRIOR } from '../../src/gaze/gazePrior';
 import type { GazeModel, Point } from '../../src/types';
+import { quantile } from './dataset';
 import { eottAvailable, eottCase, loadEott, type EottCase, type EottPerson, type EottSample } from './eott';
 import { emptyErrors, summarize, table, type Errors, type Row } from './protocol';
 import { faceScale, SharedPersonalModel } from './shared';
@@ -106,6 +107,16 @@ const CONFIGS: Config[] = [
   { label: 'the reference eye tracker (not a webcam)', fit: () => ({ predict: (s) => s.frame.reference }) },
 ];
 
+/** The columns of the person-by-person table, and what they are called there. */
+const SHORT: Record<string, string> = {
+  'no tracker: always the middle of the screen': 'middle',
+  'the app now': 'default',
+  'real-face setting (as shipped)': 'real-face',
+  'eye-picture network, as the app calibrates on it': 'network',
+  'the reference eye tracker (not a webcam)': 'Tobii',
+};
+const PER_PERSON = Object.keys(SHORT);
+
 function score(model: Predictor, test: readonly EottSample[], p: EottPerson, into: Errors): void {
   for (const s of test) {
     const g = model.predict(s);
@@ -172,5 +183,51 @@ describe.skipIf(!eottAvailable())('real people moving their eyes: EOTT dot tests
       console.log(table(`SAME LIGHT, ${setting} only (${group.length} people): against the dots`, board(group, 'dot')));
     }
     expect(same.length).toBeGreaterThan(0);
+  });
+
+  it('person by person: who each calibration fails on', () => {
+    // The same frames and the same figure as the tables above: each person's typical (median) error.
+    const cases = loadEott()
+      .map((p) => eottCase(p))
+      .filter((c): c is EottCase => !!c);
+    const haveCnn = cases.some((c) => c.test.some((s) => s.frame.cnn));
+    const configs = CONFIGS.filter((cfg) => PER_PERSON.includes(cfg.label) && (!cfg.cnn || haveCnn));
+    const mean = (v: readonly number[]): number => (v.length ? v.reduce((a, x) => a + x, 0) / v.length : NaN);
+    const typical = (c: EottCase, model: Predictor | null): number => {
+      const e = emptyErrors();
+      if (model) score(model, c.test, c.person, e);
+      return e.deg.length ? quantile(e.deg, 0.5) : NaN;
+    };
+    const rows = cases.map((c) => ({ c, deg: configs.map((cfg) => typical(c, cfg.fit(c))) }));
+    // Worst first by the last webcam column (the reference eye tracker is the column after it).
+    const by = configs.length - 2;
+    rows.sort((x, y) => (y.deg[by] || 0) - (x.deg[by] || 0));
+    const cell = (d: number): string => (Number.isFinite(d) ? d.toFixed(1) : '-');
+    let names = configs.map((cfg) => SHORT[cfg.label]).join(' | ');
+    if (haveCnn) {
+      // Not a score: the network's four numbers fitted on the test frames themselves. No calibration
+      // of this kind can do better, so what is left is the network's own misreading of the person,
+      // and the gap to the "network" column is what changed between their calibration and their test.
+      for (const r of rows) r.deg.push(typical(r.c, fourNumbers({ ...r.c, cal: r.c.test })));
+      names += ' | network, calibrated on the test';
+    }
+    const lines = rows.map(
+      ({ c, deg }) =>
+        `| ${c.person.id} | ${c.person.setting} ${(c.person.distanceMm / 10).toFixed(0)} cm | ${c.person.vision} | ${c.light!.same ? 'same' : 'changed'} | ${deg.map(cell).join(' | ')} |`,
+    );
+    console.log(
+      `\nPERSON BY PERSON (${rows.length} people, each one's typical error in degrees against the dots)\n| person | setup | wears | light | ${names} |\n|${'---|'.repeat(4 + rows[0].deg.length)}\n${lines.join('\n')}\n`,
+    );
+
+    // Glasses sit between the camera and the eye: frames cross the eye picture and lenses shift and
+    // reflect as the head moves. Same-light people only, each person counting once.
+    const groups = (['neither', 'contacts', 'glasses'] as const).map((vision) => {
+      const mine = rows.filter((r) => r.c.light!.same && r.c.person.vision === vision);
+      const col = (k: number): number[] => mine.map((r) => r.deg[k]).filter(Number.isFinite);
+      const columns = mine.length ? mine[0].deg.map((_, k) => k) : [];
+      return `| ${vision} | ${mine.length} | ${columns.map((k) => `${cell(mean(col(k)))} (worst ${cell(Math.max(...col(k)))})`).join(' | ')} |`;
+    });
+    console.log(`\nBY WHAT THEY WEAR (same light; mean of people, worst person in brackets)\n| wears | people | ${names} |\n|${'---|'.repeat(2 + rows[0].deg.length)}\n${groups.join('\n')}\n`);
+    expect(rows.length).toBeGreaterThan(0);
   });
 });
