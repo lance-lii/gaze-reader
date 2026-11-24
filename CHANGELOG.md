@@ -13,11 +13,21 @@ All notable changes to Gaze Reader are listed here. Versions follow
   on the same frames for reference. Lighting is held constant: the 40 people whose light stayed
   the same are scored together, the 4 whose light changed separately. `npm run bench:eott`; see
   [docs/REAL_DATA.md](docs/REAL_DATA.md#people-moving-their-eyes-on-video-eott).
-- **A small network that reads gaze from the picture of the eyes**, trained on those videos
-  (`scripts/research/train_eye_cnn.py`). Scored on people it never saw, same light: 3.3° off on
-  average, against 4.6° for the real-face model and 9.1° for the default calibration on nine
-  clicks (the Tobii: 1.5°). Its worst person is worse than the real-face model's (14.4° against
-  9.9°).
+- **A small network that reads gaze from the picture of the eyes**, trained on those videos and on
+  the MPIIFaceGaze photographs (`scripts/research/train_eye_cnn.py`). Scored on people it never
+  saw, same light: 2.9° off on average, against 4.6° for the real-face model and 9.1° for the
+  default calibration on nine clicks (the Tobii: 1.5°). Taught by the videos alone it scores
+  3.2° to 3.3° there over three trainings, so the photographs are worth about 0.3° on that test.
+  On the photographed people's own days they are worth more than a degree (4.2° to 4.5° without
+  them, 3.0° with).
+- **The benchmark now says who each calibration fails on.** `npm run bench:eott` prints all 44
+  people one by one and groups them by what they wear. The 13 people the network reads worst all
+  wear glasses (4.4° for a typical frame, against 1.9° without and 2.3° with contact lenses).
+  It also tries the app's 5-dot refresh partway through the test: glasses wearers go from 4.4°
+  to 3.8°, everyone else stays where they were.
+- **What a turned head costs, measured.** On the photographs, calibrated on each day's first
+  pictures: 2.6° with the head within 3° of where it was, 3.3° once it has turned more than 10°.
+  A network taught by the still-sitting video people alone goes from 3.5° to 5.2°.
 - **Settings → Advanced → Eye-picture network** loads a network file you trained. It runs in a
   background thread on every camera frame (about 5 ms), your next full calibration is built on its
   answers, and the accuracy test scores it next to the other calibrations. If it cannot run, or
