@@ -11,6 +11,7 @@ import {
   type CameraHandle,
   type OpenCameraOptions,
 } from './camera';
+import type { EyeNetRunner } from './eyeNetRunner';
 import { extractEyeFeatures, frameQuality, type BlendshapeLike, type LandmarkLike } from './features';
 import { LightingProbe, type LightingBackend, type LightingProbeLike, type LightingSource } from './lighting';
 import { blockMediapipeTelemetry } from './mediapipeTelemetry';
@@ -504,6 +505,8 @@ export class CameraFeatureSource implements FeatureSource {
   private frameErrorLogged = false;
   /** undefined until the first session; null when off or after it failed. */
   private lightingProbe: LightingProbeLike | null | undefined = undefined;
+  /** The eye-picture network's runner, when the host set one. */
+  private eyeNet: EyeNetRunner | null = null;
 
   constructor(opts: CameraFeatureSourceOptions = {}, deps: Partial<FaceTrackerDeps> = {}) {
     this.opts = { ...opts };
@@ -517,6 +520,15 @@ export class CameraFeatureSource implements FeatureSource {
 
   get running(): boolean {
     return this.session !== null;
+  }
+
+  /**
+   * Has every frame pass through an eye-picture network on its way to the listeners (the frame
+   * then carries `features.eyeNet` when the network answered in time); null goes back to
+   * delivering frames as they are. The runner stays the caller's to dispose of.
+   */
+  setEyeNet(runner: EyeNetRunner | null): void {
+    this.eyeNet = runner;
   }
 
   /** The element the camera plays in (for previews); null when stopped and self-created. */
@@ -785,7 +797,7 @@ export class CameraFeatureSource implements FeatureSource {
         console.warn('[gaze] Face detection failed on a frame; continuing.', err);
       }
       this.landmarks = null;
-      this.emit(NO_FACE(t));
+      this.deliver(s, NO_FACE(t));
       return;
     }
     this.frameErrorLogged = false;
@@ -794,7 +806,7 @@ export class CameraFeatureSource implements FeatureSource {
     const landmarks = result.faceLandmarks?.[0];
     if (!landmarks || landmarks.length === 0) {
       this.landmarks = null;
-      this.emit(NO_FACE(t));
+      this.deliver(s, NO_FACE(t));
       return;
     }
     this.landmarks = landmarks;
@@ -807,8 +819,47 @@ export class CameraFeatureSource implements FeatureSource {
     const quality = frameQuality(features);
     // `frame` is still open here: the track-processor driver closes it after this returns.
     const lighting = features ? this.measureLighting(frame ?? s.camera.video, landmarks, features, quality, t) : undefined;
-    this.emit(lighting ? { t, faceFound: true, features, quality, lighting } : { t, faceFound: true, features, quality });
+    const out: FeatureFrame = lighting ? { t, faceFound: true, features, quality, lighting } : { t, faceFound: true, features, quality };
+    const net = this.eyeNet;
+    if (!net || !features) {
+      this.deliver(s, out);
+      return;
+    }
+    // Still the frame the landmarks are of: the runner takes its picture of the eyes before this returns.
+    const width = frame ? frame.displayWidth : s.camera.video.videoWidth;
+    const height = frame ? frame.displayHeight : s.camera.video.videoHeight;
+    try {
+      net.submit(frame ?? s.camera.video, width, height, landmarks, out, (f) => {
+        if (this.session === s) this.emit(f);
+      });
+    } catch (err) {
+      // The network is an extra: tracking never depends on it.
+      this.eyeNet = null;
+      console.warn('[gaze] The eye-picture network failed on a frame; continuing without it.', err);
+      this.emit(out);
+    }
   }
+
+  /**
+   * A frame on its way to the listeners. With an eye-picture network running, frames with
+   * nothing to ask it still take their turn behind the ones it is being asked about.
+   */
+  private deliver(s: Session, frame: FeatureFrame): void {
+    const net = this.eyeNet;
+    if (!net) {
+      this.emit(frame);
+      return;
+    }
+    try {
+      net.submit(s.camera.video, 0, 0, [], frame, (f) => {
+        if (this.session === s) this.emit(f);
+      });
+    } catch {
+      this.eyeNet = null;
+      this.emit(frame);
+    }
+  }
+
 
   /**
    * A few times a second, lighting statistics from the frame MediaPipe just

@@ -5,6 +5,27 @@ All notable changes to Gaze Reader are listed here. Versions follow
 
 ## Unreleased
 
+### New: an eye-picture network you can train and load (web app, experimental)
+
+- **A second real-people benchmark: webcam video of people following dots.** 44 test cases from
+  the EOTT dataset (Papoutsaki et al., 2018): each person calibrated on nine clicks, tested on a
+  dot that jumps between nine places later in the same sitting, with a Tobii eye tracker's score
+  on the same frames for reference. Lighting is held constant: the 40 people whose light stayed
+  the same are scored together, the 4 whose light changed separately. `npm run bench:eott`; see
+  [docs/REAL_DATA.md](docs/REAL_DATA.md#people-moving-their-eyes-on-video-eott).
+- **A small network that reads gaze from the picture of the eyes**, trained on those videos
+  (`scripts/research/train_eye_cnn.py`). Scored on people it never saw, same light: 3.3° off on
+  average, against 4.6° for the real-face model and 9.1° for the default calibration on nine
+  clicks (the Tobii: 1.5°). Its worst person is worse than the real-face model's (14.4° against
+  9.9°).
+- **Settings → Advanced → Eye-picture network** loads a network file you trained. It runs in a
+  background thread on every camera frame (about 5 ms), your next full calibration is built on its
+  answers, and the accuracy test scores it next to the other calibrations. If it cannot run, or
+  answered too few of the calibration's frames, the calibration is made the ordinary way.
+- **No network ships with the app.** The dataset is GPLv3, so neither it nor weights fitted on it
+  are in this repository. The numbers above are from replayed video; nothing has been measured in
+  the app with a live camera yet.
+
 ### New: an accuracy test on your own face (web app)
 
 - **Settings → Advanced → Run the accuracy test (about 4 minutes).** A full calibration, then five

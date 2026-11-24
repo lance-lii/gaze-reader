@@ -114,6 +114,8 @@ export interface RecordedFrame {
   e: [number, number, number, number, number];
   /** squint and brow raise, where the tracker gave them. */
   s?: [number | null, number | null];
+  /** The eye-picture network's answer for the frame, when one was running (see `eyeNet` in the recording). */
+  n?: [number, number];
 }
 
 export interface RecordedTrial {
@@ -146,6 +148,8 @@ export interface AccuracyRecording {
   linePitchPx: number;
   /** Frames with a blink value above this are not used, as in the app's calibration. */
   maxBlink: number;
+  /** The id of the eye-picture network whose answers the frames carry (`n`); absent when none was running. */
+  eyeNet?: string;
   blocks: RecordedBlock[];
 }
 
@@ -168,11 +172,12 @@ export function recordFrame(frame: FeatureFrame, sessionStart: number): Recorded
   if (f.squint !== undefined || f.browRaise !== undefined) {
     out.s = [f.squint === undefined ? null : round(f.squint, 4), f.browRaise === undefined ? null : round(f.browRaise, 4)];
   }
+  if (f.eyeNet && Number.isFinite(f.eyeNet.x) && Number.isFinite(f.eyeNet.y)) out.n = [round(f.eyeNet.x, 6), round(f.eyeNet.y, 6)];
   return f.vector.every((n) => Number.isFinite(n)) ? out : null;
 }
 
-/** The eye features a recorded frame stands for. */
-export function featuresOf(f: RecordedFrame): EyeFeatures {
+/** The eye features a recorded frame stands for; `eyeNet` names the network its answer (`n`) came from. */
+export function featuresOf(f: RecordedFrame, eyeNet?: string): EyeFeatures {
   const out: EyeFeatures = {
     vector: f.v,
     headPose: { yaw: f.h[0], pitch: f.h[1], roll: f.h[2], tx: f.h[3], ty: f.h[4], tz: f.h[5] },
@@ -185,11 +190,12 @@ export function featuresOf(f: RecordedFrame): EyeFeatures {
     if (f.s[0] !== null) out.squint = f.s[0];
     if (f.s[1] !== null) out.browRaise = f.s[1];
   }
+  if (eyeNet && f.n) out.eyeNet = { id: eyeNet, x: f.n[0], y: f.n[1] };
   return out;
 }
 
-function samplesOf(trials: readonly RecordedTrial[]): CalibrationSample[] {
-  return trials.flatMap((trial) => trial.frames.map((f) => ({ target: trial.target, features: featuresOf(f), t: f.t })));
+function samplesOf(trials: readonly RecordedTrial[], eyeNet?: string): CalibrationSample[] {
+  return trials.flatMap((trial) => trial.frames.map((f) => ({ target: trial.target, features: featuresOf(f, eyeNet), t: f.t })));
 }
 
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
@@ -205,6 +211,7 @@ function checkTrial(v: unknown, featureLength: number): string | null {
   for (const f of v.frames as unknown[]) {
     if (!isObj(f) || !isNum(f.t) || !isNum(f.q) || !isTuple(f.v, featureLength) || !isTuple(f.h, 6) || !isTuple(f.e, 5)) return 'a frame is damaged';
     if (f.s !== undefined && !(Array.isArray(f.s) && f.s.length === 2 && f.s.every((n) => n === null || isNum(n)))) return 'a frame is damaged';
+    if (f.n !== undefined && !isTuple(f.n, 2)) return 'a frame is damaged';
   }
   return null;
 }
@@ -225,6 +232,7 @@ export function parseRecording(json: unknown): ParsedRecording {
   const origin = json.windowOrigin;
   if (!isPoint(json.camera) || !isObj(origin) || !isPoint(origin.start) || !isPoint(origin.end)) return bad('The recording does not say where the window and camera were.');
   if (!isNum(json.linePitchPx) || !isNum(json.maxBlink) || typeof json.app !== 'string' || typeof json.recordedAt !== 'string') return bad('The recording is missing its header.');
+  if (json.eyeNet !== undefined && (typeof json.eyeNet !== 'string' || json.eyeNet === '')) return bad('The recording does not say which eye-picture network it used.');
   if (!Array.isArray(json.blocks)) return bad('The recording has no blocks.');
   const ids = new Set(POSTURES.map((p) => p.id as string));
   for (const b of json.blocks as unknown[]) {
@@ -252,6 +260,8 @@ export interface Variant {
   headStep: boolean;
   /** Needs the real-face weights. */
   needsPrior?: boolean;
+  /** Calibrated on the eye-picture network's answers: scored only for a recording that has them. */
+  needsEyeNet?: boolean;
 }
 
 /** Head position and size: 1.1 fed them to the gaze fit, 1.2 does not. */
@@ -259,10 +269,12 @@ const HEAD_FEATURES: readonly string[] = ['yaw', 'pitch', 'roll', 'tx', 'ty', 't
 
 export const DEFAULT_VARIANT = 'default';
 export const REAL_FACE_VARIANT = 'real-face';
+export const EYE_NET_VARIANT = 'eye-net';
 
 export const VARIANTS: readonly Variant[] = Object.freeze([
   { id: DEFAULT_VARIANT, label: 'Default calibration', note: 'What the app uses unless you change a setting.', train: {}, headStep: true },
   { id: REAL_FACE_VARIANT, label: 'Real-face model', note: 'Settings → Eye tracking → Real-face model (experimental).', train: {}, headStep: true, needsPrior: true },
+  { id: EYE_NET_VARIANT, label: 'Eye-picture network', note: 'Settings → Advanced → Eye-picture network (a file you load).', train: {}, headStep: true, needsEyeNet: true },
   { id: 'no-head-step', label: 'Default, no head-movement step', note: 'The default with the nod/turn/tilt step skipped.', train: {}, headStep: false },
   { id: 'no-distance', label: 'Default, no distance correction', note: 'The default without the correction for leaning in or back.', train: { depthCompensation: false }, headStep: true },
   {
@@ -404,12 +416,12 @@ function groupScore(dots: readonly DotScore[], linePitchPx: number): GroupScore 
   };
 }
 
-function scoreDot(model: GazeModel, posture: PostureId, trial: RecordedTrial, maxBlink: number): DotScore {
+function scoreDot(model: GazeModel, posture: PostureId, trial: RecordedTrial, maxBlink: number, eyeNet?: string): DotScore {
   const xs: number[] = [];
   const ys: number[] = [];
   for (const f of trial.frames) {
     if (f.e[0] > maxBlink) continue;
-    const p = model.predict(featuresOf(f));
+    const p = model.predict(featuresOf(f, eyeNet));
     if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
     xs.push(p.x);
     ys.push(p.y);
@@ -430,7 +442,7 @@ function scoreVariant(v: Variant, rec: AccuracyRecording, prior: GazePriorWeight
   const empty = groupScore([], linePitchPx);
   const failed = (problem: string): VariantScore => ({ id: v.id, label: v.label, note: v.note, ok: false, problem, headStep: 'not used', fitErrorPx: NaN, postures: [], overall: empty, moved: empty, dots: [] });
 
-  const calibration = samplesOf(rec.blocks.filter((b) => b.kind === 'calibrate').flatMap((b) => b.trials));
+  const calibration = samplesOf(rec.blocks.filter((b) => b.kind === 'calibrate').flatMap((b) => b.trials), rec.eyeNet);
   let model: GazeModel;
   let fitErrorPx: number;
   try {
@@ -441,6 +453,7 @@ function scoreVariant(v: Variant, rec: AccuracyRecording, prior: GazePriorWeight
       maxBlink: rec.maxBlink,
       camera: rec.camera,
       ...(v.needsPrior ? { prior } : {}),
+      ...(v.needsEyeNet ? { eyeNet: rec.eyeNet } : {}),
       ...v.train,
     });
     model = trained.model;
@@ -451,7 +464,7 @@ function scoreVariant(v: Variant, rec: AccuracyRecording, prior: GazePriorWeight
 
   let headStep = 'not used';
   if (v.headStep) {
-    const head = samplesOf(rec.blocks.filter((b) => b.kind === 'head').flatMap((b) => b.trials));
+    const head = samplesOf(rec.blocks.filter((b) => b.kind === 'head').flatMap((b) => b.trials), rec.eyeNet);
     if (head.length === 0) headStep = 'not recorded';
     else {
       const fitted = fitPoseCompensation(model, head, { maxBlink: rec.maxBlink });
@@ -465,7 +478,7 @@ function scoreVariant(v: Variant, rec: AccuracyRecording, prior: GazePriorWeight
   const dots: DotScore[] = [];
   for (const b of rec.blocks) {
     if (b.kind !== 'test') continue;
-    for (const trial of b.trials) dots.push(scoreDot(model, b.posture, trial, rec.maxBlink));
+    for (const trial of b.trials) dots.push(scoreDot(model, b.posture, trial, rec.maxBlink, rec.eyeNet));
   }
   const movedIds = new Set(POSTURES.filter((p) => p.moved).map((p) => p.id));
   return {
@@ -578,7 +591,9 @@ function verdictOf(variants: readonly VariantScore[], comparisons: readonly Comp
 export function scoreRecording(rec: AccuracyRecording, opts: ScoreOptions = {}): AccuracyScores {
   const linePitchPx = rec.linePitchPx > 0 ? rec.linePitchPx : FALLBACK_LINE_PITCH_PX;
   const prior = opts.prior ?? null;
-  const variants = VARIANTS.filter((v) => (!v.needsPrior || prior) && (!opts.only || opts.only.includes(v.id))).map((v) => scoreVariant(v, rec, prior, linePitchPx));
+  const variants = VARIANTS.filter((v) => (!v.needsPrior || prior) && (!v.needsEyeNet || rec.eyeNet) && (!opts.only || opts.only.includes(v.id))).map((v) =>
+    scoreVariant(v, rec, prior, linePitchPx),
+  );
   const base = variants.find((v) => v.id === DEFAULT_VARIANT);
   const comparisons = base && base.ok ? variants.filter((v) => v.ok && v !== base).map((v) => compareVariants(base, v)) : [];
 
