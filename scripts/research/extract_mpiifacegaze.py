@@ -17,6 +17,9 @@ other non-commercial use only. Nothing derived from it is committed to this repo
 Output, per participant, in .data/mpiifacegaze/features/:
   pXX.json  screen size, where the camera is in screen pixels, blendshape names, record layout
   pXX.f32   little-endian float32 records (see RECORD below)
+and, with --eyes afterwards (for scripts/research/train_eye_cnn.py), for the same records in the same order:
+  pXX.u8         two 36×60 grey eye pictures, cut exactly as extract_eott.py cuts them
+  pXX.light.f32  the light on the face: its brightness, each half's, the rest of the picture's, clipping (6 numbers)
 """
 import argparse, io, json, os, sys, zipfile
 from concurrent.futures import ProcessPoolExecutor
@@ -143,6 +146,33 @@ def participant(args):
     return meta
 
 
+def eye_pictures(args):
+    """Second pass: the two eye pictures and the light on the face for every record already written, in the same order."""
+    zip_path, prefix, pid, out_dir = args
+    import cv2
+    from types import SimpleNamespace
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from extract_eott import EYES, eye_crop, lighting
+
+    meta = json.load(open(os.path.join(out_dir, f"{pid}.json")))
+    rec = np.fromfile(os.path.join(out_dir, f"{pid}.f32"), dtype="<f4").reshape(-1, meta["recordLength"])
+    z = zipfile.ZipFile(zip_path)
+    crops = np.zeros((len(rec), 2, 36, 60), dtype=np.uint8)
+    light = np.zeros((len(rec), 6), dtype=np.float32)
+    for i, r in enumerate(rec):
+        img = cv2.imdecode(np.frombuffer(z.read(f"{prefix}{pid}/day{int(r[0]):02d}/{int(r[1]):04d}.jpg"), np.uint8), cv2.IMREAD_GRAYSCALE)
+        h, w = img.shape[:2]
+        assert (w, h) == (int(r[4]), int(r[5])), (pid, i)
+        xy = r[HEADER : HEADER + 2 * N_LANDMARKS].reshape(-1, 2)
+        lm = [SimpleNamespace(x=float(x), y=float(y)) for x, y in xy]
+        crops[i] = np.stack([eye_crop(img, lm, w, h, a, b, mirror) for a, b, mirror in EYES])
+        light[i] = lighting(img, lm, w, h)
+    crops.tofile(os.path.join(out_dir, f"{pid}.u8"))
+    light.astype("<f4").tofile(os.path.join(out_dir, f"{pid}.light.f32"))
+    return pid, len(rec)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--zip", default=os.path.join(ROOT, ".data/mpiifacegaze/Data.zip"))
@@ -151,6 +181,7 @@ def main():
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 3))
     ap.add_argument("--limit", type=int, default=0, help="about this many pictures per participant (0: all)")
     ap.add_argument("--only", default="", help="comma-separated participants, e.g. p00,p03")
+    ap.add_argument("--eyes", action="store_true", help="only add the eye pictures (pXX.u8) and the light on the face (pXX.light.f32) to records already extracted")
     a = ap.parse_args()
 
     z = zipfile.ZipFile(a.zip)
@@ -161,6 +192,11 @@ def main():
     pids = [os.path.basename(n)[:-4] for n in txts]
     if a.only:
         pids = [p for p in pids if p in a.only.split(",")]
+    if a.eyes:
+        with ProcessPoolExecutor(max_workers=a.workers) as pool:
+            for pid, n in pool.map(eye_pictures, [(a.zip, prefix, p, a.out) for p in pids]):
+                print(f"{pid}: {n} pairs of eye pictures", flush=True)
+        return
     jobs = [(a.zip, prefix, p, a.model, a.out, a.limit) for p in pids]
     with ProcessPoolExecutor(max_workers=a.workers) as pool:
         for meta in pool.map(participant, jobs):
