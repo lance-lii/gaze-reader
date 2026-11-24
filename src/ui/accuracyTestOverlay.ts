@@ -64,6 +64,8 @@ export interface AccuracyTestOverlayOptions {
   appVersion?: string;
   /** The real-face weights: with them that calibration is scored too. */
   prior?: GazePriorWeights | null;
+  /** The id of the eye-picture network that is running: its answers are kept and its calibration scored too. */
+  eyeNet?: string | null;
   /** Saves the recording as a file; false when it could not. Without it there is no Save button. */
   save?: (recording: AccuracyRecording) => boolean;
   /** Copies text; without it the browser's clipboard is used. */
@@ -245,6 +247,7 @@ export class AccuracyTestOverlay {
       windowOrigin: { start: originStart, end: currentScreenOrigin() },
       linePitchPx: typeof pitch === 'number' && pitch > 0 ? pitch : FALLBACK_LINE_PITCH_PX,
       maxBlink: cal.maxBlink,
+      ...(this.opts.eyeNet ? { eyeNet: this.opts.eyeNet } : {}),
       blocks,
     };
     const scores = scoreRecording(recording, { prior: this.opts.prior ?? null });
