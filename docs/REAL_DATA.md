@@ -129,7 +129,9 @@ Seven laptop people have no usable final dot test, which leaves **44 test cases*
 
 **Licence: GPLv3**, as the dataset's page gives it. Nothing from it is committed, and nothing
 fitted on it either: no videos, no extracted numbers, no network weights. Everything lands in the
-git-ignored `.data/eott/`. The app can load a network you trained yourself, and ships none.
+git-ignored `.data/eott/`. The app can load a network you trained yourself, and ships none. A
+network that also learned from the photographs above carries their licence too (CC BY-NC-SA 4.0),
+which is one more reason it stays on your machine.
 
 ### Lighting
 
@@ -146,7 +148,9 @@ The exercise holds the light constant, with the yardstick fixed before any score
 ### Reproducing
 
 About 440 MB of download (the two videos and their logs per person, read out of the 21 GB archive
-by byte range), a few minutes of extraction, and 15 minutes of training on an M3 Pro's GPU.
+by byte range), a few minutes of extraction, and 20 minutes of training on an M3 Pro's GPU. The
+network also learns from the photographs of the first half of this page, so do
+[their download and extraction](#reproducing) first.
 
 ```sh
 uv venv .venv-research --python 3.12
@@ -155,9 +159,16 @@ uv pip install --python .venv-research/bin/python mediapipe scipy torch remotezi
 .venv-research/bin/python scripts/research/extract_eott_reference.py   # the Tobii's answers
 npm run bench:eott                                                     # the scoreboard, without the network
 GR_EOTT_LABELS=1 npm run bench:eott                                    # + where each frame was looking, for the trainer
-.venv-research/bin/python scripts/research/train_eye_cnn.py --final    # the network: held-out answers + weights
-npm run bench:eott                                                     # the scoreboard, with it
+.venv-research/bin/python scripts/research/extract_mpiifacegaze.py --eyes   # the photographs' eye pictures
+GR_MPII_LABELS=1 npm run bench -- bench/realdata/mpiiLabels                 # + where each photograph was looking
+.venv-research/bin/python scripts/research/train_eye_cnn.py --also .data/mpiifacegaze --teach-also --final
+npm run bench:eott                                                     # the scoreboard, with the network
 ```
+
+The trainer writes each person's held-out answers and, with `--final`, `weights.json` to
+`.data/eott/cnn/`. `--out` sends them elsewhere, and `GR_EOTT_CNN=<that folder> npm run bench:eott`
+scores that folder instead. Without `--teach-also` the photographs are only scored, and without
+`--also` they are not read at all (the first recipe: videos only).
 
 Without `.data/eott/features/` the suites skip themselves.
 
@@ -175,9 +186,13 @@ distance from the screen. It does not know the person or the screen. Their calib
 direction into a place on their screen with four numbers, a scale and an offset per axis, which
 nine clicks are enough for.
 
-**No one is scored by a network that saw them.** The people are split into five groups, and each
-group's answers come from a network trained on the other four. The four people whose light changed
-are in no training set.
+**Two sets of people teach it**: the 47 people of these videos whose light stayed the same, and
+the 15 people of the photographs above (MPIIFaceGaze), who sit at their own laptops in their own
+rooms over many days. Their eye pictures are cut the same way from the same face tracker.
+
+**No one is scored by a network that saw them.** The people of each set are split into five
+groups, and each group's answers come from a network trained on the other four. The four people
+whose light changed are in no training set.
 
 ### Results
 
@@ -189,14 +204,14 @@ angle between where the dot was and where the model said. A line is 9 mm.
 | no tracker: always the middle of the screen | 17.7° | 11.4 | 19.8° | 21.8° |
 | the app's default calibration | 9.1° | 7.4 | 24.2° | 21.5° |
 | the Real-face model setting | 4.6° | 4.0 | 10.2° | 9.9° |
-| **the eye-picture network, as the app calibrates on it** | **3.3°** | **2.4** | **7.2°** | 14.4° |
+| **the eye-picture network, as the app calibrates on it** | **2.9°** | **2.3** | **6.5°** | **8.5°** |
 | the Tobii eye tracker | 1.5° | 1.2 | 3.7° | 8.3° |
 
 | the same, by setup | default | Real-face model | eye-picture network | Tobii |
 |---|---|---|---|---|
-| desktop PC, 24 people, 62–86 cm away | 8.7° | 4.5° | 2.9° | 1.1° |
-| laptop, 16 people, 44–62 cm away | 9.7° | 4.6° | 4.1° | 2.1° |
-| light changed, 4 people | 4.9° | 4.5° | 2.1° | 1.1° |
+| desktop PC, 24 people, 62–86 cm away | 8.7° | 4.5° | 2.8° | 1.1° |
+| laptop, 16 people, 44–62 cm away | 9.7° | 4.6° | 3.1° | 2.1° |
+| light changed, 4 people | 4.9° | 4.5° | 2.3° | 1.1° |
 
 What it says:
 
@@ -207,12 +222,102 @@ What it says:
 2. **A model that has seen other people needs far less from each new one.** The Real-face model
    and the network both ask the person for a handful of numbers, and both are at half the default's
    error or better.
-3. **The pictures carry more than the outline.** The network is a quarter better than the
-   Real-face model overall and more than a third better on the desktop setups, where the face is
-   small in the frame and the tracker's outline is coarsest.
-4. **It is not better for everyone.** Its worst person is at 14.4°, against 9.9° for the Real-face
-   model: one laptop sitting it reads badly. On the desktop setups its worst person is at 5.0°.
-5. **A webcam is still two to three times off a dedicated tracker.**
+3. **The pictures carry more than the outline.** The network is a third better than the
+   Real-face model, on the desktop setups and on the laptops alike, and better for 34 of the 40
+   people.
+4. **A second set of people helped a little on this test and a lot off it.** Here the
+   photographs are worth about 0.3°, hardly more than two trainings of the same recipe differ by.
+   On the photographed people's own days, at their own laptops with their heads moving, they are
+   worth more than a degree. See [what the second set added](#what-the-second-set-added).
+5. **Glasses are what it reads badly.** See [glasses](#glasses).
+6. **A webcam is still about twice as far off as a dedicated tracker.**
+
+### What the second set added
+
+The same network taught with and without the photographs. One training is not enough to tell: the
+random start and the split of the people into groups move the result by themselves. So each recipe
+was trained more than once. Per person, each one counting once (their typical error, the median
+over their test frames):
+
+| taught by | same light, 40 people | their worst person | MPIIFaceGaze, day by day, 13 people |
+|---|---|---|---|
+| the videos alone | 3.3° | 14.3° | 4.2° |
+| the same, another random start and split | 3.2° | 9.3° | 4.5° |
+| the same, trained as many steps as the rows below | 3.2° | 9.7° | 4.3° |
+| the videos and the photographs | 2.9° | 8.5° | 3.0° |
+| the same, another random start and split | 3.0° | 7.6° | 3.0° |
+
+- **On the videos' own test the photographs are worth about 0.3°** (3.2° → 3.0°, the trainings of
+  each recipe averaged; 95 % range over people −0.5° to 0.0°; better for 26 people, worse for 14).
+  That is small next to what the trainings differ by among themselves, and training the videos
+  alone for longer does not get there.
+- **It is not where the first training pointed.** That one had the worst person at 14.3° without
+  the photographs and 8.5° with them. The other two trainings without them put the same person
+  under 10°: most of that drop was the luck of one training.
+- **The gain is among the people without glasses** (2.3° → 2.0°, range −0.55° to −0.2°, 24
+  people) and, less surely, on the laptops (3.6° → 3.1°, 16 people). With glasses there is none
+  (4.6° → 4.5°). These groups were looked at after the fact.
+- **On the photographed people's own days the photographs are worth more than a degree**, in
+  every training.
+
+The right-hand column is the photographs' own test, which the videos cannot give: the same people
+on other days, in other rooms. Each day's first 30 pictures calibrate (four numbers), and the rest
+of that day in the same light are the test (46 days, 2,112 pictures; 4,660 more are left out
+because the light had changed by more than the gate allows). The Real-face model scores 4.2° on
+it (worst person 6.7°), and it was fitted on these very people; the networks never saw the person
+they are scored on.
+
+### Glasses
+
+The dataset's notes say what each person wore. Same light, typical error per person, mean of the
+group with its worst person in brackets:
+
+| wears | people | default | Real-face model | eye-picture network | the network, calibrated on the test itself | Tobii |
+|---|---|---|---|---|---|---|
+| neither | 19 | 7.8° | 3.9° | 1.9° (3.0°) | 1.6° | 1.2° |
+| contact lenses | 5 | 10.6° | 4.5° | 2.3° (2.9°) | 1.8° | 2.0° |
+| glasses | 16 | 10.2° | 5.4° | 4.4° (8.5°) | 2.9° | 1.8° |
+
+- **The 13 people the network reads worst all wear glasses**, and so does everyone above 5°
+  (six people). Three glasses wearers are read as well as anybody (1.6° to 2.8°), so it is not
+  glasses as such: in the worst person's eye pictures the frame and the lens edge cross the eye.
+- **Contact lenses cost nothing measurable.**
+- **Half of it is the calibration not lasting.** The last webcam column is not a score: it fits
+  the person's four numbers on the test frames themselves, which no calibration can beat. Without
+  glasses, a nine-click calibration made a minute or two earlier is within 0.3° to 0.5° of that.
+  With glasses it is 1.5° short: the network's answers shift between the calibration and the
+  test.
+- **The app's 5-dot refresh wins back part of that.** Refreshed on five of the test's nine dots
+  and scored on the other four, glasses wearers go from 4.4° to 3.8° (better for 10 of 16, the
+  worst person from 8.5° to 2.8°, the worst after it 6.4°). Without glasses it changes nothing
+  (1.9° → 1.8°). On the Real-face model it is worth 0.4° overall (4.6° → 4.2°). On the default
+  calibration it does harm (9.1° → 10.5°): nine clicks leave that one too poor to correct with
+  an offset.
+- **The other half is the network itself**: even calibrated on the test, glasses wearers are at
+  2.9° against 1.6°.
+- The Real-face model is also worse with glasses. The Tobii hardly is, apart from one person.
+- The second set of people did not help with glasses: wearers are at 4.4° to 4.9° over three
+  trainings on the videos alone, and at 4.4° and 4.5° in two with the photographs.
+
+`npm run bench:eott` prints these tables and the 44 people one by one.
+
+### When the head turns
+
+The video people sat still. The photographed people did not: within a day their head is turned up
+to ten degrees and more from where it was in that day's first pictures. Error after that day's
+calibration, by how far the head has turned since (people with at least 20 pictures in the band):
+
+| head turned by | under 3° | 3–6° | 6–10° | over 10° |
+|---|---|---|---|---|
+| people | 8 | 9 | 9 | 3 |
+| Real-face model (fitted on these people) | 3.6° | 3.6° | 4.2° | 5.2° |
+| network taught by the videos alone | 3.5° | 3.5° | 4.2° | 5.2° |
+| **network taught by both** | **2.6°** | **2.5°** | **3.0°** | **3.3°** |
+
+A network that has only seen people sitting still loses half as much again when the head turns
+ten degrees. One that has seen heads turn loses a quarter, and three people is all the last
+column has. A second training of each gave the same picture (3.7° rising to 5.4°, and 2.6° rising
+to 3.5°).
 
 ### In the app
 
@@ -222,7 +327,7 @@ frames the trainer saved with its own answers (they agree to one part in a milli
 `npm run bench:eott`.
 
 Settings → Advanced → **Eye-picture network** loads the `weights.json` the trainer wrote
-(`.data/eott/cnn/weights.json`). It is kept in this browser only. While it is loaded, the eye
+(`.data/eott/cnn/weights.json`, or the folder you gave `--out`). It is kept in this browser only. While it is loaded, the eye
 region of each camera frame goes to a background thread, which answers with the two numbers; the
 next full calibration is then built on those answers. If the network has not answered for enough
 of the calibration's frames, the calibration is made the ordinary way. A calibration made on a
@@ -231,19 +336,26 @@ The accuracy test scores it next to the other calibrations.
 
 ### Limits
 
-- **One lab, one day.** 51 people in the same room with the same two setups in 2017, and
-  40 scored. The network has seen no other rooms, cameras or years, and 47 people is a small
-  number to learn faces from. How it does on a different camera is not known.
+- **Two datasets, 62 people.** The videos are 51 people in one room with the same two setups in
+  2017, and 40 scored. The photographs add 15 people's own laptops and rooms. That is still a
+  small number to learn faces from, both are a decade-old webcam's picture, and how the network
+  does on your camera is not known.
 - **Not measured in the app.** The scores are for frames replayed from video. A headless browser
   with one of these videos as its camera confirms the plumbing (the thread starts, answers every
   frame, and the calibration is built on it), not the accuracy. Nobody has read a book with it.
-- **Head still.** These people sat still for a minute or two between calibration and test, and
-  nine clicks have no head-movement step. In the app the step and the distance correction sit on
-  top of the network as they do on any calibration, but what turning or leaning does to the
-  network's answers on a real face is unmeasured. The accuracy test's posture rounds are how to
-  find out.
-- **Glasses, lighting, distance** are whatever these 51 people happened to bring. The light was
-  held constant on purpose; the four people it changed for did no worse, which is four people.
+- **Head still, in the videos.** Those people sat still for a minute or two between calibration
+  and test, and nine clicks have no head-movement step. The photographs measure a turned head
+  ([above](#when-the-head-turns)), but in single pictures, with the light held the same and with
+  four numbers rather than the app's calibration. In the app the head-movement step and the
+  distance correction sit on top of the network as they do on any calibration; what they add or
+  cost there is unmeasured. The accuracy test's posture rounds are how to find out.
+- **Glasses** are the known weak spot ([above](#glasses)): 16 wearers, read at more than twice the
+  error of the others. A refresh takes a little off; nothing here fixes it.
+- **Lighting and distance** are whatever these people happened to bring. The light was held
+  constant on purpose; the four people it changed for did no worse, which is four people.
+- **The same 40 people decided the recipe.** The network taught by both sets was picked because
+  it scored better on them. The split into groups keeps any one person out of their own network,
+  not out of that choice.
 - **The lag.** The laptop recordings run about 0.4 s behind their logs, the desktop ones about
   0.1 s or less. It is estimated per recording from the eye's own movement and removed
   (`bench/realdata/eott.ts`); an error there would cost the laptop rows more than the others.

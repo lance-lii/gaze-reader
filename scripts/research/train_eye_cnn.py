@@ -21,10 +21,19 @@ No person is ever scored by a network that saw them: people are split into folds
 people get their answers from a network trained on the other folds. Those answers go to
 .data/eott/cnn/P_XX.f32 (two numbers per frame), where the scoreboard picks them up.
 
+A second set of people (--also): MPIIFaceGaze, photographs of 15 people at their own laptops over
+many days (extract_mpiifacegaze.py --eyes, then GR_MPII_LABELS=1). They sit differently every day,
+so they are how this script measures what a moved head does to a network: each of their days is
+split into a calibration (its first 30 pictures) and a test (the rest of the day in the same
+light), and the error is reported by how far the head has turned since the calibration. They are
+held out in folds like everyone else. With --teach-also they also teach.
+
   .venv-research/bin/python scripts/research/train_eye_cnn.py            # folds, answers, report
   .venv-research/bin/python scripts/research/train_eye_cnn.py --final    # + one network on everyone, as weights
+  .venv-research/bin/python scripts/research/train_eye_cnn.py --also .data/mpiifacegaze --teach-also --final
 
-The dataset is GPLv3; neither it nor weights fitted on it are in the repository (docs/REAL_DATA.md).
+EOTT is GPLv3 and MPIIFaceGaze CC BY-NC-SA; neither they nor weights fitted on them are in the
+repository (docs/REAL_DATA.md).
 """
 import argparse
 import json
@@ -42,6 +51,11 @@ HEAD = ["yaw", "pitch", "roll", "tx", "ty", "tz"]
 BLINK_MAX = 0.5
 # A label further than this from the camera, as a share of the distance, is not on any screen here.
 LABEL_MAX = 0.6
+# The second set's days: the first pictures of a day calibrate, the rest of it in the same light test.
+DAY_MIN = 80
+DAY_CALIBRATION = 30
+LIGHT_TOLERANCE = 0.1  # the scoreboard's lighting gate (bench/realdata/eott.ts), for brightness and for balance
+TURN_BINS_DEG = (3, 6, 10)  # bench/realdata/protocol.ts
 
 
 def load(root):
@@ -53,8 +67,20 @@ def load(root):
         lab = np.fromfile(os.path.join(root, "labels", p["id"] + ".f32"), dtype=np.float32).reshape(-1, W)
         eyes = np.fromfile(os.path.join(root, "features", p["id"] + ".u8"), dtype=np.uint8).reshape(-1, 2, EYE_H, EYE_W)
         assert len(lab) == len(eyes) == p["records"], p["id"]
-        people.append({**p, "lab": lab, "eyes": eyes})
-    return people, cols
+        people.append({**p, "lab": lab, "eyes": eyes, "cols": cols, "protocol": index.get("protocol", "roles")})
+    return people
+
+
+def distance(p):
+    """Per frame where the dataset measured it, else the person's usual distance from the screen."""
+    cols = p["cols"]
+    return p["lab"][:, cols["distanceMm"]] if "distanceMm" in cols else np.full(len(p["lab"]), float(p["distanceMm"]), dtype=np.float32)
+
+
+def targets(p):
+    """Where the person was looking, as the network is asked for it: (mm from the camera) / (mm from the screen)."""
+    cols = p["cols"]
+    return p["lab"][:, [cols["targetX"], cols["targetY"]]] / distance(p)[:, None]
 
 
 def head_inputs(lab, cols):
@@ -64,9 +90,9 @@ def head_inputs(lab, cols):
     return np.stack([yaw, pitch, roll, lab[:, cols["tx"]] / tz, lab[:, cols["ty"]] / tz], axis=1)
 
 
-def samples(p, cols, labels):
+def samples(p, labels):
     """(rows, target) of the frames this person can teach with."""
-    lab = p["lab"]
+    lab, cols = p["lab"], p["cols"]
     ok = (lab[:, cols["usable"]] == 1) & (lab[:, cols["steady"]] == 1) & (lab[:, cols["blink"]] <= BLINK_MAX)
     dot = lab[:, [cols["targetX"], cols["targetY"]]]
     ref = lab[:, [cols["referenceX"], cols["referenceY"]]]
@@ -76,7 +102,7 @@ def samples(p, cols, labels):
         y = ref
     else:  # the dot or click where the frame has one, the reference eye tracker elsewhere
         y = np.where(np.isfinite(dot), dot, ref)
-    y = y / p["distanceMm"]
+    y = y / distance(p)[:, None]
     ok &= np.isfinite(y).all(axis=1) & (np.abs(y) <= LABEL_MAX).all(axis=1)
     ok &= np.isfinite(head_inputs(lab, cols)).all(axis=1)
     rows = np.nonzero(ok)[0]
@@ -146,7 +172,8 @@ def augment(eyes, gen):
     return flat.reshape(n, 2, EYE_H, EYE_W)
 
 
-def extras(p, rows, cols, inputs):
+def extras(p, rows, inputs):
+    cols = p["cols"]
     parts = []
     if "head" in inputs:
         parts.append(head_inputs(p["lab"][rows], cols))
@@ -157,14 +184,14 @@ def extras(p, rows, cols, inputs):
     return np.concatenate(parts, axis=1).astype(np.float32)
 
 
-def fit(train_people, cols, args, device, seed, log):
+def fit(train_people, args, device, seed, log):
     gen = torch.Generator(device="cpu").manual_seed(seed)
     torch.manual_seed(seed)
     eyes, extra, y = [], [], []
     for p in train_people:
-        rows, target = samples(p, cols, args.labels)
+        rows, target = samples(p, args.labels)
         eyes.append(p["eyes"][rows])
-        extra.append(extras(p, rows, cols, args.inputs))
+        extra.append(extras(p, rows, args.inputs))
         y.append(target)
     eyes = torch.from_numpy(np.concatenate(eyes)).to(device)
     extra = torch.from_numpy(np.concatenate(extra))
@@ -206,14 +233,14 @@ def fit(train_people, cols, args, device, seed, log):
 
 
 @torch.no_grad()
-def answers(model, stats, p, cols, args, device):
+def answers(model, stats, p, args, device):
     """The network's answer for every frame of a person the app could use (NaN elsewhere)."""
-    lab = p["lab"]
+    lab, cols = p["lab"], p["cols"]
     out = np.full((len(lab), 2), np.nan, dtype=np.float32)
     rows = np.nonzero((lab[:, cols["usable"]] == 1) & np.isfinite(head_inputs(lab, cols)).all(axis=1))[0]
     if not len(rows):
         return out
-    extra = torch.nan_to_num(torch.from_numpy(extras(p, rows, cols, args.inputs)))
+    extra = torch.nan_to_num(torch.from_numpy(extras(p, rows, args.inputs)))
     if extra.shape[1]:
         extra = (extra - torch.tensor(stats["extraMean"])) / torch.tensor(stats["extraSd"])
     lm, ls = torch.tensor(stats["labelMean"]), torch.tensor(stats["labelSd"])
@@ -239,18 +266,73 @@ def personal(pred_cal, y_cal, pred_test):
     return out
 
 
-def score(p, ans, cols):
+def score(p, ans):
     """Held-out error on the person's test frames: as the network says it, and after their own four numbers."""
-    lab = p["lab"]
+    if p["protocol"] == "days":
+        return score_days(p, ans)
+    lab, cols = p["lab"], p["cols"]
     keep = (lab[:, cols["steady"]] == 1) & (lab[:, cols["blink"]] <= BLINK_MAX) & np.isfinite(ans).all(axis=1)
     cal = keep & (lab[:, cols["role"]] == 1)
     test = keep & (lab[:, cols["role"]] == 2)
     if cal.sum() < 20 or test.sum() < 20:
         return None
-    t = lab[:, [cols["targetX"], cols["targetY"]]] / p["distanceMm"]
+    t = targets(p)
     raw = degrees(ans[test], t[test])
     fitted = degrees(personal(ans[cal], t[cal], ans[test]), t[test])
-    return {"raw": float(raw.mean()), "personal": float(fitted.mean()), "frames": int(test.sum())}
+    # How the head sat during the test against how it sat during the calibration.
+    head = head_inputs(lab, cols)
+    moved = head[test].mean(0) - head[cal].mean(0)
+    return {
+        "raw": float(raw.mean()),
+        "personal": float(fitted.mean()),
+        "frames": int(test.sum()),
+        "turnedDeg": float(np.degrees(np.hypot(moved[0], moved[1]))),
+        "shifted": float(np.hypot(moved[3], moved[4])),
+    }
+
+
+def score_days(p, ans):
+    """
+    A person photographed over many days: each day's first pictures calibrate (four numbers), the rest
+    of that day in the same light are the test. Error by how far the head has turned since.
+    """
+    lab, cols = p["lab"], p["cols"]
+    t = targets(p)
+    keep = (lab[:, cols["usable"]] == 1) & (lab[:, cols["blink"]] <= BLINK_MAX) & np.isfinite(ans).all(axis=1) & np.isfinite(t).all(axis=1)
+    head = head_inputs(lab, cols)
+    err, raw, turn = [], [], []
+    days = lit = 0
+    for day in np.unique(lab[keep, cols["session"]]):
+        rows = np.nonzero(keep & (lab[:, cols["session"]] == day))[0]
+        if len(rows) < DAY_MIN:
+            continue
+        rows = rows[np.argsort(lab[rows, cols["order"]], kind="stable")]
+        cal, rest = rows[:DAY_CALIBRATION], rows[DAY_CALIBRATION:]
+        face = np.maximum(lab[:, cols["lightFace"]], 1)
+        same = (np.abs(np.log(face[rest] / np.median(face[cal]))) <= LIGHT_TOLERANCE) & (
+            np.abs(lab[rest, cols["lightBalance"]] - np.median(lab[cal, cols["lightBalance"]])) <= LIGHT_TOLERANCE
+        )
+        test = rest[same]
+        if len(test) < 20:
+            continue
+        days += 1
+        lit += len(rest) - len(test)
+        err.append(degrees(personal(ans[cal], t[cal], ans[test]), t[test]))
+        raw.append(degrees(ans[test], t[test]))
+        d = head[test][:, :2] - head[cal][:, :2].mean(0)
+        turn.append(np.degrees(np.hypot(d[:, 0], d[:, 1])))
+    if not err:
+        return None
+    err, raw, turn = np.concatenate(err), np.concatenate(raw), np.concatenate(turn)
+    bins = np.digitize(turn, TURN_BINS_DEG)
+    return {
+        "raw": float(raw.mean()),
+        "personal": float(err.mean()),
+        "frames": int(len(err)),
+        "days": days,
+        "lightChanged": int(lit),
+        "byTurn": [{"frames": int((bins == b).sum()), "personal": float(err[bins == b].mean()) if (bins == b).any() else None} for b in range(len(TURN_BINS_DEG) + 1)],
+    }
 
 
 def export(model, stats, args, path):
@@ -268,7 +350,7 @@ def export(model, stats, args, path):
     lin = [m for m in model.head if isinstance(m, nn.Linear)]
     dense = [{"in": m.in_features, "out": m.out_features, "w": [round(v, 6) for v in m.weight.detach().cpu().flatten().tolist()], "b": [round(v, 6) for v in m.bias.detach().cpu().tolist()]} for m in lin]
     doc = {
-        "id": f"eye-cnn-eott-{args.inputs}-{args.seed}",
+        "id": f"eye-cnn-eott{'+mpii' if args.also and args.teach_also else ''}-{args.inputs}-{args.seed}",
         "eye": {"height": EYE_H, "width": EYE_W, "span": 1.7, "contrastFloor": 4.0},
         "inputs": args.inputs,
         "convs": convs,
@@ -283,6 +365,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=".data/eott")
     ap.add_argument("--out", default=None, help="where the answers go (default <root>/cnn)")
+    ap.add_argument("--also", default=None, help="a second set of people, scored day by day for what a moved head does (e.g. .data/mpiifacegaze)")
+    ap.add_argument("--teach-also", action="store_true", help="the second set also teaches (those of its people a fold does not hold out)")
     ap.add_argument("--inputs", default="eyes+head", choices=["eyes", "eyes+head", "eyes+head+tracker"])
     ap.add_argument("--labels", default="both", choices=["both", "dots", "reference"])
     ap.add_argument("--folds", type=int, default=5)
@@ -301,13 +385,22 @@ def main():
         print(s, flush=True)
         lines.append(s)
 
-    people, cols = load(args.root)
+    people = load(args.root)
     # Who may teach: anyone whose light did not change between their calibration and their test.
-    teach = [p for p in people if p["sameLight"] is not False and len(samples(p, cols, args.labels)[0]) >= 100]
+    teach = [p for p in people if p["sameLight"] is not False and len(samples(p, args.labels)[0]) >= 100]
     barred = [p["id"] for p in people if p["sameLight"] is False]
     order = np.random.default_rng(args.seed).permutation(len(people))
     fold_of = {people[i]["id"]: k % args.folds for k, i in enumerate(order)}
-    log(f"{len(people)} people; {len(teach)} may teach ({sum(len(samples(p, cols, args.labels)[0]) for p in teach)} frames); never trained on, light changed: {', '.join(barred) or 'nobody'}")
+    log(f"{len(people)} people; {len(teach)} may teach ({sum(len(samples(p, args.labels)[0]) for p in teach)} frames); never trained on, light changed: {', '.join(barred) or 'nobody'}")
+    also = load(args.also) if args.also else []
+    if also:
+        # Their own folds, drawn after the first set's so that those stay as they were without --also.
+        order = np.random.default_rng(args.seed + 1).permutation(len(also))
+        fold_of.update({also[i]["id"]: k % args.folds for k, i in enumerate(order)})
+        people = people + also
+        if args.teach_also:
+            teach = teach + [p for p in also if len(samples(p, args.labels)[0]) >= 100]
+        log(f"second set {args.also}: {len(also)} people ({sum(len(samples(p, args.labels)[0]) for p in also)} frames), {'teaching and ' if args.teach_also else ''}scored day by day")
     log(f"inputs {args.inputs}; labels {args.labels}; {args.folds} folds; {args.epochs} epochs; device {args.device}")
 
     report = {"args": vars(args), "people": {}, "folds": []}
@@ -316,31 +409,69 @@ def main():
         train = [p for p in teach if fold_of[p["id"]] != k]
         held = [p for p in people if fold_of[p["id"]] == k]
         log(f"fold {k + 1}/{args.folds}: train on {len(train)} people, answer for {len(held)}")
-        model, stats, n = fit(train, cols, args, args.device, args.seed + k, log)
+        model, stats, n = fit(train, args, args.device, args.seed + k, log)
         for p in held:
-            ans = answers(model, stats, p, cols, args, args.device)
+            ans = answers(model, stats, p, args, args.device)
             ans.tofile(os.path.join(out, p["id"] + ".f32"))
-            s = score(p, ans, cols)
-            report["people"][p["id"]] = {"fold": k, "setting": p["setting"], "sameLight": p["sameLight"], **(s or {})}
-        got = [report["people"][p["id"]] for p in held if "raw" in report["people"][p["id"]]]
+            s = score(p, ans)
+            report["people"][p["id"]] = {"fold": k, "setting": p["setting"], "sameLight": p["sameLight"], "protocol": p["protocol"], **(s or {})}
+        got = [report["people"][p["id"]] for p in held if "raw" in report["people"][p["id"]] and p["protocol"] == "roles"]
         if got:
             log(f"  held out: {np.mean([g['raw'] for g in got]):.2f} deg as the network says it, {np.mean([g['personal'] for g in got]):.2f} deg after each person's four numbers ({len(got)} people)")
         report["folds"].append({"fold": k, "trainPeople": len(train), "trainFrames": n})
-    same = [v for v in report["people"].values() if "raw" in v and v["sameLight"]]
+    same = [v for v in report["people"].values() if "raw" in v and v["sameLight"] and v["protocol"] == "roles"]
     log(f"ALL FOLDS, same light ({len(same)} people): {np.mean([v['raw'] for v in same]):.2f} deg raw, {np.mean([v['personal'] for v in same]):.2f} deg after four personal numbers  [{time.time() - t0:.0f} s]")
-    report["sameLight"] = {"people": len(same), "raw": float(np.mean([v["raw"] for v in same])), "personal": float(np.mean([v["personal"] for v in same]))}
+    report["sameLight"] = {
+        "people": len(same),
+        "raw": float(np.mean([v["raw"] for v in same])),
+        "personal": float(np.mean([v["personal"] for v in same])),
+        "worst": float(np.max([v["personal"] for v in same])),
+    }
+    daily = [v for v in report["people"].values() if "raw" in v and v["protocol"] == "days"]
+    if daily:
+        names = [f"under {TURN_BINS_DEG[0]}"] + [f"{a}-{b}" for a, b in zip(TURN_BINS_DEG, TURN_BINS_DEG[1:])] + [f"over {TURN_BINS_DEG[-1]}"]
+
+        def by_day(per):
+            # Each person counts once, and once in each band they have enough pictures in.
+            bands = []
+            for b in range(len(TURN_BINS_DEG) + 1):
+                got = [v["byTurn"][b]["personal"] for v in per if v["byTurn"][b]["frames"] >= 20]
+                bands.append({"people": len(got), "frames": int(sum(v["byTurn"][b]["frames"] for v in per)), "personal": float(np.mean(got)) if got else None})
+            return {
+                "people": len(per),
+                "days": int(sum(v["days"] for v in per)),
+                "frames": int(sum(v["frames"] for v in per)),
+                "lightChanged": int(sum(v["lightChanged"] for v in per)),
+                "personal": float(np.mean([v["personal"] for v in per])),
+                "worst": float(np.max([v["personal"] for v in per])),
+                "byTurn": dict(zip(names, bands)),
+            }
+
+        def line(d):
+            turns = ", ".join(f"{n} deg {b['personal']:.2f} ({b['people']} people)" if b["personal"] is not None else f"{n} deg none" for n, b in d["byTurn"].items())
+            return f"{d['personal']:.2f} deg after four personal numbers (worst person {d['worst']:.2f}); by head turn since calibration: {turns}"
+
+        report["days"] = by_day(daily)
+        d = report["days"]
+        log(f"SECOND SET, day by day, same light ({d['people']} people, {d['days']} days, {d['frames']} pictures; {d['lightChanged']} left out, light changed): {line(d)}")
+        # The same pictures and the same four numbers, on the answer of the app's Real-face model
+        # (which was itself fitted on these people: docs/REAL_DATA.md).
+        ref = [s for s in (score_days(p, p["lab"][:, [p["cols"]["priorX"], p["cols"]["priorY"]]]) for p in also) if s]
+        if ref:
+            report["daysRealFace"] = by_day(ref)
+            log(f"  for comparison, the app's Real-face model on those pictures: {line(report['daysRealFace'])}")
 
     if args.final:
         log(f"final: one network on all {len(teach)} people who may teach")
-        model, stats, n = fit(teach, cols, args, args.device, args.seed + 1000, log)
+        model, stats, n = fit(teach, args, args.device, args.seed + 1000, log)
         size = export(model.cpu(), stats, args, os.path.join(out, "weights.json"))
         # One frame and the answer to it, so another implementation of the forward pass can be checked against this one.
         p = teach[0]
-        rows, _ = samples(p, cols, args.labels)
+        rows, _ = samples(p, args.labels)
         r = rows[:8]
-        ans = answers(model, stats, p, cols, args, "cpu")[r]
+        ans = answers(model, stats, p, args, "cpu")[r]
         json.dump(
-            {"eyes": p["eyes"][r].reshape(len(r), -1).tolist(), "extra": extras(p, r, cols, args.inputs).tolist(), "answer": ans.tolist()},
+            {"eyes": p["eyes"][r].reshape(len(r), -1).tolist(), "extra": extras(p, r, args.inputs).tolist(), "answer": ans.tolist()},
             open(os.path.join(out, "check.json"), "w"),
             separators=(",", ":"),
         )

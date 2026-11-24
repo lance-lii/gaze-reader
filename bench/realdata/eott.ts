@@ -82,6 +82,8 @@ export interface EottSession {
 export interface EottPerson {
   id: string;
   setting: string;
+  /** What the person said they wear: glasses bend and reflect in front of the eye, contacts and nothing don't. */
+  vision: 'glasses' | 'contacts' | 'neither' | 'unknown';
   screen: { widthPx: number; heightPx: number; widthMm: number; heightMm: number };
   mmPerPx: number;
   /** Eyes to screen, mm: as measured in the lab, or the setting's median where it wasn't. */
@@ -100,6 +102,7 @@ interface Meta {
   landmarks: number;
   blendshapeNames: string[];
   setting: string;
+  notes?: Record<string, string>;
   screen: EottPerson['screen'];
   distanceMm: number | null;
   sessions: {
@@ -136,6 +139,11 @@ function usualLight(frames: readonly EottFrame[]): Light | null {
 }
 
 let cached: EottPerson[] | null = null;
+
+function visionOf(said: string | undefined): EottPerson['vision'] {
+  const v = (said ?? '').trim().toLowerCase();
+  return v === 'glasses' ? 'glasses' : v === 'contacts' ? 'contacts' : v === 'normal' ? 'neither' : 'unknown';
+}
 
 export function loadEott(dir = EOTT_DIR, cnnDir = EOTT_CNN_DIR): EottPerson[] {
   if (cached) return cached;
@@ -212,6 +220,7 @@ export function loadEott(dir = EOTT_DIR, cnnDir = EOTT_CNN_DIR): EottPerson[] {
     out.push({
       id: meta.participant,
       setting: meta.setting,
+      vision: visionOf(meta.notes?.['Self-Reported Vision']),
       screen: meta.screen,
       mmPerPx,
       distanceMm: meta.distanceMm ?? NaN,
