@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GAZE_EXCLUDED_FEATURES, trainGazeModel, type TrainOptions } from '../../src/gaze/calibrationModel';
+import { GAZE_EXCLUDED_FEATURES, refineGazeModel, trainGazeModel, type TrainOptions } from '../../src/gaze/calibrationModel';
 import { FEATURE_NAMES } from '../../src/gaze/features';
 import { REAL_FACE_PRIOR } from '../../src/gaze/gazePrior';
 import type { GazeModel, Point } from '../../src/types';
@@ -51,9 +51,50 @@ const NET_ID = 'eott-held-out';
 
 /** The app's own calibration made on the network's answers, the way the app makes it (TrainOptions.eyeNet). */
 function appOnNetwork(c: EottCase, extra: Partial<TrainOptions> = {}): Predictor | null {
-  const tag = (s: EottSample): EottSample => (s.frame.cnn ? { ...s, features: { ...s.features, eyeNet: { id: NET_ID, x: s.frame.cnn.x, y: s.frame.cnn.y } } } : s);
-  const model = train(c.cal.map(tag), { ...base(c.person), eyeNet: NET_ID, ...extra });
-  return model && { predict: (s) => model.predict(tag(s).features) };
+  const model = train(c.cal.map(tagged), { ...base(c.person), eyeNet: NET_ID, ...extra });
+  return model && { predict: (s) => model.predict(tagged(s).features) };
+}
+
+const tagged = (s: EottSample): EottSample => (s.frame.cnn ? { ...s, features: { ...s.features, eyeNet: { id: NET_ID, x: s.frame.cnn.x, y: s.frame.cnn.y } } } : s);
+
+/** The three calibrations a refresh is tried on: the model itself, since a refresh is made on top of it. */
+const REFRESHED: { label: string; cnn?: boolean; model: (c: EottCase) => GazeModel | null }[] = [
+  { label: 'default', model: (c) => train(c.cal, base(c.person)) },
+  { label: 'real-face', model: (c) => train(c.cal, { ...base(c.person), prior: REAL_FACE_PRIOR }) },
+  { label: 'network', cnn: true, model: (c) => train(c.cal.map(tagged), { ...base(c.person), eyeNet: NET_ID }) },
+];
+
+/** How many dots the app's quick refresh shows. */
+const REFRESH_DOTS = 5;
+
+/**
+ * The app's 5-dot refresh (refineGazeModel), made partway through the test: for every run of five
+ * dots in a row, refresh on those and score the other dots, before and after. Both errors are over
+ * the same frames, so the difference is the refresh's doing.
+ */
+function refreshTrial(c: EottCase, model: GazeModel): { before: number; after: number } | null {
+  const dots: EottSample[][] = [];
+  for (const s of c.test.map(tagged)) {
+    const mine = dots.find((d) => d[0].target.x === s.target.x && d[0].target.y === s.target.y);
+    if (mine) mine.push(s);
+    else dots.push([s]);
+  }
+  if (dots.length < REFRESH_DOTS + 2) return null;
+  const before = emptyErrors();
+  const after = emptyErrors();
+  for (let start = 0; start < dots.length; start++) {
+    const shown = new Set(Array.from({ length: REFRESH_DOTS }, (_, k) => (start + k) % dots.length));
+    const rest = dots.filter((_, i) => !shown.has(i)).flat();
+    let refreshed: GazeModel;
+    try {
+      refreshed = refineGazeModel(model, dots.filter((_, i) => shown.has(i)).flat(), { viewport: { width: c.person.screen.widthPx, height: c.person.screen.heightPx } }).model;
+    } catch {
+      return null;
+    }
+    score({ predict: (s) => model.predict(s.features) }, rest, c.person, before);
+    score({ predict: (s) => refreshed.predict(s.features) }, rest, c.person, after);
+  }
+  return before.deg.length && after.deg.length ? { before: quantile(before.deg, 0.5), after: quantile(after.deg, 0.5) } : null;
 }
 
 /** The network's answer fitted to one person with four numbers: screen = camera + (K·answer + c) ÷ face size, per axis. */
@@ -229,5 +270,44 @@ describe.skipIf(!eottAvailable())('real people moving their eyes: EOTT dot tests
     });
     console.log(`\nBY WHAT THEY WEAR (same light; mean of people, worst person in brackets)\n| wears | people | ${names} |\n|${'---|'.repeat(2 + rows[0].deg.length)}\n${groups.join('\n')}\n`);
     expect(rows.length).toBeGreaterThan(0);
+  });
+
+  it('a 5-dot refresh partway through the test: what it wins back, by what people wear', () => {
+    const cases = loadEott()
+      .map((p) => eottCase(p))
+      .filter((c): c is EottCase => !!c && c.light!.same);
+    const haveCnn = cases.some((c) => c.test.some((s) => s.frame.cnn));
+    const kinds = REFRESHED.filter((k) => !k.cnn || haveCnn);
+    const trials = cases.map((c) => ({
+      c,
+      t: kinds.map((k) => {
+        const model = k.model(c);
+        return model && refreshTrial(c, model);
+      }),
+    }));
+    const mean = (v: readonly number[]): number => (v.length ? v.reduce((a, x) => a + x, 0) / v.length : NaN);
+    const cell = (d: number): string => (Number.isFinite(d) ? d.toFixed(1) : '-');
+    const line = (name: string, mine: typeof trials): string => {
+      const cols = kinds.map((_, k) => {
+        const got = mine.map((r) => r.t[k]).filter((t): t is { before: number; after: number } => !!t);
+        const better = got.filter((t) => t.after < t.before).length;
+        return `${cell(mean(got.map((t) => t.before)))} → ${cell(mean(got.map((t) => t.after)))} (worst ${cell(Math.max(...got.map((t) => t.before)))} → ${cell(Math.max(...got.map((t) => t.after)))}; better for ${better} of ${got.length})`;
+      });
+      return `| ${name} | ${mine.length} | ${cols.join(' | ')} |`;
+    };
+    const lines = (['neither', 'contacts', 'glasses'] as const).map((vision) => line(vision, trials.filter((r) => r.c.person.vision === vision)));
+    lines.push(line('everyone', trials));
+    console.log(
+      `\nAFTER A ${REFRESH_DOTS}-DOT REFRESH (same light; refreshed on ${REFRESH_DOTS} test dots in a row, scored on the others; mean of people's typical error, before → after)\n| wears | people | ${kinds.map((k) => k.label).join(' | ')} |\n|${'---|'.repeat(2 + kinds.length)}\n${lines.join('\n')}\n`,
+    );
+    if (haveCnn) {
+      const k = kinds.findIndex((x) => x.label === 'network');
+      const perPerson = trials
+        .filter((r) => r.t[k])
+        .sort((x, y) => y.t[k]!.before - x.t[k]!.before)
+        .map((r) => `| ${r.c.person.id} | ${r.c.person.vision} | ${cell(r.t[k]!.before)} | ${cell(r.t[k]!.after)} |`);
+      console.log(`\nREFRESH, PERSON BY PERSON (network)\n| person | wears | before | after |\n|---|---|---|---|\n${perPerson.join('\n')}\n`);
+    }
+    expect(trials.length).toBeGreaterThan(0);
   });
 });
