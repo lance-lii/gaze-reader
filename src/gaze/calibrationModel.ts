@@ -332,7 +332,23 @@ export interface TrainOptions {
    * the distance and head-pose corrections work as without it. Needs `featureNames`.
    */
   prior?: GazePriorWeights | null;
+  /**
+   * The id of an eye-picture network (eyeNet.ts) whose per-frame answers the samples carry
+   * (`features.eyeNet`). Like `prior`, its two answers become the only inputs of the regression;
+   * samples without an answer from that network are left out. Needs `featureNames`; not together
+   * with `prior`.
+   */
+  eyeNet?: string | null;
 }
+
+/** The eye-picture network a model was fitted on the answers of. */
+export interface EyeNetStage {
+  id: string;
+  /** Where its two answers go in the vector handed to the regression (as {@link GazePrior.slots}). */
+  slots: readonly [number, number];
+}
+
+type EyeNetAnswer = EyeFeatures['eyeNet'];
 
 /** What the caller measured about the calibration conditions; the eyelid baseline is computed here. */
 export interface EnvironmentInput {
@@ -452,6 +468,8 @@ export interface GazeModelParams {
   pose?: PoseCompensation | null;
   /** The shared model the ridge maps were fitted on the answers of; null/absent: none. */
   prior?: GazePrior | null;
+  /** The eye-picture network the ridge maps were fitted on the answers of; null/absent: none. */
+  eyeNet?: EyeNetStage | null;
 }
 
 const IDENTITY: Readonly<AxisAffine> = Object.freeze({ sx: 1, ox: 0, sy: 1, oy: 0 });
@@ -482,6 +500,8 @@ export class RidgeGazeModel implements GazeModel {
   // Scratch buffers: predict runs at camera rate, so avoid per-call allocation.
   /** The shared model this calibration stands on (see gazePrior.ts), or null: the features go straight into the ridge maps. */
   readonly prior: Readonly<GazePrior> | null;
+  /** The eye-picture network this model needs an answer from for every frame, or null. */
+  readonly eyeNet: Readonly<EyeNetStage> | null;
   private readonly priorBuf: Float64Array | null;
   private readonly zBuf: Float64Array;
   private readonly phiBuf: Float64Array;
@@ -503,7 +523,8 @@ export class RidgeGazeModel implements GazeModel {
     this.poseCompensation = params.pose ? Object.freeze(clonePose(params.pose)) : null;
     this.poseActive = !!params.pose && (params.pose.gain.some((g) => g !== 0) || params.pose.rollGain !== 0);
     this.prior = params.prior ? Object.freeze(cloneGazePrior(params.prior)) : null;
-    this.priorBuf = this.prior ? new Float64Array(params.featureLength) : null;
+    this.eyeNet = params.eyeNet ? Object.freeze({ id: params.eyeNet.id, slots: [params.eyeNet.slots[0], params.eyeNet.slots[1]] as const }) : null;
+    this.priorBuf = this.prior || this.eyeNet ? new Float64Array(params.featureLength) : null;
     this.zBuf = new Float64Array(params.featureLength);
     this.phiBuf = new Float64Array(params.expMean.length);
   }
@@ -523,12 +544,13 @@ export class RidgeGazeModel implements GazeModel {
   /** Gaze in absolute screen CSS px (viewport px + window origin), or null. */
   predictScreen(features: EyeFeatures | null | undefined): Point | null {
     const v = features?.vector;
-    return Array.isArray(v) ? this.predictScreenFromVector(v) : null;
+    return Array.isArray(v) ? this.predictScreenFromVector(v, features?.eyeNet) : null;
   }
 
-  predictScreenFromVector(v: ArrayLike<number>): Point | null {
+  /** @param answer the eye-picture network's answer for the frame; only a model made on one reads it */
+  predictScreenFromVector(v: ArrayLike<number>, answer?: EyeNetAnswer): Point | null {
     const P = this.params;
-    const raw = this.ridgeAt(v);
+    const raw = this.ridgeAt(v, answer);
     if (!raw) return null;
     let sx = raw.x;
     let sy = raw.y;
@@ -565,10 +587,14 @@ export class RidgeGazeModel implements GazeModel {
   }
 
   /** The ridge maps' own answer in screen space: before the pose and distance corrections and `adjust`. */
-  private ridgeAt(v: ArrayLike<number>): Point | null {
+  private ridgeAt(v: ArrayLike<number>, answer?: EyeNetAnswer): Point | null {
     const P = this.params;
     if (v.length !== P.featureLength) return null;
-    if (this.prior && this.priorBuf) {
+    if (this.eyeNet && this.priorBuf) {
+      // No answer, or another network's: this model cannot say anything about the frame.
+      if (!applyEyeNetAnswer(this.eyeNet, answer, v, this.priorBuf)) return null;
+      v = this.priorBuf;
+    } else if (this.prior && this.priorBuf) {
       if (!applyGazePrior(this.prior, v, this.priorBuf)) return null;
       v = this.priorBuf;
     }
@@ -623,7 +649,7 @@ export class RidgeGazeModel implements GazeModel {
     }
     const obs: Obs[] = [];
     for (const row of rows) {
-      const raw = this.ridgeAt(row.x);
+      const raw = this.ridgeAt(row.x, row.source.features.eyeNet);
       const now = poseAngles(row.x, pose.index);
       if (!raw || !now) continue;
       // The target, taken back through `adjust` and the distance scaling into the ridge maps' space.
@@ -796,6 +822,7 @@ export class RidgeGazeModel implements GazeModel {
       depth: this.depthCompensation ? { ...this.depthCompensation, camera: { ...this.depthCompensation.camera } } : null,
       pose: this.poseCompensation ? clonePose(this.poseCompensation) : null,
       ...(this.prior ? { prior: serializeGazePrior(this.prior) } : {}),
+      ...(this.eyeNet ? { eyeNet: { id: this.eyeNet.id, slots: [...this.eyeNet.slots] } } : {}),
     };
   }
 }
@@ -920,7 +947,12 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
   }
   const prior = opts.prior ? resolveGazePrior(opts.prior, opts.featureNames) : null;
   if (opts.prior && !prior) throw new Error('The shared gaze model does not fit this build’s eye features.');
-  let rows = prior ? rowsOnPrior(prepared.rows, prior) : prepared.rows;
+  const net = opts.eyeNet ? eyeNetStage(opts.eyeNet, opts.featureNames) : null;
+  if (opts.eyeNet && !net) throw new Error('The eye-picture network needs this build’s eye feature names.');
+  if (prior && net) throw new Error('A calibration is made on the shared gaze model or on the eye-picture network, not both.');
+  /** Whichever first stage there is: its two answers are all the regression reads. */
+  const stage = prior ?? net;
+  let rows = prior ? rowsOnPrior(prepared.rows, prior) : net ? rowsOnEyeNet(prepared.rows, net) : prepared.rows;
   const initialGroups = groupRows(rows);
   if (initialGroups.length < MIN_TARGETS) {
     throw new Error(`Need at least ${MIN_TARGETS} calibration points with usable samples (got ${initialGroups.length}).`);
@@ -928,10 +960,10 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
   const qWanted = Math.max(0, Math.floor(opts.quadraticFeatures ?? DEFAULT_QUADRATIC_FEATURES));
   // Quadratic terms need several distinct targets to be identifiable at all.
   // The prior's answers are already the gaze direction: a straight line to the screen, no squares.
-  const qMax = prior ? 0 : Math.min(qWanted, Math.max(0, initialGroups.length - 3));
+  const qMax = stage ? 0 : Math.min(qWanted, Math.max(0, initialGroups.length - 3));
 
   // Posture features enter linearly only (see POSTURE_FEATURES); excluded ones not at all.
-  const excluded = prior ? allBut(p, prior.slots) : excludedMask(p, opts.featureNames, opts.excludedFeatures);
+  const excluded = stage ? allBut(p, stage.slots) : excludedMask(p, opts.featureNames, opts.excludedFeatures);
   const noQuad = Uint8Array.from(excluded);
   if (opts.featureNames) {
     opts.featureNames.forEach((name, j) => {
@@ -943,7 +975,7 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
   let dominant = selectDominant(rows, stats, qMax, noQuad);
   let rejected = 0;
   // Glances away and half-blinks show in the dominant features, or in the prior's answers.
-  const outlierCheck = prior ? prior.slots : dominant;
+  const outlierCheck = stage ? stage.slots : dominant;
   if (opts.rejectOutliers !== false && outlierCheck.length > 0) {
     const keep = rejectOutliers(rows, initialGroups, stats, outlierCheck);
     rejected = rows.length - keep.length;
@@ -1012,7 +1044,7 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     mean: stats.mean,
     std: stats.std,
     quad: dominant,
-    glitchCheck: prior ? [...prior.slots] : glitchCheckFor(dominant, opts.featureNames),
+    glitchCheck: stage ? [...stage.slots] : glitchCheckFor(dominant, opts.featureNames),
     excluded: excludedIndices,
     expMean: exp.mean,
     expStd: exp.std,
@@ -1029,8 +1061,9 @@ export function trainGazeModel(samples: CalibrationSample[], opts: TrainOptions 
     trainedAt,
     depth: depthCompensationFor(rows, excluded, viewport, origin, opts),
     // With a prior the ridge maps read no feature directly, so the pose correction has nothing to double.
-    pose: poseReferenceFor(rows, prior ? new Uint8Array(p).fill(1) : excluded, viewport, origin, opts),
+    pose: poseReferenceFor(rows, stage ? new Uint8Array(p).fill(1) : excluded, viewport, origin, opts),
     prior,
+    eyeNet: net,
     environment: {
       lighting: sanitizeLightingSignature(opts.environment?.lighting ?? null),
       // From the samples the model was fitted on (blinks and glances away already dropped).
@@ -1093,7 +1126,7 @@ export function refineGazeModel(
   for (const g of groupRows(rows)) {
     const preds: Point[] = [];
     for (const i of g.rows) {
-      const s = inner.predictScreenFromVector(rows[i].x);
+      const s = inner.predictScreenFromVector(rows[i].x, rows[i].source.features.eyeNet);
       if (s) preds.push(s);
     }
     const kept = robustPoints(preds);
@@ -1359,6 +1392,8 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
     // The ridge maps mean nothing without the prior they were fitted on: a damaged one voids the model.
     const prior = json.prior === undefined || json.prior === null ? null : sanitizeGazePrior(json.prior, featureLength);
     if (json.prior !== undefined && json.prior !== null && !prior) return null;
+    const eyeNet = json.eyeNet === undefined || json.eyeNet === null ? null : sanitizeEyeNetStage(json.eyeNet, featureLength);
+    if (json.eyeNet !== undefined && json.eyeNet !== null && (!eyeNet || prior)) return null;
     return new RidgeGazeModel({
       featureLength,
       featureSignature: typeof sig === 'string' ? sig : null,
@@ -1385,6 +1420,7 @@ export function deserializeGazeModel(json: unknown, expect: ModelCompatibility =
       depth: sanitizeDepth(json.depth, featureLength),
       pose: sanitizePose(json.pose, featureLength),
       prior,
+      eyeNet,
     });
   } catch {
     return null;
@@ -1714,6 +1750,40 @@ function allBut(p: number, keep: readonly number[]): Uint8Array {
 }
 
 /** The rows as the regression sees them with a prior; rows the prior has no answer for are dropped. */
+/** The stage for a network's id against a feature layout: its answers take the same two slots a prior's would. */
+function eyeNetStage(id: string, featureNames: readonly string[] | undefined): EyeNetStage | null {
+  if (!featureNames || typeof id !== 'string' || id.length === 0) return null;
+  const tx = featureNames.indexOf('tx');
+  const ty = featureNames.indexOf('ty');
+  return tx >= 0 && ty >= 0 ? { id, slots: [tx, ty] } : null;
+}
+
+function sanitizeEyeNetStage(json: unknown, featureLength: number): EyeNetStage | null {
+  if (!isRecord(json) || typeof json.id !== 'string' || json.id.length === 0 || json.id.length > 80) return null;
+  const s = json.slots;
+  if (!Array.isArray(s) || s.length !== 2 || s[0] === s[1]) return null;
+  if (!s.every((j) => Number.isInteger(j) && j >= 0 && j < featureLength)) return null;
+  return { id: json.id, slots: [s[0] as number, s[1] as number] };
+}
+
+/** Copies `v` into `out` with the network's two answers in their slots. False when the frame has no answer from that network. */
+function applyEyeNetAnswer(stage: EyeNetStage, answer: EyeNetAnswer, v: ArrayLike<number>, out: Float64Array): boolean {
+  if (!answer || answer.id !== stage.id || !Number.isFinite(answer.x) || !Number.isFinite(answer.y)) return false;
+  for (let j = 0; j < out.length; j++) out[j] = v[j];
+  out[stage.slots[0]] = answer.x;
+  out[stage.slots[1]] = answer.y;
+  return true;
+}
+
+function rowsOnEyeNet(rows: readonly Row[], stage: EyeNetStage): Row[] {
+  const out: Row[] = [];
+  for (const r of rows) {
+    const x = new Float64Array(r.v.length);
+    if (applyEyeNetAnswer(stage, r.source.features.eyeNet, r.v, x)) out.push({ ...r, x });
+  }
+  return out;
+}
+
 function rowsOnPrior(rows: readonly Row[], prior: GazePrior): Row[] {
   const out: Row[] = [];
   for (const r of rows) {
