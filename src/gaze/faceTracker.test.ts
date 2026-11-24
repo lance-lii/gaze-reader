@@ -2,6 +2,7 @@
 import type { FaceLandmarkerOptions } from '@mediapipe/tasks-vision';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EyeFeatures, FeatureFrame, LightingStats } from '../types';
+import type { EyeNetRunner } from './eyeNetRunner';
 import type { CameraHandle, OpenCameraOptions } from './camera';
 import {
   CameraFeatureSource,
@@ -1030,5 +1031,108 @@ describe('CameraFeatureSource lighting', () => {
     );
     expect(on.lit).toBeGreaterThan(100);
     expect(added).toBeLessThan(100); // µs per frame on average; a frame at 30 fps lasts 33 000 µs
+  });
+});
+
+// ─────────────────────────── the eye-picture network ───────────────────────────
+
+/** Stands in for the network's runner: holds each frame until the test lets it go. */
+function fakeEyeNet() {
+  const held: { source: unknown; width: number; height: number; landmarks: number; frame: FeatureFrame; emit: (f: FeatureFrame) => void }[] = [];
+  let throwing = false;
+  const runner = {
+    submit(source: unknown, width: number, height: number, landmarks: ArrayLike<unknown>, frame: FeatureFrame, emit: (f: FeatureFrame) => void): void {
+      if (throwing) throw new Error('runner broke');
+      held.push({ source, width, height, landmarks: landmarks.length, frame, emit });
+    },
+  } as unknown as EyeNetRunner;
+  return {
+    runner,
+    held,
+    release(answer?: { id: string; x: number; y: number }): void {
+      for (const h of held.splice(0)) h.emit(answer && h.frame.features ? { ...h.frame, features: { ...h.frame.features, eyeNet: answer } } : h.frame);
+    },
+    set throwing(v: boolean) {
+      throwing = v;
+    },
+  };
+}
+
+describe('CameraFeatureSource with an eye-picture network', () => {
+  it('hands every frame to the network with the picture it came from, and delivers what comes back', async () => {
+    const h = harness();
+    const net = fakeEyeNet();
+    h.src.setEyeNet(net.runner);
+    await h.src.start();
+    vi.advanceTimersByTime(100);
+    expect(net.held.length).toBeGreaterThanOrEqual(2);
+    expect(h.frames).toHaveLength(0);
+    expect(net.held[0]).toMatchObject({ source: h.video, width: 640, height: 480, landmarks: FACE_RESULT.faceLandmarks[0].length });
+    const n = net.held.length;
+    net.release({ id: 'net-1', x: 0.1, y: -0.2 });
+    expect(h.frames).toHaveLength(n);
+    expect(h.frames[0].features?.eyeNet).toEqual({ id: 'net-1', x: 0.1, y: -0.2 });
+    h.src.stop();
+  });
+
+  it('sends frames without a face the same way, so the order holds', async () => {
+    const h = harness();
+    const net = fakeEyeNet();
+    h.src.setEyeNet(net.runner);
+    await h.src.start();
+    vi.advanceTimersByTime(40);
+    h.lm.result = { faceLandmarks: [], faceBlendshapes: [], facialTransformationMatrixes: [] };
+    vi.advanceTimersByTime(40);
+    h.lm.throwing = true;
+    vi.advanceTimersByTime(40);
+    const found = net.held.map((x) => x.frame.faceFound);
+    expect(found).toContain(true);
+    expect(found.at(-1)).toBe(false);
+    expect(net.held.filter((x) => !x.frame.faceFound).every((x) => x.landmarks === 0)).toBe(true);
+    net.release();
+    expect(h.frames.map((f) => f.t)).toEqual([...h.frames.map((f) => f.t)].sort((a, b) => a - b));
+    expect(h.frames).toHaveLength(found.length);
+    h.src.stop();
+  });
+
+  it('drops answers that arrive after the camera stopped', async () => {
+    const h = harness();
+    const net = fakeEyeNet();
+    h.src.setEyeNet(net.runner);
+    await h.src.start();
+    vi.advanceTimersByTime(100);
+    h.src.stop();
+    net.release({ id: 'net-1', x: 0, y: 0 });
+    expect(h.frames).toHaveLength(0);
+  });
+
+  it('keeps tracking when the network’s runner breaks, and stops asking it', async () => {
+    const h = harness();
+    const net = fakeEyeNet();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    h.src.setEyeNet(net.runner);
+    net.throwing = true;
+    await h.src.start();
+    vi.advanceTimersByTime(100);
+    expect(h.frames.length).toBeGreaterThanOrEqual(2);
+    expect(h.frames.every((f) => f.faceFound && f.features?.eyeNet === undefined)).toBe(true);
+    net.throwing = false;
+    vi.advanceTimersByTime(100);
+    expect(net.held).toHaveLength(0);
+    h.src.stop();
+  });
+
+  it('delivers frames directly again once the network is taken away', async () => {
+    const h = harness();
+    const net = fakeEyeNet();
+    h.src.setEyeNet(net.runner);
+    await h.src.start();
+    vi.advanceTimersByTime(50);
+    h.src.setEyeNet(null);
+    const before = net.held.length;
+    vi.advanceTimersByTime(100);
+    expect(net.held).toHaveLength(before);
+    expect(h.frames.length).toBeGreaterThanOrEqual(2);
+    h.src.stop();
   });
 });
