@@ -34,6 +34,11 @@ requests they make.
   light), and discards the pixels at once. They are never kept, shown on the page or sent
   anywhere. The lighting numbers themselves are used like the eye numbers: on your device,
   then thrown away.
+- If you load an **eye-picture network** (web app, Settings → Advanced; the app comes with none),
+  a small picture of the area round your eyes is cut from each frame and handed to a background
+  thread of the same page, which reduces it to two numbers (how far across and how far down you
+  are looking) and discards the picture at once. The picture never leaves the page, and is never
+  kept or shown. The two numbers are used like the eye numbers: on your device, then thrown away.
 - Video frames and images are **never recorded, stored, uploaded or shared**. Neither are the
   landmarks, the gaze positions or the lighting numbers, unless you record tracking diagnostics
   yourself (see [below](#tracking-diagnostics-web-app-only-if-you-start-it)).
@@ -52,6 +57,8 @@ requests they make.
 - for PDFs you open from a file, the file itself and where the lines are on its pages (IndexedDB,
   a database named `gazeReaderPdf`), so the app can show the PDF's own pages. It is removed when
   you remove the book. Which view you last chose for a PDF is kept with your settings;
+- an eye-picture network, if you loaded one: the file you chose, as it was (`localStorage`), until
+  you press **Remove the network**. It holds the network's weights and nothing about you;
 - your settings and your calibration (`localStorage`), together with a few small markers: that
   you have seen the introduction, when the "please calibrate once more" note was shown, which view
   you chose for each PDF, and that the pages view was pointed out for it. A calibration is a small
@@ -110,7 +117,8 @@ unless you start it.
 - **What is recorded,** as numbers, for the frames of the calibration and of each dot: your eye
   measurements (the numbers described under "The camera", head angle and position, how open your
   eyes are), where each dot was, the size and place of the window, the line spacing of the open
-  text, the app version, and the date and time.
+  text, the app version, and the date and time. If an eye-picture network is running, also its
+  name and its two numbers for each frame.
 - **What is not:** video, images, anything about the book, your settings, or your browser and
   camera.
 - **Where it goes:** it stays in memory while the results are on screen. **Save recording** saves
