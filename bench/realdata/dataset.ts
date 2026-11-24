@@ -32,6 +32,8 @@ export interface RealSample extends CalibrationSample {
   /** The day's number, and the picture's number within it (its order in time). */
   day: number;
   number: number;
+  /** Which record of the participant's file this is (the eye pictures and the lighting are stored in the same order). */
+  row: number;
   /** Eye-to-target distance, mm, from the dataset's own 3D estimate. */
   distanceMm: number;
   /** The dataset's face centre in the camera's frame, mm (x right, y down, z away from the camera). */
@@ -102,6 +104,7 @@ export function loadParticipants(dir = REAL_DATA_DIR): Participant[] {
       samples.push({
         day: h[0],
         number: h[1],
+        row: r / L,
         target: { x: h[2], y: h[3] },
         features,
         t: samples.length * 100,
