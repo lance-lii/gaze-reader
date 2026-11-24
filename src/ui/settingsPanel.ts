@@ -21,6 +21,16 @@ export interface SettingsPanelOptions {
   onAccuracyTest?: () => void;
   /** The tracking-diagnostics recorder (Advanced). Omitted where downloads don't exist (the Artifact build). */
   diagnostics?: DiagnosticsControls;
+  /** The eye-picture network (Advanced). Omitted where there is no camera (the Artifact build) and in the extension. */
+  eyeNet?: EyeNetControls;
+}
+
+export interface EyeNetControls {
+  /** The network kept in this browser, and whether the calibration in use was made on it. */
+  status(): { id: string | null; inUse: boolean };
+  /** A chosen file's text: checked and kept. The message says what happened, in words for the reader. */
+  load(text: string): { ok: boolean; message: string };
+  remove(): void;
 }
 
 export interface DiagnosticsStatus {
@@ -47,6 +57,12 @@ export const DIAGNOSTICS_PRIVACY_TEXT =
   'Records numbers only, for up to 10 minutes: eye measurements, gaze estimates, lighting readings, ' +
   'line positions and page turns, plus your settings, your browser, and your camera’s settings and name (usually its model). ' +
   'No video, no images, no book text. It stays on this device until you download it, and nothing is uploaded.';
+
+/** What the eye-picture network is and where the pictures go. PRIVACY.md ("Eye-picture network") says the same. */
+export const EYE_NET_TEXT =
+  'Experimental. A small neural network that reads where you look from the picture of your eyes, instead of from the outline the face tracker draws round them. ' +
+  'Gaze Reader does not come with one: you train it yourself (docs/REAL_DATA.md) and load the file here. ' +
+  'While it runs, a small picture of your eyes from each camera frame goes to a background thread of this page. No picture is kept, and nothing is uploaded.';
 
 /** What the accuracy test does and keeps. PRIVACY.md ("Accuracy test") says the same. */
 export const ACCURACY_TEST_TEXT =
@@ -98,6 +114,7 @@ export class SettingsPanel implements Mountable {
   /** Null in the Artifact build (no calibration) or when the host offers no check. */
   private readonly checkBtn: HTMLButtonElement | null;
   private diag: { record: HTMLButtonElement; download: HTMLButtonElement; status: HTMLElement } | null = null;
+  private eyeNet: { state: HTMLElement; remove: HTMLButtonElement } | null = null;
   private diagTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: SettingsPanelOptions) {
@@ -131,6 +148,7 @@ export class SettingsPanel implements Mountable {
       if (group.id === 'tracking') section.appendChild(IS_ARTIFACT ? artifactTrackingNote() : this.renderCalibrationActions());
       if (group.id === 'advanced' && opts.onAccuracyTest && !IS_ARTIFACT) section.appendChild(this.renderAccuracyTest(opts.onAccuracyTest, uid));
       if (group.id === 'advanced' && opts.diagnostics && !IS_ARTIFACT) section.appendChild(this.renderDiagnostics(opts.diagnostics, uid));
+      if (group.id === 'advanced' && opts.eyeNet && !IS_ARTIFACT) section.appendChild(this.renderEyeNet(opts.eyeNet, uid));
       body.appendChild(section);
     }
 
@@ -167,6 +185,7 @@ export class SettingsPanel implements Mountable {
 
   open(): void {
     this.update(this.opts.getSettings());
+    this.refreshEyeNet();
     this.layer.open();
     this.syncDiagTimer();
   }
@@ -429,6 +448,68 @@ export class SettingsPanel implements Mountable {
     actions.append(run);
     wrap.append(title, hint, actions);
     return wrap;
+  }
+
+  private renderEyeNet(controls: EyeNetControls, uid: string): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'gr-set-row gr-set-eyenet';
+    const title = document.createElement('p');
+    title.className = 'gr-set-row__label';
+    title.textContent = 'Eye-picture network';
+    title.style.margin = '0';
+    const hint = document.createElement('small');
+    hint.className = 'gr-set-row__hint';
+    hint.id = `${uid}-eyenet-hint`;
+    hint.textContent = EYE_NET_TEXT;
+    const state = document.createElement('p');
+    state.className = 'gr-set-row__hint gr-settings__eyenet-state';
+    state.style.gridColumn = '1 / -1';
+    state.style.margin = '0';
+    const actions = document.createElement('div');
+    actions.className = 'gr-set-actions';
+    actions.style.gridColumn = '1 / -1';
+    const status = this.statusElement();
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.hidden = true;
+    input.className = 'gr-settings__eyenet-file';
+    input.addEventListener('change', () => {
+      const file = input.files?.[0];
+      input.value = ''; // the same file can be chosen again
+      if (!file) return;
+      void file.text().then(
+        (text) => {
+          this.flash(status, controls.load(text).message);
+          this.refreshEyeNet();
+        },
+        () => this.flash(status, 'That file could not be read.'),
+      );
+    });
+    const load = this.button('Load a network file…', 'gr-btn--soft gr-settings__eyenet-load', () => input.click(), 'download');
+    load.setAttribute('aria-describedby', hint.id);
+    const remove = this.button('Remove the network', 'gr-btn--ghost gr-settings__eyenet-remove', () => {
+      const wasInUse = controls.status().inUse;
+      controls.remove();
+      this.flash(status, wasInUse ? 'Removed. Your calibration was made with it, so calibrate again.' : 'Removed.');
+      this.refreshEyeNet();
+    });
+    this.confirmable(remove, 'Click again to remove');
+    actions.append(load, remove, input, status);
+    wrap.append(title, hint, state, actions);
+    this.eyeNet = { state, remove };
+    return wrap;
+  }
+
+  /** Says which network is loaded, and whether the calibration in use was made on it. */
+  private refreshEyeNet(): void {
+    const ui = this.eyeNet;
+    const controls = this.opts.eyeNet;
+    if (!ui || !controls) return;
+    const { id, inUse } = controls.status();
+    ui.remove.hidden = id === null;
+    ui.state.textContent =
+      id === null ? 'No network is loaded.' : inUse ? `Loaded: ${id}. Your calibration uses it.` : `Loaded: ${id}. It is used from your next full calibration.`;
   }
 
   private renderDiagnostics(controls: DiagnosticsControls, uid: string): HTMLElement {

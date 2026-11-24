@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createEventBus } from '../core/events';
 import { DEFAULT_SETTINGS } from '../core/settings';
 import type { AppSettings } from '../types';
-import { ACCURACY_TEST_TEXT, SettingsPanel, formatClock } from './settingsPanel';
+import { ACCURACY_TEST_TEXT, EYE_NET_TEXT, SettingsPanel, formatClock } from './settingsPanel';
 
 function setup(saved = true) {
   const bus = createEventBus();
@@ -152,6 +152,78 @@ describe('SettingsPanel', () => {
     const { panel: plain } = setup();
     plain.open();
     expect(document.querySelector('.gr-settings__acctest')).toBeNull();
+    plain.destroy();
+  });
+
+  it('loads and removes an eye-picture network from Advanced, saying where the pictures go', async () => {
+    const net = { id: null as string | null, inUse: false, loaded: [] as string[], removed: 0 };
+    const panel = new SettingsPanel({
+      bus: createEventBus(),
+      getSettings: () => DEFAULT_SETTINGS,
+      hasSavedCalibration: () => true,
+      onForgetCalibration: () => undefined,
+      onRecalibrate: () => undefined,
+      onShowHelp: () => undefined,
+      onReplayIntro: () => undefined,
+      eyeNet: {
+        status: () => ({ id: net.id, inUse: net.inUse }),
+        load: (text) => {
+          net.loaded.push(text);
+          if (text === 'bad') return { ok: false, message: 'That file is not an eye-picture network (it is not JSON).' };
+          net.id = 'net-7';
+          return { ok: true, message: 'Loaded. It is used from your next full calibration.' };
+        },
+        remove: () => {
+          net.removed++;
+          net.id = null;
+          net.inUse = false;
+        },
+      },
+    });
+    panel.mount(document.body);
+    panel.open();
+    const state = () => document.querySelector('.gr-settings__eyenet-state')!.textContent;
+    const load = document.querySelector<HTMLButtonElement>('.gr-settings__eyenet-load')!;
+    const remove = document.querySelector<HTMLButtonElement>('.gr-settings__eyenet-remove')!;
+    const input = document.querySelector<HTMLInputElement>('.gr-settings__eyenet-file')!;
+    expect(document.getElementById(load.getAttribute('aria-describedby') ?? '')?.textContent).toBe(EYE_NET_TEXT);
+    expect(EYE_NET_TEXT).toContain('No picture is kept');
+    expect(EYE_NET_TEXT).toContain('nothing is uploaded');
+    expect(state()).toBe('No network is loaded.');
+    expect(remove.hidden).toBe(true);
+
+    const choose = async (text: string): Promise<void> => {
+      Object.defineProperty(input, 'files', { configurable: true, value: [{ text: () => Promise.resolve(text) }] });
+      input.dispatchEvent(new Event('change'));
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    };
+    await choose('bad');
+    expect(state()).toBe('No network is loaded.');
+    expect(document.querySelector('.gr-set-eyenet')!.textContent).toContain('not an eye-picture network');
+    await choose('{"a":1}');
+    expect(net.loaded).toEqual(['bad', '{"a":1}']);
+    expect(state()).toBe('Loaded: net-7. It is used from your next full calibration.');
+    expect(remove.hidden).toBe(false);
+
+    // Reopening shows what the calibration in use was made on.
+    net.inUse = true;
+    panel.close();
+    panel.open();
+    expect(state()).toBe('Loaded: net-7. Your calibration uses it.');
+
+    // Removing takes a second click.
+    remove.click();
+    expect(net.removed).toBe(0);
+    remove.click();
+    expect(net.removed).toBe(1);
+    expect(state()).toBe('No network is loaded.');
+    expect(document.querySelector('.gr-set-eyenet')!.textContent).toContain('calibrate again');
+    panel.destroy();
+
+    // Hosts without it (the extension) get no block.
+    const { panel: plain } = setup();
+    plain.open();
+    expect(document.querySelector('.gr-set-eyenet')).toBeNull();
     plain.destroy();
   });
 

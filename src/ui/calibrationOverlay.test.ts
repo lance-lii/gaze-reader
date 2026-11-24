@@ -150,6 +150,8 @@ interface Reader {
    * real face: the eyes stay on the dot.
    */
   head: { nodDeg: number; turnDeg: number; tiltDeg: number } | null;
+  /** An eye-picture network's answer for a frame with the eyes on `gaze`; null when none is running. */
+  eyeNet: ((gaze: Point, r: () => number) => { id: string; x: number; y: number }) | null;
   pointIndex: number;
   attempt: number;
 }
@@ -173,6 +175,7 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
     zoom: 1,
     readsNotices: false,
     head: null,
+    eyeNet: null,
     pointIndex: -1,
     attempt: 0,
   };
@@ -217,6 +220,8 @@ function simulateReader(src: FakeSource, scope: ParentNode, bus: ReturnType<type
       features.headPose = pose;
       features.vector.push(pose.yaw + 0.002 * gaussian(r), pose.pitch + 0.002 * gaussian(r), pose.roll + 0.002 * gaussian(r), pose.tx, pose.ty, pose.tz);
     }
+    const answer = reader.eyeNet?.(gaze, r);
+    if (answer) features.eyeNet = answer;
     features.faceScale = reader.faceScale;
     features.faceCenter = { ...reader.faceCenter };
     if (reader.squint !== undefined) features.squint = reader.squint;
@@ -1733,6 +1738,56 @@ describe('the head-movement step', () => {
     // The same reader without it: the calibration the app has always made.
     const plain = await calibrate({ nodDeg: 6, turnDeg: 7, tiltDeg: 5 });
     expect(asRidgeGazeModel(plain.result!.model)!.prior).toBeNull();
+  });
+
+  it('builds the calibration on an eye-picture network’s answers when one is running, head step included', async () => {
+    // A stand-in network: its own skewed, noisy reading of where the eyes point.
+    const answers = (gaze: Point, r: () => number) => ({ id: 'net-1', x: 0.02 + (0.5 * (gaze.x - VW / 2)) / VW + 0.004 * gaussian(r), y: -0.04 + (0.5 * (gaze.y - VH / 2)) / VW + 0.004 * gaussian(r) });
+    const ctx = setup({ featureNames: POSE_NAMES, linePitchPx: 20, eyeNet: 'net-1' });
+    ctx.sim.reader.head = { nodDeg: 6, turnDeg: 7, tiltDeg: 5 };
+    ctx.sim.reader.eyeNet = answers;
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 180_000, 250);
+    ctx.q<HTMLButtonElement>('[data-action="use"]').click();
+    const result = await done;
+    ctx.sim.stop();
+    const model = asRidgeGazeModel(result!.model)!;
+    expect(model.eyeNet?.id).toBe('net-1');
+    expect(model.prior).toBeNull();
+    expect(result?.headStep).toBeDefined();
+    expect(result!.report.meanErrorPx).toBeLessThan(40);
+    // It reads a frame through the network's answer, and nothing without one.
+    const r = rng(3);
+    const f = eyeFeatures({ x: 300, y: 500 }, r);
+    f.vector.push(0.02, 0.07, 0, 0, -5, -60);
+    expect(model.predict(f)).toBeNull();
+    const p = model.predict({ ...f, eyeNet: answers({ x: 300, y: 500 }, r) })!;
+    expect(Math.hypot(p.x - 300, p.y - 500)).toBeLessThan(60);
+  });
+
+  it('uses a network whose thread came up after the screen opened', async () => {
+    let running: string | null = null;
+    const ctx = setup({ featureNames: POSE_NAMES, linePitchPx: 20, eyeNet: () => running });
+    ctx.sim.reader.head = { nodDeg: 6, turnDeg: 7, tiltDeg: 5 };
+    ctx.sim.reader.eyeNet = (gaze, r) => ({ id: 'net-1', x: (0.5 * (gaze.x - VW / 2)) / VW + 0.004 * gaussian(r), y: (0.5 * (gaze.y - VH / 2)) / VW + 0.004 * gaussian(r) });
+    const done = ctx.overlay.run();
+    await startCalibration(ctx);
+    running = 'net-1';
+    await advanceUntil(() => ctx.root.dataset.phase === 'results', 180_000, 250);
+    ctx.q<HTMLButtonElement>('[data-action="use"]').click();
+    const result = await done;
+    ctx.sim.stop();
+    expect(asRidgeGazeModel(result!.model)!.eyeNet?.id).toBe('net-1');
+  });
+
+  it('calibrates as it always has when the network that should be running answered nothing', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { result } = await calibrate({ nodDeg: 6, turnDeg: 7, tiltDeg: 5 }, undefined, { eyeNet: 'net-1' });
+    const model = asRidgeGazeModel(result!.model)!;
+    expect(model.eyeNet).toBeNull();
+    expect(result!.report.meanErrorPx).toBeLessThan(60);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('eye-picture network'), expect.anything());
   });
 
   it('says so and carries on when the head hardly moved, and the calibration is as good as without the step', async () => {

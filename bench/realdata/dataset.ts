@@ -14,7 +14,8 @@ interface FsLike {
   existsSync(path: string): boolean;
   readdirSync(path: string): string[];
   readFileSync(path: string): Uint8Array;
-  writeFileSync(path: string, data: string): void;
+  writeFileSync(path: string, data: string | Uint8Array): void;
+  mkdirSync(path: string, options?: { recursive?: boolean }): unknown;
 }
 interface ProcessLike {
   env?: Record<string, string | undefined>;

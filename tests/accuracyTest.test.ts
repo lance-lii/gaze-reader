@@ -1,14 +1,16 @@
 // The live accuracy test's scoring, on sessions played by the face simulator.
 import { describe, expect, it } from 'vitest';
-import { simulatedSession } from '../bench/live/simSession';
+import { SIM_EYE_NET, simulatedSession } from '../bench/live/simSession';
 import {
   DEFAULT_VARIANT,
+  EYE_NET_VARIANT,
   POSTURES,
   REAL_FACE_VARIANT,
   TEST_TARGETS,
   VARIANTS,
   accuracyRecordingFileName,
   compareVariants,
+  featuresOf,
   formatPooled,
   formatScores,
   median,
@@ -37,6 +39,9 @@ describe('accuracy test: the plan', () => {
   });
 });
 
+/** The calibrations every recording is scored for: the eye-picture network's needs a recording that carries its answers. */
+const PLAIN = VARIANTS.filter((v) => !v.needsEyeNet);
+
 describe('accuracy test: scoring a session', () => {
   const rec = simulatedSession(11);
   const scores = scoreRecording(rec, { prior: REAL_FACE_PRIOR });
@@ -47,7 +52,7 @@ describe('accuracy test: scoring a session', () => {
   };
 
   it('scores every variant on every test dot', () => {
-    expect(scores.variants.map((v) => v.id)).toEqual(VARIANTS.map((v) => v.id));
+    expect(scores.variants.map((v) => v.id)).toEqual(PLAIN.map((v) => v.id));
     for (const v of scores.variants) {
       expect(v.ok, `${v.id}: ${v.problem ?? ''}`).toBe(true);
       expect(v.dots.length).toBe(POSTURES.length * TEST_TARGETS.length);
@@ -77,7 +82,7 @@ describe('accuracy test: scoring a session', () => {
   });
 
   it('compares each other variant with the default, dot by dot', () => {
-    expect(scores.comparisons.map((c) => c.b)).toEqual(VARIANTS.slice(1).map((v) => v.id));
+    expect(scores.comparisons.map((c) => c.b)).toEqual(PLAIN.slice(1).map((v) => v.id));
     for (const c of scores.comparisons) {
       expect(c.a).toBe(DEFAULT_VARIANT);
       expect(c.dots).toBe(45);
@@ -105,7 +110,7 @@ describe('accuracy test: scoring a session', () => {
 
   it('prints a table with every variant and the verdict', () => {
     const text = formatScores(scores);
-    for (const v of VARIANTS) expect(text).toContain(v.label);
+    for (const v of PLAIN) expect(text).toContain(v.label);
     for (const p of POSTURES) expect(text).toContain(p.short);
     expect(text).toContain('Against the default, dot by dot');
     expect(text.endsWith(scores.verdict)).toBe(true);
@@ -184,7 +189,7 @@ describe('accuracy test: several sessions together', () => {
 
   it('compares over every dot of every session', () => {
     const pooled = poolComparisons(sessions);
-    expect(pooled.map((c) => c.b)).toEqual(VARIANTS.filter((v) => v.id !== DEFAULT_VARIANT).map((v) => v.id));
+    expect(pooled.map((c) => c.b)).toEqual(PLAIN.filter((v) => v.id !== DEFAULT_VARIANT).map((v) => v.id));
     for (const c of pooled) {
       const each = sessions.map((s) => s.comparisons.find((x) => x.b === c.b));
       expect(c.dots).toBe(each.reduce((n, x) => n + (x?.dots ?? 0), 0));
@@ -208,7 +213,7 @@ describe('accuracy test: several sessions together', () => {
   it('prints one column per session and one line per comparison', () => {
     const text = formatPooled(sessions);
     expect(text).toContain('2 sessions together');
-    for (const v of VARIANTS) expect(text).toContain(v.label);
+    for (const v of PLAIN) expect(text).toContain(v.label);
     expect(text).toMatch(/Real-face model\s+closer on \d+ of 81 dots/);
   });
 });
@@ -235,5 +240,50 @@ describe('accuracy test: the arithmetic', () => {
     expect(signTest(0, 10)).toBeCloseTo(2 / 1024, 12);
     // 2 * (C(12,0) + C(12,1) + C(12,2)) / 2^12
     expect(signTest(10, 2)).toBeCloseTo((2 * (1 + 12 + 66)) / 4096, 12);
+  });
+});
+
+describe('accuracy test: a session recorded with an eye-picture network running', () => {
+  const rec = simulatedSession(21, { eyeNet: true });
+  const scores = scoreRecording(rec, { prior: REAL_FACE_PRIOR });
+
+  it('keeps the network’s answer with every frame and says whose they are', () => {
+    expect(rec.eyeNet).toBe(SIM_EYE_NET);
+    const frames = rec.blocks.flatMap((b) => b.trials.flatMap((t) => t.frames));
+    expect(frames.every((f) => f.n?.length === 2)).toBe(true);
+    const back = parseRecording(JSON.parse(JSON.stringify(rec)));
+    expect(back.ok).toBe(true);
+    if (back.ok) expect(back.recording.eyeNet).toBe(SIM_EYE_NET);
+    expect(featuresOf(frames[0], rec.eyeNet).eyeNet).toEqual({ id: SIM_EYE_NET, x: frames[0].n![0], y: frames[0].n![1] });
+    expect(featuresOf(frames[0]).eyeNet).toBeUndefined();
+  });
+
+  it('scores the calibration made on the network next to the others, on the same frames', () => {
+    expect(scores.variants.map((v) => v.id)).toEqual(VARIANTS.map((v) => v.id));
+    const net = scores.variants.find((v) => v.id === EYE_NET_VARIANT)!;
+    expect(net.ok, net.problem ?? '').toBe(true);
+    expect(net.overall.scored).toBe(scores.variants[0].overall.scored);
+    // The stand-in reads the dot to about 30 px; a calibration that really used it lands near that.
+    expect(net.overall.medianErrorPx).toBeLessThan(60);
+    expect(scores.comparisons.map((c) => c.b)).toContain(EYE_NET_VARIANT);
+    expect(formatScores(scores)).toContain('Eye-picture network');
+  });
+
+  it('leaves the other calibrations as they are without the answers', () => {
+    const stripped: AccuracyRecording = JSON.parse(JSON.stringify(rec));
+    delete stripped.eyeNet;
+    for (const b of stripped.blocks) for (const t of b.trials) for (const f of t.frames) delete f.n;
+    const plain = scoreRecording(stripped, { prior: REAL_FACE_PRIOR });
+    expect(plain.variants.map((v) => v.id)).toEqual(PLAIN.map((v) => v.id));
+    for (const v of plain.variants) expect(scores.variants.find((x) => x.id === v.id)!.overall.medianErrorPx).toBeCloseTo(v.overall.medianErrorPx, 6);
+  });
+
+  it('refuses a recording whose network answers are damaged', () => {
+    const bad = JSON.parse(JSON.stringify(rec));
+    bad.blocks[0].trials[0].frames[0].n = [0.1];
+    expect(parseRecording(bad).ok).toBe(false);
+    const unnamed = JSON.parse(JSON.stringify(rec));
+    unnamed.eyeNet = '';
+    expect(parseRecording(unnamed).ok).toBe(false);
   });
 });

@@ -49,6 +49,8 @@ import {
   saveCalibration,
   savedCalibrationNeedsUpgrade,
 } from '../gaze/calibrationModel';
+import { EyeNetRunner } from '../gaze/eyeNetRunner';
+import { forgetStoredEyeNet, loadStoredEyeNet, storeEyeNet, type StoredEyeNet } from '../gaze/eyeNetStore';
 import { CameraFeatureSource, preloadFaceLandmarker } from '../gaze/faceTracker';
 import { FEATURE_NAMES } from '../gaze/features';
 import { REAL_FACE_PRIOR } from '../gaze/gazePrior';
@@ -169,6 +171,8 @@ const CAMERA_RESTART_WINDOW_MS = 10 * 60_000;
 const SLOW_CAMERA_MS = 5000;
 /** …and told again when it happens again after the camera was fast enough, at most this often. */
 const SLOW_CAMERA_REPEAT_MS = 10 * 60_000;
+/** How long a calibration waits for the eye-picture network's worker to read its file. */
+const EYE_NET_START_WAIT_MS = 1500;
 const SCROLL_SETTLE_MS = 120;
 const SAVE_POSITION_MS = 1000;
 const ESTIMATE_EMIT_MS = 100;
@@ -350,6 +354,10 @@ export class AppController {
   private model: GazeModel | null | undefined = undefined;
   private savedCalibration = false;
   private calibration: CalibrationOverlay | null = null;
+  /** The eye-picture network kept in this browser (undefined until first asked for; see eyeNetStore.ts). */
+  private eyeNetFile: StoredEyeNet | null | undefined = undefined;
+  /** Its worker, while the camera is on. */
+  private eyeNetRunner: EyeNetRunner | null = null;
   /** The accuracy test's rounds of dots, while they are up (after its calibration). */
   private accuracyTest: AccuracyTestOverlay | null = null;
   /** The frames of the last full calibration finished in this session: what the accuracy test records. */
@@ -520,6 +528,11 @@ export class AppController {
               start: () => this.startRecording(),
               stop: () => this.stopRecording(true),
               download: () => this.downloadRecording(),
+            },
+            eyeNet: {
+              status: () => this.eyeNetStatus(),
+              load: (text: string) => this.loadEyeNetFile(text),
+              remove: () => this.removeEyeNetFile(),
             },
           }),
     });
@@ -1805,6 +1818,7 @@ export class AppController {
     this.offCameraFrames?.();
     this.offCameraFrames = null;
     this.camera?.stop();
+    this.stopEyeNet();
     this.stopConditionWatch();
     this.resetFixations(true);
     this.updateOverlays();
@@ -1847,6 +1861,7 @@ export class AppController {
     // Lighting and eyelid watch, diagnostics (subscribed before any calibration, so a recording has its frames).
     this.offCameraFrames?.();
     this.offCameraFrames = camera.onFrame(this.onCameraFrame);
+    this.startEyeNet(camera);
     this.updateOverlays();
 
     const model = this.currentModel();
@@ -2129,6 +2144,9 @@ export class AppController {
   private currentModel(): GazeModel | null {
     if (this.model === undefined) {
       this.model = loadCalibration({ featureLength: FEATURE_NAMES.length, featureNames: FEATURE_NAMES });
+      // Made on an eye-picture network that is no longer here: it has nothing to go on.
+      const net = this.model ? asRidgeGazeModel(this.model)?.eyeNet : null;
+      if (net && this.storedEyeNet()?.shape.id !== net.id) this.model = null;
       this.savedCalibration = this.model !== null;
       this.applyEnvironment(this.model);
     }
@@ -2145,6 +2163,12 @@ export class AppController {
     const stale = (): boolean => gen !== this.sourceGen || this.destroyed;
     const camera = this.camera;
     if (!camera?.running || this.calibration) return null;
+    // A network whose worker is still reading its file gets a moment: the calibration is made on its answers.
+    const starting = this.eyeNetRunner;
+    if (starting && !starting.running) {
+      await Promise.race([starting.started, new Promise<void>((resolve) => setTimeout(resolve, EYE_NET_START_WAIT_MS))]);
+      if (stale() || !camera.running || this.calibration) return null;
+    }
     const base = this.currentModel();
     this.closePanels();
     this.setPhase('calibrating');
@@ -2158,6 +2182,8 @@ export class AppController {
       linePitchPx: () => this.layout?.linePitch ?? null,
       featureNames: FEATURE_NAMES,
       prior: !IS_ARTIFACT && this.store.get().realFaceModel ? REAL_FACE_PRIOR : null,
+      // Read when the dots are done: on a busy start the network's thread can come up after this screen does.
+      eyeNet: () => this.runningEyeNet(),
     });
     this.calibration = overlay;
     this.calibrationMode = mode;
@@ -2378,6 +2404,7 @@ export class AppController {
       appVersion: APP_VERSION,
       // Always scored, whatever the setting: the test is how to find out which one does better.
       prior: REAL_FACE_PRIOR,
+      eyeNet: this.runningEyeNet(),
       save: (recording) => downloadJson(recording, accuracyRecordingFileName(recording.recordedAt)),
     });
     this.accuracyTest = overlay;
@@ -2989,6 +3016,104 @@ export class AppController {
     // are then somewhere else on screen, and nothing else (no scroll, no resize) says so.
     if (any(['buddyCorner', 'buddyEnabled'])) this.scheduleMeasure('resize', 80);
     if (changed.includes('buddyEnabled') && !s.buddyEnabled && !this.settingsPanel.isOpen) this.deweyHidden();
+  }
+
+  // ─────────────────────────── the eye-picture network ───────────────────────────
+
+  private storedEyeNet(): StoredEyeNet | null {
+    if (IS_ARTIFACT) return null;
+    if (this.eyeNetFile === undefined) this.eyeNetFile = loadStoredEyeNet();
+    return this.eyeNetFile;
+  }
+
+  /** The id of the network that is answering frames right now, or null. */
+  private runningEyeNet(): string | null {
+    return this.eyeNetRunner?.running ? this.eyeNetRunner.id : null;
+  }
+
+  /** The id of the network the calibration in use was made on, or null. */
+  private calibrationEyeNet(): string | null {
+    const model = this.currentModel();
+    return (model ? asRidgeGazeModel(model)?.eyeNet?.id : null) ?? null;
+  }
+
+  /** Starts the kept network's worker and puts it between the camera and everything that listens to it. */
+  private startEyeNet(camera: CameraFeatureSource): void {
+    if (IS_ARTIFACT) return;
+    const file = this.storedEyeNet();
+    this.stopEyeNet();
+    if (!file) return;
+    try {
+      const runner: EyeNetRunner = new EyeNetRunner(file.weights, file.shape, undefined, (message) => this.eyeNetFailed(runner, message));
+      this.eyeNetRunner = runner;
+      camera.setEyeNet(runner);
+    } catch (err) {
+      // No background threads in this browser, or the page's policy forbids them.
+      console.warn('[app] the eye-picture network could not be started', err);
+      this.eyeNetUnusable('The eye-picture network could not be started in this browser.');
+    }
+  }
+
+  private stopEyeNet(): void {
+    this.camera?.setEyeNet(null);
+    this.eyeNetRunner?.dispose();
+    this.eyeNetRunner = null;
+  }
+
+  private eyeNetFailed(runner: EyeNetRunner, message: string): void {
+    if (this.eyeNetRunner !== runner || this.destroyed) return;
+    this.stopEyeNet();
+    this.eyeNetUnusable(message);
+  }
+
+  /** The network cannot run: tracking goes on without it, and a calibration made on it has to be made again. */
+  private eyeNetUnusable(message: string): void {
+    const calibratedOnIt = this.calibrationEyeNet() !== null;
+    this.toasts.show({
+      id: 'eye-net',
+      message: calibratedOnIt ? `${message} Your calibration was made with it, so please calibrate again.` : `${message} Eye tracking continues without it.`,
+      durationMs: 12_000,
+      ...(calibratedOnIt ? { actions: [{ label: 'Calibrate now', primary: true, run: () => this.recalibrate() }] } : {}),
+    });
+    if (calibratedOnIt) this.forgetCalibration();
+  }
+
+  private eyeNetStatus(): { id: string | null; inUse: boolean } {
+    const id = this.storedEyeNet()?.shape.id ?? null;
+    return { id, inUse: id !== null && this.calibrationEyeNet() === id };
+  }
+
+  /** Settings → Advanced: a network file was chosen. It is checked, kept, and started if the camera is on. */
+  private loadEyeNetFile(text: string): { ok: boolean; message: string } {
+    const result = storeEyeNet(text);
+    if (!result.ok) return { ok: false, message: result.problem };
+    const before = this.calibrationEyeNet();
+    this.eyeNetFile = result.net;
+    this.toasts.dismiss('eye-net');
+    if (this.camera?.running) this.startEyeNet(this.camera);
+    if (before !== null && before !== result.net.shape.id) {
+      // The calibration in use reads another network's answers, and that one is gone now.
+      this.forgetCalibration();
+      return { ok: true, message: 'Loaded in place of the one your calibration was made with. Calibrate again to use it.' };
+    }
+    // The line above the buttons says the rest (which network, and whether the calibration uses it).
+    return { ok: true, message: 'Loaded.' };
+  }
+
+  private removeEyeNetFile(): void {
+    const calibratedOnIt = this.calibrationEyeNet() !== null;
+    forgetStoredEyeNet();
+    this.eyeNetFile = null;
+    this.stopEyeNet();
+    this.toasts.dismiss('eye-net');
+    if (!calibratedOnIt) return;
+    this.forgetCalibration();
+    this.toasts.show({
+      id: 'eye-net',
+      message: 'Your calibration was made with that network, so it went with it. Calibrate again to go on with eye tracking.',
+      durationMs: 12_000,
+      actions: [{ label: 'Calibrate now', primary: true, run: () => this.recalibrate() }],
+    });
   }
 
   /** The setting only picks what the next full calibration is built on: say so when the current one differs. */

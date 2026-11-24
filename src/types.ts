@@ -54,6 +54,12 @@ export interface EyeFeatures {
   /** Face center in normalized image coordinates (0..1), NOT mirrored. */
   faceCenter: Point;
   /**
+   * The eye-picture network's answer for this frame, when one is running (src/gaze/eyeNet.ts):
+   * which way the eyes point as seen from the camera, and which network said so. Read only by a
+   * calibration that was made on that network's answers.
+   */
+  eyeNet?: { id: string; x: number; y: number };
+  /**
    * 0..1 mean of MediaPipe's eyeSquint blendshapes (0 when blendshapes are missing).
    * Used to notice light-driven squinting; never a gaze-model input.
    */

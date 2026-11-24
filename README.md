@@ -247,6 +247,28 @@ tracking is worse with it, switch it off and calibrate again (**C**). The settin
 a quick 5-dot refresh keeps whichever kind you have. The weights are licensed for non-commercial
 use only (see [License](#license)).
 
+## Eye-picture network (experimental)
+
+Settings → Advanced → **Eye-picture network**. Web app only, and the app comes with none: you
+train one yourself and load the file.
+
+Every calibration above works from the outline the face tracker draws round your eyes. This is a
+small neural network that looks at the picture of the eyes instead, and tells the calibration
+which way you are looking. On webcam video of 40 people following dots, each calibrated with nine
+clicks and scored by a network that had never seen them, it was 3.3° off on average, against 4.6°
+for the real-face model and 9.1° for the default calibration with so few dots. A dedicated eye
+tracker scored 1.5° on the same frames. See
+[docs/REAL_DATA.md](docs/REAL_DATA.md#people-moving-their-eyes-on-video-eott) for how to train it
+(about half an hour on a laptop) and for what those numbers do not cover: one lab, one day, heads
+held still, and nothing yet measured in the app itself.
+
+No network is included because the videos it learns from are GPLv3 and this project is MIT. While
+one is loaded, a small picture of your eyes from each frame goes to a background thread of the
+page and is discarded there; nothing is kept or uploaded ([PRIVACY.md](PRIVACY.md)). It is used
+from your next full calibration, and a calibration made with it needs it: remove the network and
+the app asks you to calibrate again. The [accuracy test](docs/ACCURACY_TEST.md) scores it next to
+the other calibrations on your own face.
+
 ## Lighting
 
 Light changes how open your eyes are. In bright light or glare most people squint a little
@@ -304,7 +326,7 @@ no camera and no downloads.
 tracking on your own face and camera: a full calibration, then five rounds of nine dots while you
 sit still, turn your head, lean back, sit lower and sit up again. The results compare the
 calibration you use with the alternatives (the real-face model, no head-movement step, the 1.1 and
-1.0 measurements) on the same frames, in lines of your text. Numbers only, no video, and nothing
+1.0 measurements, and the eye-picture network if one is running) on the same frames, in lines of your text. Numbers only, no video, and nothing
 is kept unless you press **Save recording**. Developers score saved recordings with the current
 code with `GR_ACCURACY=path/to/file.json npm run bench:live`. See
 [docs/ACCURACY_TEST.md](docs/ACCURACY_TEST.md). The web app only.

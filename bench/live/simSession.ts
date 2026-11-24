@@ -29,6 +29,8 @@ export interface SimSessionOptions {
   lowCm?: number;
   /** Leave these postures out, as a session stopped early would. */
   skip?: readonly PostureId[];
+  /** Every frame also carries the answer of a stand-in eye-picture network (SIM_EYE_NET). */
+  eyeNet?: boolean;
 }
 
 /** The head pose the simulated reader holds in each posture. */
@@ -48,8 +50,18 @@ export function posturePose(id: PostureId, o: SimSessionOptions = {}): Pose {
   }
 }
 
+/** The id of the stand-in network whose answers a session made with `eyeNet` carries. */
+export const SIM_EYE_NET = 'sim-net';
+
 export function simulatedSession(seed: number, o: SimSessionOptions = {}): AccuracyRecording {
   const r = rng(seed);
+  // A stand-in for an eye-picture network: where the eyes point as this person's own skewed, noisy
+  // reading of the dot, which is what a calibration on a network has to straighten out.
+  const net = (target: Point): { id: string; x: number; y: number } => ({
+    id: SIM_EYE_NET,
+    x: 0.03 + (0.55 * (target.x - VIEW.width / 2)) / VIEW.width + 0.012 * gauss(r),
+    y: -0.05 + (0.5 * (target.y - VIEW.height / 2)) / VIEW.width + 0.012 * gauss(r),
+  });
   const per = o.perDot ?? 34;
   let t = 0;
   const frame = (features: CalibrationSample['features']): RecordedFrame | null => recordFrame({ t: (t += 33), faceFound: true, features, quality: 1 }, 0);
@@ -64,7 +76,7 @@ export function simulatedSession(seed: number, o: SimSessionOptions = {}): Accur
       for (let i = 0; i < per; i++) {
         const gaze = { h: fix.h + 0.1 * DEG * gauss(r), v: fix.v + 0.1 * DEG * gauss(r) };
         const f = frameFeatures(makeFrame(target, head, gaze, {}, r, NOMINAL_NOISE));
-        const rec = f ? frame(f) : null;
+        const rec = f ? frame(o.eyeNet ? { ...f, eyeNet: net(target) } : f) : null;
         if (rec) frames.push(rec);
       }
       return { target, frames };
@@ -72,7 +84,7 @@ export function simulatedSession(seed: number, o: SimSessionOptions = {}): Accur
 
   const head = headMovementSession(seed + 1);
   const centre = { x: VIEW.width / 2, y: VIEW.height / 2 };
-  const headFrames = head.map((s) => frame(s.features)).filter((f): f is RecordedFrame => f !== null);
+  const headFrames = head.map((s) => frame(o.eyeNet ? { ...s.features, eyeNet: net(centre) } : s.features)).filter((f): f is RecordedFrame => f !== null);
 
   const blocks: RecordedBlock[] = [
     { kind: 'calibrate', trials: dots(STANDARD_TARGETS, BASE_POSE) },
@@ -95,6 +107,7 @@ export function simulatedSession(seed: number, o: SimSessionOptions = {}): Accur
     windowOrigin: { start: { x: 0, y: 0 }, end: { x: 0, y: 0 } },
     linePitchPx: 30,
     maxBlink: 0.85,
+    ...(o.eyeNet ? { eyeNet: SIM_EYE_NET } : {}),
     blocks,
   };
 }

@@ -37,7 +37,8 @@ places it was not fitted on.
 
 ## Reading the results
 
-The same frames are scored for six calibrations, each fitted again from your calibration dots:
+The same frames are scored for six calibrations, each fitted again from your calibration dots
+(seven while an eye-picture network is running):
 
 | Row | What it is |
 | --- | --- |
@@ -47,6 +48,7 @@ The same frames are scored for six calibrations, each fitted again from your cal
 | Default, no distance correction | The default without the correction for leaning in or back |
 | 1.1 features | Head pose fed to the gaze fit, as in version 1.1 |
 | 1.0 features | Every measurement, eyelids included, as in version 1.0 |
+| Eye-picture network | Only while one is loaded and running (Settings → Advanced → Eye-picture network; see [REAL_DATA.md](REAL_DATA.md#the-eye-picture-network)) |
 
 Each cell is the median up-or-down miss in lines of the text you had open, and in brackets the
 share of dots read on the right line (within half a line). **All** covers every round;
