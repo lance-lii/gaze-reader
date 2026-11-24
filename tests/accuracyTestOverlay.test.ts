@@ -170,7 +170,7 @@ describe('accuracy test screen', () => {
     expect(g.src.listenerCount).toBe(0);
 
     const rows = [...(g.root()?.querySelectorAll('tbody tr') ?? [])];
-    expect(rows.length).toBe(VARIANTS.length);
+    expect(rows.length).toBe(VARIANTS.filter((v) => !v.needsEyeNet).length);
     expect(rows[0].textContent).toContain('Default calibration');
     expect(g.root()?.querySelector('.gr-acc-verdict')?.textContent?.length).toBeGreaterThan(20);
 
