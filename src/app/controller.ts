@@ -71,7 +71,7 @@ import { MIN_TRACKING_HZ, PageEndDetector } from '../reading/pageEndDetector';
 import { SimulatedReaderSource } from '../reading/simulatedReader';
 import { FixationDetector } from '../signal/fixations';
 import { accuracyRecordingFileName } from '../gaze/accuracyTest';
-import { AccuracyTestOverlay } from '../ui/accuracyTestOverlay';
+import type { AccuracyTestOverlay } from '../ui/accuracyTestOverlay';
 import { CalibrationOverlay, type AccuracyCheckResult, type CalibrationFrames, type CalibrationMode } from '../ui/calibrationOverlay';
 import { CameraPreview } from '../ui/cameraPreview';
 import { DEWEY_FULL_APP_LINE, FULL_APP_LABEL, WEBCAM_UNAVAILABLE_TEXT, WEBCAM_UNAVAILABLE_TITLE } from '../ui/fullApp';
@@ -2368,10 +2368,28 @@ export class AppController {
       this.webcamUnavailable();
       return;
     }
-    if (this.phase === 'calibrating' || this.calibration || this.accuracyTest) return;
+    if (!this.canRunAccuracyTest()) return;
+    // Rarely run, so its screen and scoring aren't part of what every reader downloads. Loaded
+    // before the calibration, so that a failed download doesn't waste one.
+    let Overlay: typeof AccuracyTestOverlay;
+    try {
+      ({ AccuracyTestOverlay: Overlay } = await import('../ui/accuracyTestOverlay'));
+    } catch (err) {
+      console.error('[app] the accuracy test failed to load', err);
+      this.toasts.show({ id: 'accuracy-test', message: 'The accuracy test failed to load. Check your connection and try again.' });
+      return;
+    }
+    // Asked again: the reader may have closed the book or the camera during the download.
+    if (this.destroyed || !this.canRunAccuracyTest()) return;
+    await this.recalibrateInPlace('standard', (outcome) => this.accuracyRounds(Overlay, outcome));
+  }
+
+  /** Whether the accuracy test can start now; says why not, when there is something to say. */
+  private canRunAccuracyTest(): boolean {
+    if (this.phase === 'calibrating' || this.calibration || this.accuracyTest) return false;
     if (!this.session) {
       this.toasts.show({ id: 'accuracy-test', message: 'Open a book first: the accuracy test measures in lines of the text you read.' });
-      return;
+      return false;
     }
     if (this.store.get().gazeSource !== 'webcam') {
       this.toasts.show({
@@ -2379,17 +2397,17 @@ export class AppController {
         message: 'The accuracy test is for eye tracking. Switch to your eyes first.',
         actions: [{ label: 'Use my eyes', primary: true, run: () => this.selectSource('webcam') }],
       });
-      return;
+      return false;
     }
     if (this.sourceKind !== 'webcam' || this.phase !== 'running' || !this.source || !this.camera?.running) {
       this.toasts.show({ id: 'accuracy-test', message: 'Eye tracking isn’t running yet. Calibrate first, then run the accuracy test.' });
-      return;
+      return false;
     }
-    await this.recalibrateInPlace('standard', (outcome) => this.accuracyRounds(outcome));
+    return true;
   }
 
   /** The accuracy test after its calibration: the rounds of dots and the results. Gaze processing is still paused. */
-  private async accuracyRounds(outcome: CalibrationOutcome): Promise<void> {
+  private async accuracyRounds(Overlay: typeof AccuracyTestOverlay, outcome: CalibrationOutcome): Promise<void> {
     const camera = this.camera;
     const frames = this.calibrationFrames;
     // Cancelled, or the reader kept the old calibration: there is nothing to test against.
@@ -2397,7 +2415,7 @@ export class AppController {
       this.toasts.show({ id: 'accuracy-test', message: 'The accuracy test needs a finished calibration, so it didn’t run.' });
       return;
     }
-    const overlay = new AccuracyTestOverlay({
+    const overlay = new Overlay({
       features: camera,
       calibration: frames,
       linePitchPx: this.layout?.linePitch ?? null,
