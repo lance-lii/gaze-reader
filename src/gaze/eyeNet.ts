@@ -299,11 +299,25 @@ function eyeFeatures(net: EyeNet, eyes: ArrayLike<number>, offset: number, at: n
           const r0 = c * psize + y * pw;
           const r1 = r0 + pw;
           const r2 = r1 + pw;
+          // The window's left two columns are carried over from the pixel before: three reads a
+          // pixel instead of nine. The sum is added up in the same order as with nine reads.
+          let a0 = pad[r0], a1 = pad[r0 + 1];
+          let b0 = pad[r1], b1 = pad[r1 + 1];
+          let c0 = pad[r2], c1 = pad[r2 + 1];
           for (let x = 0; x < w; x++) {
+            const a2 = pad[r0 + x + 2];
+            const b2 = pad[r1 + x + 2];
+            const c2 = pad[r2 + x + 2];
             b[d + x] +=
-              w0 * pad[r0 + x] + w1 * pad[r0 + x + 1] + w2 * pad[r0 + x + 2] +
-              w3 * pad[r1 + x] + w4 * pad[r1 + x + 1] + w5 * pad[r1 + x + 2] +
-              w6 * pad[r2 + x] + w7 * pad[r2 + x + 1] + w8 * pad[r2 + x + 2];
+              w0 * a0 + w1 * a1 + w2 * a2 +
+              w3 * b0 + w4 * b1 + w5 * b2 +
+              w6 * c0 + w7 * c1 + w8 * c2;
+            a0 = a1;
+            a1 = a2;
+            b0 = b1;
+            b1 = b2;
+            c0 = c1;
+            c1 = c2;
           }
         }
       }
