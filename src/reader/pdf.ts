@@ -499,6 +499,33 @@ function startsNewBlock(a: Line, b: Line, m: Metrics): boolean {
   return shortfall > Math.max(m.body * 3, width * 0.1) && /[.!?:…”"’)\]]$/.test(a.text);
 }
 
+/** joinLineText looks no further back than this many characters (a surrogate-pair letter and a hyphen need 3). */
+const END_CHARS = 4;
+
+/**
+ * Same text as `lines.reduce(joinLineText)`, but joinLineText only ever sees the end of the text so
+ * far, and the pieces are joined once. Testing the growing string itself made V8 flatten it at
+ * every line, so a long run of lines with no paragraph break took far longer than its length.
+ */
+export function joinParagraph(lines: readonly string[]): string {
+  const parts: string[] = [];
+  let end = ''; // the last END_CHARS characters of the text so far
+  for (const line of lines) {
+    if (parts.length === 0) {
+      parts.push(line);
+      end = line.slice(-END_CHARS);
+      continue;
+    }
+    const joined = joinLineText(end, line);
+    const added = joined.length - end.length - line.length; // -1: a hyphen went; 1: a space came
+    if (added < 0) parts[parts.length - 1] = parts[parts.length - 1].slice(0, added);
+    const part = joined.slice(end.length + Math.min(0, added));
+    if (part) parts.push(part); // the last part is never empty, so a later hyphen comes off the right one
+    end = joined.slice(-END_CHARS);
+  }
+  return parts.join('');
+}
+
 /**
  * Rebuilds readable blocks from positioned PDF text: reading order (incl. two
  * columns), running heads and page numbers removed, lines joined into paragraphs
@@ -522,7 +549,7 @@ export function reconstructBlocks(pages: readonly PdfPageText[]): PdfBlock[] {
 
   const blocks: PdfBlock[] = [];
   for (const group of groups) {
-    const text = group.map((l) => l.text).reduce(joinLineText);
+    const text = joinParagraph(group.map((l) => l.text));
     const size = extremum(group, (l) => l.size, Math.max, 0);
     const larger = size >= m.body * 1.18 && text.length <= 200;
     const chapterLine = group.length === 1 && matchChapterLine(text) !== null;
