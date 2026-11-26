@@ -9,9 +9,11 @@ on:
 permissions:
   contents: read
 
+# Runs on main share one group, so that deploys never overlap. Each pull request has a group of its
+# own: it doesn't wait behind other pull requests or a deploy, and a new push cancels its older run.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('ci-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Actions are pinned to the commit their major tag pointed to when this was written: a tag can be
 # moved, and the deploy job runs with pages: write and an identity token. To update one, look up the
