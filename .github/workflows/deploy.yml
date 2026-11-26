@@ -19,6 +19,23 @@ concurrency:
 # moved, and the deploy job runs with pages: write and an identity token. To update one, look up the
 # new commit (git ls-remote --tags https://github.com/actions/<name>) and change hash and comment together.
 jobs:
+  # The tests are nearly all of a run's time (CPU-heavy simulations), so they are split over two
+  # machines, beside the build. Nothing is deployed unless both halves and the build pass.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test -- --shard=${{ matrix.shard }}/2
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -29,7 +46,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
       # Dependencies with a published advisory fail the build (production ones; dev tooling is checked by hand).
       - run: npm audit --omit=dev
       # prebuild copies the MediaPipe WASM runtime into public/ so it is served from our own origin.
@@ -47,7 +63,7 @@ jobs:
 
   deploy:
     if: github.event_name != 'pull_request'
-    needs: build
+    needs: [test, build]
     runs-on: ubuntu-latest
     permissions:
       pages: write
