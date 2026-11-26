@@ -191,13 +191,25 @@ function irisCentre5(P: (i: number) => Vec, centre: number, contour: readonly nu
 
 const normalizeBlendshapeName = (name: string): string => name.replace(/[^a-z]/gi, '').toLowerCase();
 
+/** A tracker sends the same 52 names with every frame, so each is normalized once. Bounded, whatever the input. */
+const keyCache = new Map<string, string>();
+const MAX_CACHED_NAMES = 256;
+function blendshapeKey(name: string): string {
+  let key = keyCache.get(name);
+  if (key === undefined) {
+    key = normalizeBlendshapeName(name);
+    if (keyCache.size < MAX_CACHED_NAMES) keyCache.set(name, key);
+  }
+  return key;
+}
+
 /** Name → score (clamped to 0..1; non-finite → 0), tolerant of `eyeBlink_Left`-style names. */
 function readBlendshapes(blendshapes: readonly BlendshapeLike[] | null): Map<string, number> | null {
   if (!blendshapes || blendshapes.length === 0) return null;
   const scores = new Map<string, number>();
   for (const b of blendshapes) {
     if (!b || typeof b.categoryName !== 'string') continue;
-    scores.set(normalizeBlendshapeName(b.categoryName), Number.isFinite(b.score) ? clamp01(b.score) : 0);
+    scores.set(blendshapeKey(b.categoryName), Number.isFinite(b.score) ? clamp01(b.score) : 0);
   }
   return scores;
 }
