@@ -260,7 +260,11 @@ function mergePiecesIntoLines(pieces: Piece[], page: number, col: number): Line[
 /** Lines of one page in reading order (two-column pages: header, left column, right column, footer). */
 function pageLines(page: PdfPageText, pageIndex: number): Line[] {
   const pieces = pagePieces(page);
-  const gutter = findGutter(pieces, page.width);
+  return orderLines(pieces, findGutter(pieces, page.width), pageIndex);
+}
+
+/** {@link pageLines}, for a page whose pieces and gutter are already known. */
+function orderLines(pieces: Piece[], gutter: number | null, pageIndex: number): Line[] {
   if (gutter === null) return mergePiecesIntoLines(pieces, pageIndex, 0);
 
   const left = pieces.filter((p) => p.x1 <= gutter);
@@ -320,10 +324,12 @@ export function layoutPdfPages(pages: readonly PdfPageText[]): PdfPageLayout[] {
     const width = Number.isFinite(page.width) && page.width > 0 ? page.width : 0;
     const height = Number.isFinite(page.height) && page.height > 0 ? page.height : 0;
     if (!width || !height) return { width: width || 1, height: height || 1, columns: false, lines: [] };
-    const columns = findGutter(pagePieces(page), width) !== null;
+    // Grouped once. `width` is the page's own width here (a page without one has returned above).
+    const pieces = pagePieces(page);
+    const gutter = findGutter(pieces, width);
     const lines: PdfLineBox[] = [];
     const skew = typeof page.skew === 'number' && Number.isFinite(page.skew) ? page.skew : 0;
-    for (const straight of pageLines(page, index)) {
+    for (const straight of orderLines(pieces, gutter, index)) {
       // A crooked scan: back from the straightened page to where the line is in the picture (its
       // middle; the box itself stays level, which at a degree or two is within the line's height).
       let l = straight;
@@ -337,7 +343,7 @@ export function layoutPdfPages(pages: readonly PdfPageText[]): PdfPageLayout[] {
       if (!(l.x1 > l.x0) || l.y <= 0 || l.y - l.size > height || l.x1 <= 0 || l.x0 >= width) continue;
       lines.push({ x0: Math.max(0, l.x0), x1: Math.min(width, l.x1), y: l.y, size: l.size, text: l.text.slice(0, MAX_LINE_TEXT) });
     }
-    return { width, height, columns, lines };
+    return { width, height, columns: gutter !== null, lines };
   });
 }
 
