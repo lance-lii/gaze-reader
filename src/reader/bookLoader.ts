@@ -98,28 +98,36 @@ export function countWords(text: string): number {
   return (cjk ? cjk.length : 0) + (words ? words.length : 0);
 }
 
-const FNV_OFFSET_HI = 0xcbf29ce4;
-const FNV_OFFSET_LO = 0x84222325;
-const FNV_PRIME_LO = 0x1b3; // prime = 2^40 + 0x1b3
+/** The FNV prime is 2^40 + this. */
+const FNV_PRIME_LOW = 0x1b3;
 
 /**
  * Stable id: 64-bit FNV-1a over the UTF-8 bytes, printed in base 36.
- * The 64-bit multiply is done on two 32-bit halves so hashing a whole book
- * doesn't allocate a BigInt per byte.
+ * The 64-bit state is held in four 16-bit limbs, so that every product and sum is a
+ * small integer: no BigInt per byte, and no floating-point division or remainder.
  */
 export function hashId(text: string): string {
   const bytes = new TextEncoder().encode(text);
-  let hi = FNV_OFFSET_HI;
-  let lo = FNV_OFFSET_LO;
+  // The FNV offset basis, 0xcbf29ce484222325, lowest limb first.
+  let h0 = 0x2325;
+  let h1 = 0x8422;
+  let h2 = 0x9ce4;
+  let h3 = 0xcbf2;
   for (let i = 0; i < bytes.length; i++) {
-    lo = (lo ^ bytes[i]) >>> 0;
-    // (hi:lo) * (2^40 + 0x1b3) mod 2^64. All intermediates stay below 2^53.
-    const loProduct = lo * FNV_PRIME_LO;
-    const carry = Math.floor(loProduct / 0x1_0000_0000);
-    const newHi = (hi * FNV_PRIME_LO + carry + ((lo << 8) >>> 0)) % 0x1_0000_0000;
-    lo = loProduct >>> 0;
-    hi = newHi >>> 0;
+    h0 ^= bytes[i];
+    // state * (2^40 + 0x1b3) mod 2^64: each limb times 0x1b3, plus the two low limbs
+    // moved up by 40 bits (two limbs and 8 bits), then the carries.
+    const t0 = h0 * FNV_PRIME_LOW;
+    const t1 = h1 * FNV_PRIME_LOW + (t0 >>> 16);
+    const t2 = h2 * FNV_PRIME_LOW + (h0 << 8) + (t1 >>> 16);
+    const t3 = h3 * FNV_PRIME_LOW + (h1 << 8) + (t2 >>> 16);
+    h0 = t0 & 0xffff;
+    h1 = t1 & 0xffff;
+    h2 = t2 & 0xffff;
+    h3 = t3 & 0xffff;
   }
+  const hi = ((h3 << 16) | h2) >>> 0;
+  const lo = ((h1 << 16) | h0) >>> 0;
   return ((BigInt(hi) << 32n) | BigInt(lo)).toString(36);
 }
 
