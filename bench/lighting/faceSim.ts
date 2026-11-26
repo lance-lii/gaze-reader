@@ -280,6 +280,12 @@ const KIND: readonly Kind[] = Array.from({ length: LANDMARK_COUNT }, (_, i): Kin
   return 'other';
 });
 
+/** The unmodelled points: a ring round the face, the same in every frame (head frame, cm). */
+const ringAngle = (i: number): number => (i / LANDMARK_COUNT) * 2 * Math.PI;
+const RING_X = Float64Array.from({ length: LANDMARK_COUNT }, (_, i) => 7.0 * Math.cos(ringAngle(i)));
+const RING_Y = Float64Array.from({ length: LANDMARK_COUNT }, (_, i) => -2 + 9.5 * Math.sin(ringAngle(i)));
+const RING_Z = -3.0;
+
 const clamp01 = (x: number): number => (x <= 0 ? 0 : x >= 1 ? 1 : x);
 const includesEye = (which: Eyes | undefined, side: 'right' | 'left'): boolean => (which ?? 'both') === 'both' || which === side;
 
@@ -455,22 +461,39 @@ export function makeFrame(
   }
 
   px[EYE_LANDMARKS.chin] = P(v3(CHIN.x, CHIN.y, CHIN.z));
-  for (let i = 0; i < LANDMARK_COUNT; i++) {
-    if (MODELLED.has(i)) continue;
-    const a = (i / LANDMARK_COUNT) * 2 * Math.PI;
-    px[i] = P(v3(7.0 * Math.cos(a), -2 + 9.5 * Math.sin(a), -3.0));
-  }
 
   const shift = light.globalShift ?? { dx: 0, dy: 0 };
   const sigma: Record<Kind, number> = { iris: noise.irisPx, contour: noise.contourPx, lid: noise.lidPx, corner: noise.cornerPx, other: noise.otherPx };
-  const noisy = px.map((p, i) => {
+  // One pass over the mesh. Nearly all of it is the ring of unmodelled points, so those are posed
+  // and projected here in plain numbers (`P`, written out), without an object per step.
+  const [[r00, r01, r02], [r10, r11, r12], [r20, r21, r22]] = R;
+  const shiftX = shift.dx * IMG_W;
+  const shiftY = shift.dy * IMG_H;
+  const commonX = noise.commonPx * jit * common[0];
+  const commonY = noise.commonPx * jit * common[1];
+  const noisy = new Array<Point>(LANDMARK_COUNT); // image px; filled for the modelled points only
+  const landmarks = new Array<LandmarkLike>(LANDMARK_COUNT);
+  for (let i = 0; i < LANDMARK_COUNT; i++) {
+    const modelled = MODELLED.has(i);
+    let x: number;
+    let y: number;
+    if (modelled) {
+      ({ x, y } = px[i]);
+    } else {
+      const hx = RING_X[i];
+      const hy = RING_Y[i];
+      const camX = r00 * hx + r01 * hy + r02 * RING_Z + T.x;
+      const camY = r10 * hx + r11 * hy + r12 * RING_Z + T.y;
+      const camZ = r20 * hx + r21 * hy + r22 * RING_Z + T.z;
+      x = IMG_W / 2 + (F_PX * camX) / -camZ;
+      y = IMG_H / 2 - (F_PX * camY) / -camZ;
+    }
     const s = sigma[KIND[i]] * jit;
-    return {
-      x: p.x + shift.dx * IMG_W + s * lmNoise[2 * i] + noise.commonPx * jit * common[0],
-      y: p.y + shift.dy * IMG_H + s * lmNoise[2 * i + 1] + noise.commonPx * jit * common[1],
-    };
-  });
-  const landmarks: LandmarkLike[] = noisy.map((p) => ({ x: p.x / IMG_W, y: p.y / IMG_H, z: 0 }));
+    x = x + shiftX + s * lmNoise[2 * i] + commonX;
+    y = y + shiftY + s * lmNoise[2 * i + 1] + commonY;
+    if (modelled) noisy[i] = { x, y };
+    landmarks[i] = { x: x / IMG_W, y: y / IMG_H, z: 0 };
+  }
 
   const noisyEye = (idx: typeof R_IDX, contour: readonly number[]): Eye2D => ({
     inner: noisy[idx.inner],
